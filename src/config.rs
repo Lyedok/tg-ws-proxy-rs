@@ -105,8 +105,11 @@ pub struct Config {
     pub port: u16,
 
     /// Host / IP address to bind.
-    #[arg(long, default_value = "127.0.0.1", env = "TG_HOST")]
-    pub host: String,
+    /// When omitted, the proxy binds `0.0.0.0` if a LAN IP can be
+    /// auto-detected (so the address advertised in the proxy link is
+    /// actually reachable), otherwise it falls back to `127.0.0.1`.
+    #[arg(long, env = "TG_HOST")]
+    pub host: Option<String>,
 
     /// MTProto proxy secret(s) (32 hex chars each).
     /// Can be specified multiple times or as a comma-separated list.
@@ -531,26 +534,49 @@ impl Config {
         )
     }
 
+    /// The address the TCP listener actually binds to.
+    ///
+    /// Resolution order:
+    /// 1. `--host` if explicitly set — the user's choice is always respected.
+    /// 2. `0.0.0.0` (all interfaces) when no `--host` was given and a LAN IP
+    ///    can be auto-detected, so the address advertised by `link_host`
+    ///    below is actually reachable instead of only bindable on loopback.
+    /// 3. `127.0.0.1` as the final fallback (no LAN connectivity detected).
+    pub fn bind_host(&self) -> String {
+        if let Some(ref host) = self.host {
+            return host.clone();
+        }
+
+        if detect_lan_ip().is_some() {
+            "0.0.0.0".to_string()
+        } else {
+            "127.0.0.1".to_string()
+        }
+    }
+
     /// The hostname/IP to advertise in the generated `tg://proxy` link.
     ///
     /// Resolution order:
     /// 1. `--link-ip` if explicitly set.
-    /// 2. Auto-detected first non-loopback IPv4 address when `--host` is a
-    ///    wildcard (`0.0.0.0`) or loopback (`127.0.0.1` / `::1`).
-    /// 3. `--host` verbatim as the final fallback.
+    /// 2. Auto-detected first non-loopback IPv4 address when the bind
+    ///    address (see `bind_host`) is a wildcard (`0.0.0.0`) or loopback
+    ///    (`127.0.0.1` / `::1`).
+    /// 3. The bind address verbatim as the final fallback.
     pub fn link_host(&self) -> String {
         if let Some(ref ip) = self.link_ip {
             return ip.clone();
         }
 
+        let bind_host = self.bind_host();
+
         // Auto-detect when the bind address is not directly reachable by
         // remote clients (wildcard or loopback).
-        let bind_is_local = matches!(self.host.as_str(), "0.0.0.0" | "::" | "127.0.0.1" | "::1");
+        let bind_is_local = matches!(bind_host.as_str(), "0.0.0.0" | "::" | "127.0.0.1" | "::1");
         if bind_is_local && let Some(lan_ip) = detect_lan_ip() {
             return lan_ip;
         }
 
-        self.host.clone()
+        bind_host
     }
 
     /// Socket buffer size in bytes.

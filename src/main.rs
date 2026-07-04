@@ -150,7 +150,8 @@ async fn main() {
     }
 
     // ── Bind the server socket ────────────────────────────────────────────
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port)
+    let bind_host = config.bind_host();
+    let addr: SocketAddr = format!("{}:{}", bind_host, config.port)
         .parse()
         .expect("invalid listen address");
 
@@ -195,8 +196,11 @@ async fn main() {
     );
 
     info!("{}", "=".repeat(60));
-    info!("  Telegram MTProto WS Bridge Proxy  (tg-ws-proxy-rs)");
-    info!("  Listening on   {}:{}", config.host, config.port);
+    info!(
+        "  Telegram MTProto WS Bridge Proxy  (tg-ws-proxy-rs v{})",
+        env!("CARGO_PKG_VERSION")
+    );
+    info!("  Listening on   {}:{}", bind_host, config.port);
     info!("  Secret:        {}", secret);
     if let Some(domain) = config.listen_faketls_domain() {
         info!("  Inbound mode:   FakeTLS ee (SNI: {})", domain);
@@ -264,18 +268,18 @@ async fn main() {
         }
     }
 
-    if link_host != config.host {
+    if link_host != bind_host {
         info!(
             "  ℹ  Link uses auto-detected IP {}. \
              Use --link-ip <IP> to override.",
             link_host
         );
-    } else if matches!(config.host.as_str(), "127.0.0.1" | "::1") {
+    } else if matches!(bind_host.as_str(), "127.0.0.1" | "::1") {
         warn!(
             "  ⚠  Link shows {} — only the local machine can use this link. \
              Run with --host 0.0.0.0 (or --link-ip <router-LAN-IP>) \
              so other devices on the network can connect.",
-            config.host
+            bind_host
         );
     }
     info!("{}", "=".repeat(60));

@@ -1,0 +1,89 @@
+# AGENTS.md
+
+Guidance for AI coding agents (and humans) working in this repository.
+
+## What this project is
+
+`tg-ws-proxy-rs` is a Rust port of [Flowseal/tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy): a local
+MTProto proxy that tunnels Telegram Desktop traffic through WebSocket connections to Telegram's
+data centers. It exists for networks where raw TCP to Telegram is blocked but WebSocket/HTTPS to
+`web.telegram.org` still works (common in Russia and other censored networks).
+
+At a high level: a Telegram client (Desktop, or any MTProto-speaking client) connects to this
+proxy over plain MTProto (optionally disguised as FakeTLS). The proxy de-obfuscates the MTProto
+transport frame, re-encrypts it for the target DC, and forwards it — preferring a WebSocket
+tunnel to `wss://kwsN.web.telegram.org/apiws`, with Cloudflare-proxy, Cloudflare-Worker, upstream
+MTProto proxy, and raw TCP as successive fallbacks.
+
+## Repository layout
+
+```
+src/
+  main.rs              Entry point: CLI parsing, socket bind, startup banner, connection accept loop
+  config.rs            clap-derived Config struct; all CLI flags + TG_* env var fallbacks
+  proxy.rs              Core per-connection logic: client handshake, DC routing, WS/CF/TCP fallback chain
+  crypto.rs             MTProto obfuscated-transport crypto (AES-256-CTR key derivation)
+  faketls.rs            0xee FakeTLS camouflage: fake TLS 1.3 handshake for inbound + upstream proxies
+  splitter.rs            Splits/reassembles MTProto transport frames from WebSocket message boundaries
+  ws_client.rs           WebSocket client that dials Telegram DC endpoints (kwsN.web.telegram.org)
+  pool.rs                Pre-warmed pool of idle WebSocket connections per DC (cuts handshake latency)
+  check.rs               `--check` connectivity tester for CF domains and upstream MTProto proxies
+  default_domains.rs      Fetches + deobfuscates the community CF-proxy domain list from GitHub
+  runtime.rs              Shared runtime state (outbound connector, etc.) threaded through the app
+  outbound/               Outbound TCP connector: HTTP/SOCKS5(h) proxy support, NO_PROXY matching
+  default_domains/http.rs  Minimal HTTPS GET used only to fetch the default domain list
+
+tests/                   Integration tests (one file per subsystem, mirrors src/ module names)
+docs/                    CfProxy.md, CfWorker.md — setup guides for Cloudflare-based fallback routing
+```
+
+`src/lib.rs` re-exports the crate's internals so integration tests in `tests/` can exercise them
+directly; almost all logic lives in the library, `main.rs` is a thin binary wrapper.
+
+## Build, test, lint
+
+```bash
+cargo build                        # debug build
+cargo test                         # unit + integration tests (tests/*.rs)
+cargo clippy --all-targets         # CI runs this; keep it clean of new warnings
+cargo fmt                          # run before committing — CI does not auto-format
+cargo build --release              # CI also does a release build with LTO (see Cargo.toml profile)
+```
+
+CI (`.github/workflows/ci.yml`) additionally enforces that `Cargo.toml`'s `package.version` is
+strictly greater than the base branch's version on every PR, and matches the git tag on release
+builds. **Any change destined for `main` must bump the `version` field in `Cargo.toml`** (and let
+`cargo build` regenerate the matching line in `Cargo.lock`) — the CI job `release-version` fails
+the PR otherwise.
+
+## Conventions to follow
+
+- **CLI flags mirror env vars.** Every `#[arg(...)]` in `config.rs` has an `env = "TG_*"` fallback.
+  New flags should follow the same pattern so Docker/systemd deployments stay config-file-free.
+- **Module-level `//!` doc comments explain the *protocol/why*, not the *what*.** Look at the top
+  of `crypto.rs`, `faketls.rs`, `splitter.rs`, `pool.rs` for the expected level of detail — they
+  describe non-obvious protocol framing/timing reasons, not restate the code.
+- **All outbound TCP connections go through `src/outbound/`.** Direct WS, Cloudflare, Cloudflare
+  Worker, TCP fallback, `--check`, and the default-domain fetch all call into the shared outbound
+  connector so proxy/NO_PROXY behavior stays consistent. Don't open a raw `TcpStream::connect`
+  elsewhere.
+- **Integration tests are organized by subsystem**, one file per `src/` module area (e.g.
+  `tests/config.rs`, `tests/outbound.rs`, `tests/faketls.rs`). Add new tests to the matching file
+  rather than creating a new one per feature.
+- **No comments that restate code.** Only comment on non-obvious protocol constraints, timing
+  workarounds, or invariants — consistent with the existing style throughout `src/`.
+- Follow the general engineering discipline already in place in this repo: small, focused diffs;
+  don't add abstractions or config knobs beyond what's needed for the task at hand.
+
+## Gotchas specific to this codebase
+
+- The MTProto transport and the WebSocket transport have different framing guarantees — see
+  `splitter.rs`. Never assume one WebSocket message == one MTProto packet without going through
+  the splitter.
+- `--host` auto-detection (`Config::bind_host`/`Config::link_host` in `config.rs`) intentionally
+  keeps the bind address and the advertised `tg://` link address consistent. If you touch this
+  logic, verify both by actually starting the binary (`cargo run -- --port <N>`) and reading the
+  startup banner — a passing `cargo test` alone won't catch a bind/link mismatch a user would see.
+- FakeTLS (`0xee` secrets) affects both the inbound listener (`--listen-faketls-domain`) and
+  upstream MTProto proxies (`--mtproto-proxy` with an `ee`-prefixed secret) — they share
+  `faketls.rs` but are configured independently; don't conflate the two when making changes.

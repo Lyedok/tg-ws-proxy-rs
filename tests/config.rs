@@ -93,6 +93,34 @@ fn cf_worker_domains_accept_multiple_values_and_normalize() {
 }
 
 #[test]
+fn default_host_binds_and_links_to_the_same_address() {
+    // Regression test for https://github.com/valnesfjord/tg-ws-proxy-rs/issues/82:
+    // without --host, the listener must bind to whatever address link_host()
+    // advertises (or 127.0.0.1 if no LAN IP is detectable), never a mismatch
+    // like binding 127.0.0.1 while advertising a LAN IP that isn't reachable.
+    let cfg = Config::try_parse_from(["tg-ws-proxy"]).unwrap();
+
+    let bind_host = cfg.bind_host();
+    let link_host = cfg.link_host();
+
+    if bind_host == "0.0.0.0" {
+        // A LAN IP was detected: the link must show that concrete address,
+        // and 0.0.0.0 actually listens on it (unlike 127.0.0.1 before this fix).
+        assert_ne!(link_host, "0.0.0.0");
+    } else {
+        // No LAN connectivity: both must fall back to loopback consistently.
+        assert_eq!(bind_host, "127.0.0.1");
+        assert_eq!(link_host, "127.0.0.1");
+    }
+}
+
+#[test]
+fn explicit_host_is_respected_for_binding() {
+    let cfg = Config::try_parse_from(["tg-ws-proxy", "--host", "127.0.0.1"]).unwrap();
+    assert_eq!(cfg.bind_host(), "127.0.0.1");
+}
+
+#[test]
 fn cf_worker_domains_accept_repeated_flags_including_alias() {
     let cfg = Config::try_parse_from([
         "tg-ws-proxy",
