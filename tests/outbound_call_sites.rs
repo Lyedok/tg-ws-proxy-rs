@@ -28,6 +28,7 @@ async fn ws_client_connects_through_outbound_proxy() {
         false,
         Duration::from_secs(2),
         &outbound,
+        None,
     )
     .await;
 
@@ -49,13 +50,14 @@ async fn telegram_ws_dc_connector_uses_outbound_proxy() {
     let outbound =
         OutboundConnector::from_config(Some(&format!("http://{proxy_addr}")), None, false).unwrap();
 
-    let (ws, all_redirects) = connect_ws_for_dc_with_outbound(
+    let (ws, all_redirects, _timed_out) = connect_ws_for_dc_with_outbound(
         "203.0.113.10",
         2,
         false,
         false,
         Duration::from_secs(2),
         &outbound,
+        None,
     )
     .await;
 

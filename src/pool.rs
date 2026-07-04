@@ -240,6 +240,15 @@ impl WsPool {
         let mut results = Vec::new();
         // Limit pool fill timeout to avoid blocking for too long.
         let timeout = Duration::from_secs(8);
+        // While the domain-fronting fallback is in its sticky window, warm the
+        // pool with fronted connections too — otherwise a pool hit would hand
+        // a client a connection that never had to front in the first place,
+        // defeating the point of staying "sticky".
+        let fronting_domain = self
+            .runtime
+            .fronting_active()
+            .then(|| self.runtime.fronting_domain())
+            .flatten();
 
         for _ in 0..count {
             match connect_ws_for_dc_with_outbound(
@@ -249,11 +258,12 @@ impl WsPool {
                 skip_tls,
                 timeout,
                 self.runtime.outbound(),
+                fronting_domain,
             )
             .await
             {
-                (Some(ws), _) => results.push(ws),
-                (None, _) => {
+                (Some(ws), _, _) => results.push(ws),
+                (None, _, _) => {
                     warn!(
                         "pool: failed to pre-connect DC{}{}",
                         dc,

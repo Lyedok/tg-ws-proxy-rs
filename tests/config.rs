@@ -121,6 +121,29 @@ fn explicit_host_is_respected_for_binding() {
 }
 
 #[test]
+fn fronting_domain_is_disabled_by_default() {
+    let cfg = Config::try_parse_from(["tg-ws-proxy"]).unwrap();
+
+    assert_eq!(cfg.fronting_domain, None);
+    assert_eq!(cfg.fronting_cooldown, 1800);
+}
+
+#[test]
+fn fronting_flags_parse() {
+    let cfg = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--fronting-domain",
+        "sprinthost.ru",
+        "--fronting-cooldown",
+        "60",
+    ])
+    .unwrap();
+
+    assert_eq!(cfg.fronting_domain.as_deref(), Some("sprinthost.ru"));
+    assert_eq!(cfg.fronting_cooldown, 60);
+}
+
+#[test]
 fn cf_worker_domains_accept_repeated_flags_including_alias() {
     let cfg = Config::try_parse_from([
         "tg-ws-proxy",
