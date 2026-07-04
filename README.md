@@ -105,6 +105,8 @@ tg-ws-proxy [OPTIONS]
 | `--default-domains` | off | Fetch and use the built-in CF proxy domain list from GitHub (no Cloudflare setup needed, see [Default domains](#default-domains)) |
 | `--cf-priority` | off | Try CF proxy **before** direct WS for all DCs (see [CF Proxy](#cloudflare-proxy)) |
 | `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` and `--cf-worker-domain` values (see [CF Proxy](#cloudflare-proxy)) |
+| `--fronting-domain <DOMAIN>` | off | Domain-fronting fallback SNI, e.g. `sprinthost.ru` (see [Domain fronting](#domain-fronting)) |
+| `--fronting-cooldown <SECS>` | `1800` | How long the fronting fallback stays active after it last succeeded |
 | `--max-connections <N>` | auto | Max concurrent client connections (auto-computed from `ulimit -n`) |
 | `--mtproto-proxy <HOST:PORT:SECRET>` | — | Upstream MTProto proxy fallback (repeatable) |
 | `--outbound-proxy <URL>` | — | Proxy for all outgoing connections: `http://`, `socks5://`, or `socks5h://`; `https://` proxy URLs are not supported |
@@ -119,7 +121,8 @@ Every flag has a matching environment variable (`TG_PORT`, `TG_HOST`,
 `TG_SECRET`, `TG_BUF_KB`, `TG_POOL_SIZE`, `TG_MAX_CONNECTIONS`, `TG_QUIET`,
 `TG_VERBOSE`, `TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_LISTEN_FAKETLS_DOMAIN`, `TG_MTPROTO_PROXY`,
 `TG_LOG_FILE`, `TG_CF_DOMAIN`, `TG_CF_WORKER_DOMAIN`, `TG_CF_PRIORITY`,
-`TG_CF_BALANCE`, `TG_DEFAULT_DOMAINS`, `TG_OUTBOUND_PROXY`, `TG_NO_OUTBOUND_PROXY`, `TG_NO_PROXY`).
+`TG_CF_BALANCE`, `TG_DEFAULT_DOMAINS`, `TG_OUTBOUND_PROXY`, `TG_NO_OUTBOUND_PROXY`, `TG_NO_PROXY`,
+`TG_FRONTING_DOMAIN`, `TG_FRONTING_COOLDOWN`).
 When `TG_OUTBOUND_PROXY` is not set, standard `HTTPS_PROXY`, `ALL_PROXY`,
 `HTTP_PROXY` and `NO_PROXY` environment variables are also honored. `https://`
 proxy URLs are skipped when discovered from the standard environment if a later
@@ -428,6 +431,32 @@ For DCs with a configured direct WebSocket target, direct WS is tried first and
 the Worker is used only after that path fails. For DCs without a direct WS
 target, the Worker is tried before the regular Cloudflare proxy/default
 domains and the remaining fallbacks.
+
+### Domain fronting
+
+If direct WebSocket connections to Telegram keep timing out — a common sign
+of SNI-based DPI blocking — the proxy can fall back to **domain fronting**:
+presenting an unrelated, presumably-unblocked domain as the TLS SNI while
+still connecting to the real Telegram DC IP and using the real DC domain as
+the HTTP `Host`. DPI that filters by SNI sees the fronted name; the actual
+(TLS-encrypted) request still reaches Telegram normally.
+
+```bash
+tg-ws-proxy --fronting-domain sprinthost.ru
+```
+
+Disabled unless `--fronting-domain` is set. Once a fronted connection
+succeeds, the fallback stays active (including for background connection-pool
+refills) for `--fronting-cooldown` seconds (default 1800 = 30 min), so the
+proxy doesn't keep re-probing the likely-still-blocked direct path on every
+new connection.
+
+> **Note:** TLS certificate verification is unconditionally skipped on
+> connections using this fallback, regardless of
+> `--danger-accept-invalid-certs` — the real Telegram certificate can never
+> match a fronted SNI, so hostname verification would always fail. This is
+> inherent to the technique, not a bug, and only applies to the direct-WS
+> fallback path (not CF proxy/Worker connections).
 
 ### Default domains
 

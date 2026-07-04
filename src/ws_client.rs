@@ -31,6 +31,7 @@ use rustls::{
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
+    client_async_with_config,
     tungstenite::{client::IntoClientRequest, http::HeaderValue},
 };
 use tracing::{debug, warn};
@@ -78,6 +79,10 @@ pub enum WsConnectResult {
     Redirect(u16),
     /// Any other non-101 status code or transport error.
     Failed(String),
+    /// The connection attempt did not complete within the given timeout.
+    /// Kept distinct from `Failed` so callers can trigger timeout-specific
+    /// fallbacks (e.g. domain fronting) without string-matching error text.
+    TimedOut,
 }
 
 /// Try to establish a WebSocket connection to one Telegram DC domain.
@@ -96,18 +101,24 @@ pub async fn connect_ws(
         skip_tls_verify,
         timeout,
         &OutboundConnector::direct(),
+        None,
     )
     .await
 }
 
 /// Same as [`connect_ws`], but routes the TCP connection through the supplied
 /// outbound connector.
+///
+/// `sni_override`, when set, presents that hostname as the TLS SNI instead of
+/// `domain` while still using `domain` as the HTTP `Host` — see
+/// [`connect_ws_with_path`] for why and how.
 pub async fn connect_ws_with_outbound(
     ip: &str,
     domain: &str,
     skip_tls_verify: bool,
     timeout: Duration,
     outbound: &OutboundConnector,
+    sni_override: Option<&str>,
 ) -> WsConnectResult {
     connect_ws_with_path(
         ip,
@@ -117,10 +128,22 @@ pub async fn connect_ws_with_outbound(
         skip_tls_verify,
         timeout,
         outbound,
+        sni_override,
     )
     .await
 }
 
+/// Connect to `ip:443` and perform the WebSocket upgrade to `wss://{domain}{path}`.
+///
+/// Normally the TLS SNI is `domain` (matching the `Host` header). When
+/// `sni_override` is set, the TLS handshake instead presents that unrelated
+/// hostname as SNI — domain fronting — while the HTTP request still targets
+/// `domain` as `Host`. DPI that filters by SNI sees the fronted name; the
+/// actual (TLS-encrypted) request still reaches the real `domain` normally.
+/// Because the server's real certificate can never match a fronted SNI,
+/// certificate verification is unconditionally skipped in that case,
+/// regardless of `skip_tls_verify`.
+#[allow(clippy::too_many_arguments)]
 async fn connect_ws_with_path(
     ip: &str,
     domain: &str,
@@ -129,6 +152,7 @@ async fn connect_ws_with_path(
     skip_tls_verify: bool,
     timeout: Duration,
     outbound: &OutboundConnector,
+    sni_override: Option<&str>,
 ) -> WsConnectResult {
     // ── TCP connection to the configured IP ──────────────────────────────
     let tcp = match outbound.connect(ip, 443, timeout).await {
@@ -167,13 +191,10 @@ async fn connect_ws_with_path(
         );
     }
 
-    // ── TLS connector ────────────────────────────────────────────────────
-    let connector = build_tls_connector(skip_tls_verify);
-
-    // ── WebSocket handshake over the existing TCP stream ─────────────────
+    // ── TLS handshake + WebSocket upgrade ─────────────────────────────────
     let result = tokio::time::timeout(
         timeout,
-        client_async_tls_with_config(request, tcp, None, Some(connector)),
+        tls_handshake_and_upgrade(tcp, request, skip_tls_verify, sni_override),
     )
     .await;
 
@@ -204,7 +225,42 @@ async fn connect_ws_with_path(
                 WsConnectResult::Failed(e.to_string())
             }
         }
-        Err(_) => WsConnectResult::Failed("WebSocket handshake timed out".into()),
+        Err(_) => WsConnectResult::TimedOut,
+    }
+}
+
+/// Perform the TLS handshake (with optional SNI override) and the WebSocket
+/// upgrade over an already-connected TCP stream.
+///
+/// Split out from `connect_ws_with_path` so it can be exercised in tests
+/// against a stream connected to an arbitrary local port — the public
+/// connect functions always dial `:443`, Telegram's real WS port.
+async fn tls_handshake_and_upgrade<R>(
+    tcp: TcpStream,
+    request: R,
+    skip_tls_verify: bool,
+    sni_override: Option<&str>,
+) -> Result<(TgWsStream, tungstenite::handshake::client::Response), WsError>
+where
+    R: IntoClientRequest + Unpin,
+{
+    if let Some(sni) = sni_override {
+        // Domain fronting: TLS SNI = `sni`, Host stays whatever `request`
+        // already carries. Manual TLS is required here because
+        // `client_async_tls_with_config` always derives the SNI from the
+        // request's own host, with no way to override it.
+        let server_name = ServerName::try_from(sni)
+            .map_err(|_| WsError::Url(tungstenite::error::UrlError::NoHostName))?
+            .to_owned();
+        let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(no_verify_rustls_config()));
+        let tls_stream = tls_connector
+            .connect(server_name, tcp)
+            .await
+            .map_err(WsError::Io)?;
+        client_async_with_config(request, MaybeTlsStream::Rustls(tls_stream), None).await
+    } else {
+        let connector = build_tls_connector(skip_tls_verify);
+        client_async_tls_with_config(request, tcp, None, Some(connector)).await
     }
 }
 
@@ -251,19 +307,27 @@ pub async fn connect_ws_for_dc(
     skip_tls_verify: bool,
     timeout: Duration,
 ) -> (Option<TgWsStream>, bool) {
-    connect_ws_for_dc_with_outbound(
+    let (ws, all_redirects, _timed_out) = connect_ws_for_dc_with_outbound(
         ip,
         dc,
         is_media,
         skip_tls_verify,
         timeout,
         &OutboundConnector::direct(),
+        None,
     )
-    .await
+    .await;
+    (ws, all_redirects)
 }
 
 /// Same as [`connect_ws_for_dc`], but routes each TCP connection through the
 /// supplied outbound connector.
+///
+/// `sni_override` is forwarded to every domain attempt — see
+/// [`connect_ws_with_path`] for what it does. Returns
+/// `(stream, all_redirects, any_timed_out)`, where `any_timed_out` is `true`
+/// when at least one domain attempt hit the connect timeout (as opposed to a
+/// redirect or other failure) — used to trigger the domain-fronting fallback.
 pub async fn connect_ws_for_dc_with_outbound(
     ip: &str,
     dc: u32,
@@ -271,9 +335,11 @@ pub async fn connect_ws_for_dc_with_outbound(
     skip_tls_verify: bool,
     timeout: Duration,
     outbound: &OutboundConnector,
-) -> (Option<TgWsStream>, bool) {
+    sni_override: Option<&str>,
+) -> (Option<TgWsStream>, bool, bool) {
     let domains = ws_domains(dc, is_media);
     let mut all_redirects = true;
+    let mut any_timed_out = false;
 
     for domain in &domains {
         debug!(
@@ -284,9 +350,11 @@ pub async fn connect_ws_for_dc_with_outbound(
             ip
         );
 
-        match connect_ws_with_outbound(ip, domain, skip_tls_verify, timeout, outbound).await {
+        match connect_ws_with_outbound(ip, domain, skip_tls_verify, timeout, outbound, sni_override)
+            .await
+        {
             WsConnectResult::Connected(ws) => {
-                return (Some(ws), false);
+                return (Some(ws), false, false);
             }
             WsConnectResult::Redirect(code) => {
                 warn!(
@@ -309,10 +377,21 @@ pub async fn connect_ws_for_dc_with_outbound(
 
                 all_redirects = false; // a real failure, not just a redirect
             }
+            WsConnectResult::TimedOut => {
+                warn!(
+                    "WS DC{}{} timed out on {}",
+                    dc,
+                    if is_media { "m" } else { "" },
+                    domain
+                );
+
+                all_redirects = false;
+                any_timed_out = true;
+            }
         }
     }
 
-    (None, all_redirects)
+    (None, all_redirects, any_timed_out)
 }
 
 /// WebSocket domains for a given DC when routing through one or more
@@ -407,7 +486,9 @@ pub async fn connect_cf_ws_for_dc_with_outbound(
 
         // Pass the CF domain as the TCP host so that Tokio's DNS resolution
         // returns Cloudflare's anycast IP rather than Telegram's DC IP.
-        match connect_ws_with_outbound(domain, domain, skip_tls_verify, timeout, outbound).await {
+        match connect_ws_with_outbound(domain, domain, skip_tls_verify, timeout, outbound, None)
+            .await
+        {
             WsConnectResult::Connected(ws) => {
                 return (Some(ws), false);
             }
@@ -440,6 +521,7 @@ pub async fn connect_cf_ws_for_dc_with_outbound(
                         skip_tls_verify,
                         timeout,
                         outbound,
+                        None,
                     )
                     .await
                     {
@@ -465,6 +547,15 @@ pub async fn connect_cf_ws_for_dc_with_outbound(
                             );
                             all_redirects = false;
                         }
+                        WsConnectResult::TimedOut => {
+                            warn!(
+                                "CF WS DC{}{} timed out on {}",
+                                dc,
+                                if is_media { "m" } else { "" },
+                                fallback
+                            );
+                            all_redirects = false;
+                        }
                     }
                 } else {
                     warn!(
@@ -476,6 +567,15 @@ pub async fn connect_cf_ws_for_dc_with_outbound(
                     );
                     all_redirects = false;
                 }
+            }
+            WsConnectResult::TimedOut => {
+                warn!(
+                    "CF WS DC{}{} timed out on {}",
+                    dc,
+                    if is_media { "m" } else { "" },
+                    domain
+                );
+                all_redirects = false;
             }
         }
     }
@@ -537,6 +637,7 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound(
         skip_tls_verify,
         timeout,
         outbound,
+        None,
     )
     .await
     {
@@ -558,6 +659,15 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound(
                 if is_media { "m" } else { "" },
                 worker_domain,
                 reason
+            );
+            None
+        }
+        WsConnectResult::TimedOut => {
+            warn!(
+                "CF Worker DC{}{} timed out on {}",
+                dc,
+                if is_media { "m" } else { "" },
+                worker_domain
             );
             None
         }
@@ -609,11 +719,19 @@ fn build_default_rustls_config() -> rustls::ClientConfig {
 }
 
 fn build_no_verify_connector() -> Connector {
-    let config = rustls::ClientConfig::builder()
+    Connector::Rustls(Arc::new(no_verify_rustls_config()))
+}
+
+/// A `rustls::ClientConfig` that accepts any certificate, regardless of
+/// hostname or trust chain. Shared by `--danger-accept-invalid-certs` and by
+/// the domain-fronting path, which *always* needs it: the real certificate
+/// presented by Telegram can never match a fronted (spoofed) SNI hostname, so
+/// hostname verification would fail even for an otherwise-legitimate server.
+fn no_verify_rustls_config() -> rustls::ClientConfig {
+    rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerifier))
-        .with_no_client_auth();
-    Connector::Rustls(Arc::new(config))
+        .with_no_client_auth()
 }
 
 /// Build a root certificate store from the bundled WebPKI roots.
@@ -674,3 +792,6 @@ impl ServerCertVerifier for NoVerifier {
         ]
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -821,27 +821,86 @@ pub async fn handle_client_with_runtime(
         ws
     } else {
         // ── Step 6b: fresh WebSocket connect ────────────────────────────
-        let (ws_opt, all_redirects) = connect_ws_for_dc_with_outbound(
+        // While the domain-fronting fallback is in its sticky window, skip
+        // straight to a fronted attempt instead of the normal per-domain
+        // loop — matching upstream's "stay fronted while it keeps working"
+        // behavior instead of re-probing the (likely still-blocked) direct
+        // path on every connection.
+        let sticky_fronting_domain = runtime
+            .fronting_active()
+            .then(|| runtime.fronting_domain())
+            .flatten();
+
+        let (mut ws_opt, all_redirects, timed_out) = connect_ws_for_dc_with_outbound(
             &target_ip,
             ws_dc,
             is_media,
             skip_tls,
             ws_timeout,
             runtime.outbound(),
+            sticky_fronting_domain,
         )
         .await;
 
-        match ws_opt {
-            Some(ws) => {
-                clear_dc_cooldown(dc_id, is_media);
-
+        if let Some(domain) = sticky_fronting_domain {
+            if ws_opt.is_some() {
+                runtime.activate_fronting();
                 info!(
-                    "[{}] DC{}{} → WS connected via {}",
-                    label, dc_id, media_tag, target_ip
+                    "[{}] DC{}{} → fronting connected (SNI {})",
+                    label, dc_id, media_tag, domain
                 );
-
-                ws
+            } else {
+                runtime.deactivate_fronting();
+                warn!(
+                    "[{}] DC{}{} fronting (sticky) failed, falling back",
+                    label, dc_id, media_tag
+                );
             }
+        } else if ws_opt.is_some() {
+            clear_dc_cooldown(dc_id, is_media);
+
+            info!(
+                "[{}] DC{}{} → WS connected via {}",
+                label, dc_id, media_tag, target_ip
+            );
+        } else if timed_out && let Some(domain) = runtime.fronting_domain() {
+            // Reactive fronting: the normal (non-fronted) attempt above
+            // timed out — a sign of SNI-based DPI blocking — so try once
+            // more with the fronted SNI before falling back to cooldown +
+            // CF/upstream/TCP.
+            info!(
+                "[{}] DC{}{} WS timed out → trying fronting (SNI {})",
+                label, dc_id, media_tag, domain
+            );
+
+            let (front_opt, _all_redirects, _timed_out) = connect_ws_for_dc_with_outbound(
+                &target_ip,
+                ws_dc,
+                is_media,
+                skip_tls,
+                ws_timeout,
+                runtime.outbound(),
+                Some(domain),
+            )
+            .await;
+
+            if front_opt.is_some() {
+                runtime.activate_fronting();
+                info!(
+                    "[{}] DC{}{} → fronting connected (SNI {})",
+                    label, dc_id, media_tag, domain
+                );
+            } else {
+                warn!(
+                    "[{}] DC{}{} fronting fallback failed",
+                    label, dc_id, media_tag
+                );
+            }
+            ws_opt = front_opt;
+        }
+
+        match ws_opt {
+            Some(ws) => ws,
             None => {
                 // WS failed — apply cooldown and try CF proxy, upstream proxies, or TCP fallback.
                 if all_redirects {

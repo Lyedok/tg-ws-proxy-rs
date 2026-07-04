@@ -327,6 +327,32 @@ pub struct Config {
     )]
     pub cf_fail_cooldown: u64,
 
+    /// Domain to present as the TLS SNI for the domain-fronting fallback,
+    /// used when direct WebSocket connects to a DC keep timing out (a sign
+    /// of SNI-based DPI blocking). The real DC IP and `Host` are still used —
+    /// only the SNI is swapped for this unrelated, presumably-unblocked
+    /// domain, e.g. `sprinthost.ru` (the value upstream tg-ws-proxy uses).
+    ///
+    /// Disabled unless set. TLS certificate verification is unconditionally
+    /// skipped on connections using this fallback: the real Telegram
+    /// certificate can never match a fronted SNI, so hostname verification
+    /// would always fail — this is inherent to the technique, not a bug.
+    ///
+    /// Once a fronted connection succeeds, the fallback stays active for
+    /// `--fronting-cooldown` seconds so new connections (including
+    /// background pool refills) keep using it.
+    #[arg(long = "fronting-domain", env = "TG_FRONTING_DOMAIN")]
+    pub fronting_domain: Option<String>,
+
+    /// Seconds to keep the domain-fronting fallback active after it last
+    /// succeeded, before returning to normal direct WebSocket attempts.
+    #[arg(
+        long = "fronting-cooldown",
+        default_value = "1800",
+        env = "TG_FRONTING_COOLDOWN"
+    )]
+    pub fronting_cooldown: u64,
+
     /// Maximum age of a pooled WebSocket connection in seconds.
     /// Connections older than this are discarded and re-established.
     #[arg(long = "pool-max-age", default_value = "55", env = "TG_POOL_MAX_AGE")]
