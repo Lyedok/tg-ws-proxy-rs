@@ -93,7 +93,7 @@ tg-ws-proxy [OPTIONS]
 | Flag | Default | Description |
 |---|---|---|
 | `--port <PORT>` | `1443` | Listen port |
-| `--host <HOST>` | `127.0.0.1` | Listen address |
+| `--host <HOST>` | auto-detected | Listen address. Binds `0.0.0.0` if a LAN IP is detected (so it matches the auto-detected link IP below), otherwise `127.0.0.1` |
 | `--link-ip <IP>` | auto-detected | IP shown in the `tg://` link (see [Router deployment](#router-deployment)) |
 | `--secret <HEX>` | random | 32 hex-char MTProto secret (repeatable / comma-separated for per-user secrets) |
 | `--listen-faketls-domain <DOMAIN>` | — | Accept inbound clients with `ee` FakeTLS and advertise this SNI domain in the link |
@@ -468,16 +468,17 @@ warning — it will still start normally.
 
 ### Router deployment
 
-Run the proxy on your router with `--host 0.0.0.0` so it accepts connections
-from all LAN devices:
+Run the proxy on your router without `--host` (or with `--host 0.0.0.0`) so
+it accepts connections from all LAN devices:
 
 ```bash
-tg-ws-proxy --host 0.0.0.0 --port 1443
+tg-ws-proxy --port 1443
 ```
 
-When `--host 0.0.0.0` is used, the proxy **auto-detects** the router's LAN IP
-address and uses it in the generated `tg://` link, so you can share the same
-link with every device on your network.
+When no `--host` is given and a LAN IP can be auto-detected, the proxy binds
+`0.0.0.0` (all interfaces) and uses the detected LAN IP in the generated
+`tg://` link, so the link is actually reachable and you can share it with
+every device on your network.
 
 If auto-detection picks the wrong interface, override it explicitly:
 
@@ -485,9 +486,10 @@ If auto-detection picks the wrong interface, override it explicitly:
 tg-ws-proxy --host 0.0.0.0 --link-ip 192.168.1.1
 ```
 
-> **Note:** The default `--host 127.0.0.1` only accepts connections from the
+> **Note:** Passing `--host 127.0.0.1` explicitly restricts connections to the
 > machine running the proxy. Other devices on the network will not be able to
-> connect unless you change this to `0.0.0.0` (or the router's LAN IP).
+> connect unless you use `0.0.0.0` (or omit `--host` entirely) so it binds to
+> the router's LAN IP.
 
 ## Telegram Desktop Setup
 
