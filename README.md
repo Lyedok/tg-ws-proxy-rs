@@ -107,6 +107,7 @@ tg-ws-proxy [OPTIONS]
 | `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` and `--cf-worker-domain` values (see [CF Proxy](#cloudflare-proxy)) |
 | `--fronting-domain <DOMAIN>` | off | Domain-fronting fallback SNI, e.g. `sprinthost.ru` (see [Domain fronting](#domain-fronting)) |
 | `--fronting-cooldown <SECS>` | `1800` | How long the fronting fallback stays active after it last succeeded |
+| `--fronting-fail-cooldown <SECS>` | `60` | How long to stop retrying fronting after it fails for a DC (protects against networks that block Telegram's DC IPs outright, where fronting can never succeed) |
 | `--max-connections <N>` | auto | Max concurrent client connections (auto-computed from `ulimit -n`) |
 | `--mtproto-proxy <HOST:PORT:SECRET>` | — | Upstream MTProto proxy fallback (repeatable) |
 | `--outbound-proxy <URL>` | — | Proxy for all outgoing connections: `http://`, `socks5://`, or `socks5h://`; `https://` proxy URLs are not supported |
@@ -122,7 +123,7 @@ Every flag has a matching environment variable (`TG_PORT`, `TG_HOST`,
 `TG_VERBOSE`, `TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_LISTEN_FAKETLS_DOMAIN`, `TG_MTPROTO_PROXY`,
 `TG_LOG_FILE`, `TG_CF_DOMAIN`, `TG_CF_WORKER_DOMAIN`, `TG_CF_PRIORITY`,
 `TG_CF_BALANCE`, `TG_DEFAULT_DOMAINS`, `TG_OUTBOUND_PROXY`, `TG_NO_OUTBOUND_PROXY`, `TG_NO_PROXY`,
-`TG_FRONTING_DOMAIN`, `TG_FRONTING_COOLDOWN`).
+`TG_FRONTING_DOMAIN`, `TG_FRONTING_COOLDOWN`, `TG_FRONTING_FAIL_COOLDOWN`).
 When `TG_OUTBOUND_PROXY` is not set, standard `HTTPS_PROXY`, `ALL_PROXY`,
 `HTTP_PROXY` and `NO_PROXY` environment variables are also honored. `https://`
 proxy URLs are skipped when discovered from the standard environment if a later
@@ -350,6 +351,10 @@ The proxy will try the CF path as a fallback after direct WebSocket fails.
 With `--cf-priority`, the CF proxy is tried **before** direct WebSocket for all
 DCs.
 
+Every connection retries every configured CF domain fresh — a failure isn't
+remembered across connections (matching upstream tg-ws-proxy), so one flaky
+domain can never block the others, or the whole DC, from being tried.
+
 #### `--cf-balance` — round-robin load balancing
 
 When multiple `--cf-domain` values are given, connections normally always start
@@ -442,14 +447,28 @@ the HTTP `Host`. DPI that filters by SNI sees the fronted name; the actual
 (TLS-encrypted) request still reaches Telegram normally.
 
 ```bash
-tg-ws-proxy --fronting-domain sprinthost.ru
+tg-ws-proxy --dc-ip 2:149.154.167.220 --fronting-domain sprinthost.ru
 ```
+
+**Only takes effect when `--dc-ip` is configured for a DC** — this matches
+upstream tg-ws-proxy exactly: fronting is purely a direct-connection
+technique and is never applied to CF proxy, CF Worker, or upstream MTProto
+proxy connections (see their respective sections below). If you rely solely
+on `--cf-domain`/`--default-domains` — the common way to route around a
+block, and what suppresses the built-in `--dc-ip` default (see the
+`--dc-ip` row above) — `--fronting-domain` has no effect, by design.
+Upstream's own guidance for a network that blocks Telegram's IPs outright
+(where fronting can't help either, since it still needs a real TCP
+connection to that IP) is to leave `--dc-ip` unset entirely.
 
 Disabled unless `--fronting-domain` is set. Once a fronted connection
 succeeds, the fallback stays active (including for background connection-pool
 refills) for `--fronting-cooldown` seconds (default 1800 = 30 min), so the
 proxy doesn't keep re-probing the likely-still-blocked direct path on every
-new connection.
+new connection. If a fronting attempt fails, `--fronting-fail-cooldown`
+seconds (default 60) pass before it's retried for that DC — otherwise a
+network where fronting can never succeed (e.g. the DC IP itself is blocked)
+would pay for a doomed attempt on every single connection.
 
 > **Note:** TLS certificate verification is unconditionally skipped on
 > connections using this fallback, regardless of

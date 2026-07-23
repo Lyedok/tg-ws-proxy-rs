@@ -259,6 +259,56 @@ async fn proxy_tcp_fallback_uses_outbound_proxy() {
     assert!(request.starts_with("CONNECT 149.154.167.51:443 HTTP/1.1"));
 }
 
+#[tokio::test]
+async fn cf_proxy_is_retried_fresh_on_every_connection_no_cooldown() {
+    // Regression test for issue #81: a per-DC cooldown used to block *every*
+    // CF domain for a DC after a single failed attempt, so with
+    // --cf-balance/--default-domains (many domains) one flaky domain could
+    // knock out CF entirely for --cf-fail-cooldown seconds, forcing every
+    // connection in that window straight to the (often doomed) TCP fallback.
+    // Upstream tg-ws-proxy's `_cfproxy_fallback` has no such cooldown at
+    // all — every connection retries every configured domain fresh — so we
+    // now match that. With one CF domain configured (2 domain variants:
+    // kwsN and kwsN-1) and no --dc-ip/upstream-proxy, each of 2 separate
+    // client connections should independently try both CF domain variants
+    // before falling through to TCP: 3 CONNECTs per connection, 6 total.
+    // The old cooldown-gated behavior would only produce 4 (connection 2
+    // skips CF and goes straight to its single TCP-fallback attempt).
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests(6).await;
+    let make_config = || {
+        Config::try_parse_from([
+            "tg-ws-proxy",
+            "--secret",
+            "00112233445566778899aabbccddeeff",
+            "--cf-domain",
+            "example.net",
+            "--outbound-proxy",
+            &format!("http://{proxy_addr}"),
+            "--no-outbound-proxy",
+            "--no-proxy",
+            "",
+            "--handshake-timeout",
+            "2",
+            "--cf-connect-timeout",
+            "2",
+            "--tcp-fallback-timeout",
+            "2",
+        ])
+        .unwrap()
+    };
+
+    run_proxy_once(make_config()).await;
+    run_proxy_once(make_config()).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(
+        requests.len(),
+        6,
+        "expected both connections to retry CF fresh (2 domains + TCP \
+         fallback each), got {requests:?}"
+    );
+}
+
 async fn rejecting_http_proxy() -> (std::net::SocketAddr, tokio::task::JoinHandle<String>) {
     let (addr, task) = rejecting_http_proxy_requests(1).await;
     let task = tokio::spawn(async move { await_proxy_requests(task).await.remove(0) });
@@ -350,9 +400,19 @@ async fn read_http_connect_request(stream: &mut TcpStream) -> String {
 }
 
 async fn run_proxy_once(config: Config) {
+    run_proxy_once_for_dc(config, 2).await;
+}
+
+/// Same as [`run_proxy_once`], but lets the caller pick the DC so tests that
+/// touch DC-keyed global cooldown state (e.g. the fronting fail-cooldown)
+/// don't collide with other tests sharing the same test binary process.
+async fn run_proxy_once_for_dc(config: Config, dc: i16) {
     let secret = config.secret_bytes();
     let outbound = config.outbound_connector().unwrap();
-    let runtime = Arc::new(Runtime::new(outbound));
+    let runtime = Arc::new(Runtime::new(outbound).with_fronting(
+        config.fronting_domain.clone(),
+        Duration::from_secs(config.fronting_cooldown),
+    ));
     let pool = Arc::new(WsPool::with_runtime(
         0,
         Duration::from_secs(config.pool_max_age),
@@ -370,7 +430,7 @@ async fn run_proxy_once(config: Config) {
     let proxy_task = tokio::spawn(handle_client_with_runtime(
         server, peer, config, pool, runtime,
     ));
-    let (handshake, _, _) = generate_client_handshake(&secret, 2, ProtoTag::PaddedIntermediate);
+    let (handshake, _, _) = generate_client_handshake(&secret, dc, ProtoTag::PaddedIntermediate);
     client.write_all(&handshake).await.unwrap();
     drop(client);
 

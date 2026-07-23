@@ -333,6 +333,16 @@ pub struct Config {
     /// only the SNI is swapped for this unrelated, presumably-unblocked
     /// domain, e.g. `sprinthost.ru` (the value upstream tg-ws-proxy uses).
     ///
+    /// **Only takes effect when `--dc-ip` is configured for that DC** — by
+    /// design, matching upstream tg-ws-proxy exactly: fronting only ever
+    /// applies to a direct connection to Telegram's real DC IP, never to the
+    /// CF proxy/Worker/upstream-proxy paths. If you rely solely on
+    /// `--cf-domain`/`--default-domains` (no `--dc-ip`), this flag has no
+    /// effect — upstream's own troubleshooting guidance for a network where
+    /// Telegram's IPs are blocked outright (where fronting can't help, since
+    /// it still needs a real TCP connection to that IP) is to leave
+    /// `--dc-ip` unset entirely so this path is never attempted.
+    ///
     /// Disabled unless set. TLS certificate verification is unconditionally
     /// skipped on connections using this fallback: the real Telegram
     /// certificate can never match a fronted SNI, so hostname verification
@@ -352,6 +362,21 @@ pub struct Config {
         env = "TG_FRONTING_COOLDOWN"
     )]
     pub fronting_cooldown: u64,
+
+    /// Seconds to stop retrying the domain-fronting fallback after it fails.
+    ///
+    /// Fronting only helps against SNI-based DPI blocking — it does nothing
+    /// for a network that blocks Telegram's DC IPs outright (the fronted
+    /// attempt still has to open a real TCP connection to that IP). Without
+    /// this cooldown, every connection to that DC would retry fronting from
+    /// scratch and pay a full `--ws-connect-timeout` for a doomed attempt on
+    /// top of the already doomed direct/CF/upstream/TCP attempts.
+    #[arg(
+        long = "fronting-fail-cooldown",
+        default_value = "60",
+        env = "TG_FRONTING_FAIL_COOLDOWN"
+    )]
+    pub fronting_fail_cooldown: u64,
 
     /// Maximum age of a pooled WebSocket connection in seconds.
     /// Connections older than this are discarded and re-established.
