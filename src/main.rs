@@ -254,10 +254,20 @@ async fn main() {
     }
 
     if let Some(domain) = runtime.fronting_domain() {
-        info!(
-            "  Domain fronting: enabled (SNI {}, sticky for {}s after success)",
-            domain, config.fronting_cooldown
-        );
+        if dc_redirects.is_empty() {
+            warn!(
+                "  ⚠  --fronting-domain {} has no effect: no --dc-ip is configured. \
+                 Fronting only applies to a direct connection to a DC's real IP \
+                 (matching upstream tg-ws-proxy) — it is never used for CF proxy, \
+                 CF Worker, or upstream MTProto proxy connections.",
+                domain
+            );
+        } else {
+            info!(
+                "  Domain fronting: enabled (SNI {}, sticky for {}s after success)",
+                domain, config.fronting_cooldown
+            );
+        }
     }
 
     info!(

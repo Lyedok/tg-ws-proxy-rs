@@ -144,35 +144,10 @@ fn balanced_cf_workers(cf_worker_domains: &[String]) -> Vec<String> {
     result
 }
 
-/// Per-DC cooldown for the CF proxy path.
-static CF_FAIL_UNTIL: StdMutex<Option<HashMap<(u32, bool), Instant>>> = StdMutex::new(None);
 /// Per-Worker cooldown for the Cloudflare Worker path.
 static CF_WORKER_FAIL_UNTIL: StdMutex<Option<HashMap<String, Instant>>> = StdMutex::new(None);
 type TcpReader = ReadHalf<TcpStream>;
 type TcpWriter = WriteHalf<TcpStream>;
-
-fn set_cf_cooldown(dc: u32, is_media: bool, cooldown: Duration) {
-    let mut lock = CF_FAIL_UNTIL.lock().unwrap();
-    lock.get_or_insert_with(HashMap::new)
-        .insert((dc, is_media), Instant::now() + cooldown);
-}
-
-fn clear_cf_cooldown(dc: u32, is_media: bool) {
-    let mut lock = CF_FAIL_UNTIL.lock().unwrap();
-    if let Some(map) = lock.as_mut() {
-        map.remove(&(dc, is_media));
-    }
-}
-
-fn cf_in_cooldown(dc: u32, is_media: bool) -> bool {
-    let lock = CF_FAIL_UNTIL.lock().unwrap();
-    if let Some(map) = lock.as_ref()
-        && let Some(&until) = map.get(&(dc, is_media))
-    {
-        return Instant::now() < until;
-    }
-    false
-}
 
 fn set_cf_worker_cooldown(worker_domain: &str, cooldown: Duration) {
     let mut lock = CF_WORKER_FAIL_UNTIL.lock().unwrap();
@@ -191,6 +166,38 @@ fn cf_worker_in_cooldown(worker_domain: &str) -> bool {
     let lock = CF_WORKER_FAIL_UNTIL.lock().unwrap();
     if let Some(map) = lock.as_ref()
         && let Some(&until) = map.get(worker_domain)
+    {
+        return Instant::now() < until;
+    }
+    false
+}
+
+// ─── Domain-fronting failure tracking ────────────────────────────────────────
+
+/// Per-DC cooldown for a *failed* fronting attempt — distinct from
+/// `Runtime`'s sticky "fronting is currently working" state. Without this,
+/// a network that blocks Telegram's DC IPs outright (not just by SNI) would
+/// retry a doomed fronting attempt on every single connection; see
+/// `Config::fronting_fail_cooldown`.
+static FRONTING_FAIL_UNTIL: StdMutex<Option<HashMap<(u32, bool), Instant>>> = StdMutex::new(None);
+
+fn set_fronting_fail_cooldown(dc: u32, is_media: bool, cooldown: Duration) {
+    let mut lock = FRONTING_FAIL_UNTIL.lock().unwrap();
+    lock.get_or_insert_with(HashMap::new)
+        .insert((dc, is_media), Instant::now() + cooldown);
+}
+
+fn clear_fronting_fail_cooldown(dc: u32, is_media: bool) {
+    let mut lock = FRONTING_FAIL_UNTIL.lock().unwrap();
+    if let Some(map) = lock.as_mut() {
+        map.remove(&(dc, is_media));
+    }
+}
+
+fn fronting_in_fail_cooldown(dc: u32, is_media: bool) -> bool {
+    let lock = FRONTING_FAIL_UNTIL.lock().unwrap();
+    if let Some(map) = lock.as_ref()
+        && let Some(&until) = map.get(&(dc, is_media))
     {
         return Instant::now() < until;
     }
@@ -396,6 +403,7 @@ pub async fn handle_client_with_runtime(
     let upstream_fail_cooldown = Duration::from_secs(config.upstream_fail_cooldown);
     let cf_connect_timeout = Duration::from_secs(config.cf_connect_timeout);
     let cf_fail_cooldown = Duration::from_secs(config.cf_fail_cooldown);
+    let fronting_fail_cooldown = Duration::from_secs(config.fronting_fail_cooldown);
 
     // Split into independent read / write halves.
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -566,62 +574,57 @@ pub async fn handle_client_with_runtime(
         }
 
         // ── Try Cloudflare proxy if configured ────────────────────────────
+        // Always attempted fresh — no per-DC cooldown here, matching
+        // upstream's `_cfproxy_fallback`, which retries every configured
+        // domain on every single connection with no failure memory at all.
+        // A per-DC cooldown (removed) meant one flaky domain among many
+        // (e.g. with --cf-balance/--default-domains) blocked *all* of them
+        // for the whole cooldown window, forcing every connection in that
+        // window down into the fronting/TCP fallback instead.
         if !config.cf_domains.is_empty() {
-            if !cf_in_cooldown(dc_id, is_media) {
-                let cf_domains_for_conn = if config.cf_balance {
-                    balanced_cf_domains(&config.cf_domains)
-                } else {
-                    config.cf_domains.clone()
-                };
-                debug!(
-                    "[{}] DC{}{} {} → trying CF proxy via {:?}",
-                    label, dc_id, media_tag, reason, cf_domains_for_conn
-                );
+            let cf_domains_for_conn = if config.cf_balance {
+                balanced_cf_domains(&config.cf_domains)
+            } else {
+                config.cf_domains.clone()
+            };
+            debug!(
+                "[{}] DC{}{} {} → trying CF proxy via {:?}",
+                label, dc_id, media_tag, reason, cf_domains_for_conn
+            );
 
-                let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
-                    dc_id,
-                    &cf_domains_for_conn,
-                    is_media,
-                    skip_tls,
-                    cf_connect_timeout,
-                    runtime.outbound(),
+            let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
+                dc_id,
+                &cf_domains_for_conn,
+                is_media,
+                skip_tls,
+                cf_connect_timeout,
+                runtime.outbound(),
+            )
+            .await;
+
+            if let Some(ws) = cf_ws_opt {
+                info!(
+                    "[{}] DC{}{} {} → CF proxy connected",
+                    label, dc_id, media_tag, reason
+                );
+                bridge_ws(
+                    reader,
+                    writer,
+                    WsBridgeParams {
+                        label: &label,
+                        ws,
+                        relay_init,
+                        ciphers,
+                        proto,
+                        dc: dc_id,
+                        is_media,
+                    },
                 )
                 .await;
-
-                if let Some(ws) = cf_ws_opt {
-                    clear_cf_cooldown(dc_id, is_media);
-                    info!(
-                        "[{}] DC{}{} {} → CF proxy connected",
-                        label, dc_id, media_tag, reason
-                    );
-                    bridge_ws(
-                        reader,
-                        writer,
-                        WsBridgeParams {
-                            label: &label,
-                            ws,
-                            relay_init,
-                            ciphers,
-                            proto,
-                            dc: dc_id,
-                            is_media,
-                        },
-                    )
-                    .await;
-                    return;
-                } else {
-                    set_cf_cooldown(dc_id, is_media, cf_fail_cooldown);
-                    warn!(
-                        "[{}] DC{}{} CF proxy failed, cooldown {}s",
-                        label,
-                        dc_id,
-                        media_tag,
-                        cf_fail_cooldown.as_secs()
-                    );
-                }
+                return;
             } else {
-                debug!(
-                    "[{}] DC{}{} CF proxy in cooldown, skipping",
+                warn!(
+                    "[{}] DC{}{} CF proxy failed (all configured domains)",
                     label, dc_id, media_tag
                 );
             }
@@ -748,62 +751,52 @@ pub async fn handle_client_with_runtime(
     let ws_timeout = ws_timeout_for(dc_id, is_media, ws_connect_timeout, ws_fail_probe_timeout);
 
     // ── Step 6: CF priority — try CF proxy before direct WS if enabled ──
+    // No per-DC cooldown gate — see the note on the other CF proxy attempt
+    // below for why (matches upstream's memoryless per-connection retry).
     if config.cf_priority && !config.cf_domains.is_empty() {
-        if !cf_in_cooldown(dc_id, is_media) {
-            let cf_domains_for_conn = if config.cf_balance {
-                balanced_cf_domains(&config.cf_domains)
-            } else {
-                config.cf_domains.clone()
-            };
-            debug!(
-                "[{}] DC{}{} cf-priority → trying CF proxy first",
+        let cf_domains_for_conn = if config.cf_balance {
+            balanced_cf_domains(&config.cf_domains)
+        } else {
+            config.cf_domains.clone()
+        };
+        debug!(
+            "[{}] DC{}{} cf-priority → trying CF proxy first",
+            label, dc_id, media_tag
+        );
+
+        let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
+            dc_id,
+            &cf_domains_for_conn,
+            is_media,
+            skip_tls,
+            cf_connect_timeout,
+            runtime.outbound(),
+        )
+        .await;
+
+        if let Some(ws) = cf_ws_opt {
+            info!(
+                "[{}] DC{}{} → CF proxy connected (priority)",
                 label, dc_id, media_tag
             );
-
-            let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
-                dc_id,
-                &cf_domains_for_conn,
-                is_media,
-                skip_tls,
-                cf_connect_timeout,
-                runtime.outbound(),
+            bridge_ws(
+                reader,
+                writer,
+                WsBridgeParams {
+                    label: &label,
+                    ws,
+                    relay_init,
+                    ciphers,
+                    proto,
+                    dc: dc_id,
+                    is_media,
+                },
             )
             .await;
-
-            if let Some(ws) = cf_ws_opt {
-                clear_cf_cooldown(dc_id, is_media);
-                info!(
-                    "[{}] DC{}{} → CF proxy connected (priority)",
-                    label, dc_id, media_tag
-                );
-                bridge_ws(
-                    reader,
-                    writer,
-                    WsBridgeParams {
-                        label: &label,
-                        ws,
-                        relay_init,
-                        ciphers,
-                        proto,
-                        dc: dc_id,
-                        is_media,
-                    },
-                )
-                .await;
-                return;
-            } else {
-                set_cf_cooldown(dc_id, is_media, cf_fail_cooldown);
-                warn!(
-                    "[{}] DC{}{} CF proxy failed (priority), cooldown {}s — falling back to WS",
-                    label,
-                    dc_id,
-                    media_tag,
-                    cf_fail_cooldown.as_secs()
-                );
-            }
+            return;
         } else {
-            debug!(
-                "[{}] DC{}{} CF proxy in cooldown (priority), trying WS",
+            warn!(
+                "[{}] DC{}{} CF proxy failed (priority) — falling back to WS",
                 label, dc_id, media_tag
             );
         }
@@ -844,6 +837,7 @@ pub async fn handle_client_with_runtime(
 
         if let Some(domain) = sticky_fronting_domain {
             if ws_opt.is_some() {
+                clear_fronting_fail_cooldown(dc_id, is_media);
                 runtime.activate_fronting();
                 info!(
                     "[{}] DC{}{} → fronting connected (SNI {})",
@@ -851,9 +845,13 @@ pub async fn handle_client_with_runtime(
                 );
             } else {
                 runtime.deactivate_fronting();
+                set_fronting_fail_cooldown(dc_id, is_media, fronting_fail_cooldown);
                 warn!(
-                    "[{}] DC{}{} fronting (sticky) failed, falling back",
-                    label, dc_id, media_tag
+                    "[{}] DC{}{} fronting (sticky) failed, falling back, cooldown {}s",
+                    label,
+                    dc_id,
+                    media_tag,
+                    fronting_fail_cooldown.as_secs()
                 );
             }
         } else if ws_opt.is_some() {
@@ -863,11 +861,17 @@ pub async fn handle_client_with_runtime(
                 "[{}] DC{}{} → WS connected via {}",
                 label, dc_id, media_tag, target_ip
             );
-        } else if timed_out && let Some(domain) = runtime.fronting_domain() {
+        } else if timed_out
+            && !fronting_in_fail_cooldown(dc_id, is_media)
+            && let Some(domain) = runtime.fronting_domain()
+        {
             // Reactive fronting: the normal (non-fronted) attempt above
             // timed out — a sign of SNI-based DPI blocking — so try once
             // more with the fronted SNI before falling back to cooldown +
-            // CF/upstream/TCP.
+            // CF/upstream/TCP. Skipped while a previous fronting attempt is
+            // in its own fail-cooldown — a network that blocks the DC IP
+            // outright would otherwise pay for this doomed attempt on every
+            // single connection (see `fronting_fail_cooldown` docs).
             info!(
                 "[{}] DC{}{} WS timed out → trying fronting (SNI {})",
                 label, dc_id, media_tag, domain
@@ -885,15 +889,20 @@ pub async fn handle_client_with_runtime(
             .await;
 
             if front_opt.is_some() {
+                clear_fronting_fail_cooldown(dc_id, is_media);
                 runtime.activate_fronting();
                 info!(
                     "[{}] DC{}{} → fronting connected (SNI {})",
                     label, dc_id, media_tag, domain
                 );
             } else {
+                set_fronting_fail_cooldown(dc_id, is_media, fronting_fail_cooldown);
                 warn!(
-                    "[{}] DC{}{} fronting fallback failed",
-                    label, dc_id, media_tag
+                    "[{}] DC{}{} fronting fallback failed, cooldown {}s",
+                    label,
+                    dc_id,
+                    media_tag,
+                    fronting_fail_cooldown.as_secs()
                 );
             }
             ws_opt = front_opt;
@@ -993,59 +1002,49 @@ pub async fn handle_client_with_runtime(
 
                 // ── Try Cloudflare proxy if configured ────────────────────
                 // (Skip if --cf-priority already tried the CF path above.)
+                // No per-DC cooldown gate here either — see the note on the
+                // other CF proxy attempt above.
                 if !config.cf_priority && !config.cf_domains.is_empty() {
-                    if !cf_in_cooldown(dc_id, is_media) {
-                        let cf_domains_for_conn = if config.cf_balance {
-                            balanced_cf_domains(&config.cf_domains)
-                        } else {
-                            config.cf_domains.clone()
-                        };
-                        debug!(
-                            "[{}] DC{}{} WS/Worker failed → trying CF proxy",
-                            label, dc_id, media_tag
-                        );
+                    let cf_domains_for_conn = if config.cf_balance {
+                        balanced_cf_domains(&config.cf_domains)
+                    } else {
+                        config.cf_domains.clone()
+                    };
+                    debug!(
+                        "[{}] DC{}{} WS/Worker failed → trying CF proxy",
+                        label, dc_id, media_tag
+                    );
 
-                        let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
-                            dc_id,
-                            &cf_domains_for_conn,
-                            is_media,
-                            skip_tls,
-                            cf_connect_timeout,
-                            runtime.outbound(),
+                    let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
+                        dc_id,
+                        &cf_domains_for_conn,
+                        is_media,
+                        skip_tls,
+                        cf_connect_timeout,
+                        runtime.outbound(),
+                    )
+                    .await;
+
+                    if let Some(ws) = cf_ws_opt {
+                        info!("[{}] DC{}{} → CF proxy connected", label, dc_id, media_tag);
+                        bridge_ws(
+                            reader,
+                            writer,
+                            WsBridgeParams {
+                                label: &label,
+                                ws,
+                                relay_init,
+                                ciphers,
+                                proto,
+                                dc: dc_id,
+                                is_media,
+                            },
                         )
                         .await;
-
-                        if let Some(ws) = cf_ws_opt {
-                            clear_cf_cooldown(dc_id, is_media);
-                            info!("[{}] DC{}{} → CF proxy connected", label, dc_id, media_tag);
-                            bridge_ws(
-                                reader,
-                                writer,
-                                WsBridgeParams {
-                                    label: &label,
-                                    ws,
-                                    relay_init,
-                                    ciphers,
-                                    proto,
-                                    dc: dc_id,
-                                    is_media,
-                                },
-                            )
-                            .await;
-                            return;
-                        } else {
-                            set_cf_cooldown(dc_id, is_media, cf_fail_cooldown);
-                            warn!(
-                                "[{}] DC{}{} CF proxy failed, cooldown {}s",
-                                label,
-                                dc_id,
-                                media_tag,
-                                cf_fail_cooldown.as_secs()
-                            );
-                        }
+                        return;
                     } else {
-                        debug!(
-                            "[{}] DC{}{} CF proxy in cooldown, skipping",
+                        warn!(
+                            "[{}] DC{}{} CF proxy failed (all configured domains)",
                             label, dc_id, media_tag
                         );
                     }
@@ -1971,5 +1970,25 @@ mod tests {
 
         clear_cf_worker_cooldown("w1.example.workers.dev");
         assert!(!cf_worker_in_cooldown("w1.example.workers.dev"));
+    }
+
+    #[test]
+    fn fronting_fail_cooldown_is_tracked_per_dc_and_media_flag() {
+        // Use DC numbers not touched by other tests in this file (which run
+        // concurrently and share this same global static).
+        clear_fronting_fail_cooldown(90, false);
+        clear_fronting_fail_cooldown(90, true);
+
+        assert!(!fronting_in_fail_cooldown(90, false));
+        assert!(!fronting_in_fail_cooldown(90, true));
+
+        set_fronting_fail_cooldown(90, false, Duration::from_secs(60));
+        assert!(fronting_in_fail_cooldown(90, false));
+        // The media flag is part of the key — a non-media cooldown must not
+        // leak into the media bucket for the same DC.
+        assert!(!fronting_in_fail_cooldown(90, true));
+
+        clear_fronting_fail_cooldown(90, false);
+        assert!(!fronting_in_fail_cooldown(90, false));
     }
 }
