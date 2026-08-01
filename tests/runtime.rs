@@ -80,19 +80,18 @@ fn fallback_ip_is_known_for_every_built_in_dc() {
 }
 
 #[test]
-fn outbound_summary_reflects_the_configured_proxy() {
+fn the_configured_outbound_connector_is_handed_through() {
+    // What `summary()` renders is covered by tests/outbound.rs; here we only
+    // care that Runtime hands back the connector it was built with.
     let direct = Runtime::new(OutboundConnector::direct());
     assert_eq!(direct.outbound().summary(), None);
 
     let proxied = Runtime::new(
-        OutboundConnector::from_config(Some("socks5h://user:secret@127.0.0.1:1080"), None, false)
-            .unwrap(),
+        OutboundConnector::from_config(Some("socks5h://127.0.0.1:1080"), None, false).unwrap(),
     );
-    let summary = proxied.outbound().summary().expect("proxy summary");
-    assert_eq!(summary, "socks5h://user:***@127.0.0.1:1080");
-    assert!(
-        !summary.contains("secret"),
-        "credentials must not be logged"
+    assert_eq!(
+        proxied.outbound().summary().as_deref(),
+        Some("socks5h://127.0.0.1:1080")
     );
 }
 

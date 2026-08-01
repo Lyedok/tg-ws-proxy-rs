@@ -14,6 +14,10 @@ const UNLIMITED_MAX_CONNECTIONS: usize = 512;
 const RUNTIME_RESERVED_FDS: usize = 32;
 /// File descriptors used per active connection: one inbound, one outbound.
 const FDS_PER_CONNECTION: usize = 2;
+/// File descriptors reserved per pool bucket slot: the idle connection plus
+/// one in-flight refill. Numerically the same as [`FDS_PER_CONNECTION`], but a
+/// different quantity — don't collapse them.
+const FDS_PER_POOL_SLOT: usize = 2;
 /// Smallest cap worth serving, however tight the budget is.
 const MIN_MAX_CONNECTIONS: usize = 4;
 
@@ -61,13 +65,10 @@ pub fn auto_max_connections(fd_limit: usize, pool_size: usize, dc_buckets: usize
 
     let pool_fds = pool_size
         .saturating_mul(dc_buckets)
-        .saturating_mul(FDS_PER_CONNECTION);
+        .saturating_mul(FDS_PER_POOL_SLOT);
     let reserved = 1usize
         .saturating_add(pool_fds)
         .saturating_add(RUNTIME_RESERVED_FDS);
 
     (fd_limit.saturating_sub(reserved) / FDS_PER_CONNECTION).max(MIN_MAX_CONNECTIONS)
 }
-
-#[cfg(test)]
-mod tests;

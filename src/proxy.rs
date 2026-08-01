@@ -59,19 +59,35 @@ use crate::ws_client::{
 type TcpReader = ReadHalf<TcpStream>;
 type TcpWriter = WriteHalf<TcpStream>;
 
-/// Relay buffer size for the plain (non-FakeTLS) bridge directions.
+/// Relay buffer size for reads from the *remote* side.
 ///
-/// Deliberately small: this is allocated (and zeroed) **per direction, per
-/// connection**, so on the routers and embedded boxes this proxy targets it
-/// dominates the per-connection footprint.  16 KiB matches the cap the
-/// FakeTLS bridge has always run at — a full TLS record — and costs only
-/// extra `read` syscalls, since the per-byte work (AES-CTR, framing) is
-/// unchanged.  At 64 KiB, 200 concurrent connections reserved 25 MiB of
-/// buffers alone; at 16 KiB they reserve 6 MiB.
+/// Deliberately small: it is allocated (and zeroed) per connection, so on the
+/// routers and embedded boxes this proxy targets it dominates the
+/// per-connection footprint.  16 KiB matches the cap the FakeTLS bridge has
+/// always run at — a full TLS record — and costs only extra `read` syscalls,
+/// since the per-byte work (AES-CTR, framing) is unchanged.
+///
+/// How many of these a connection holds depends on its path.  The default
+/// WebSocket bridge holds none: `bridge_ws` reads downloads as owned frames
+/// off the socket and only buffers the client direction.  `bridge_tcp` and the
+/// plain relay hold one per direction.  So 200 concurrent connections went
+/// from 12.5 MiB to 3.1 MiB on the WebSocket path, and from 25 MiB to 6.2 MiB
+/// on the TCP fallback.
 const RELAY_BUF_SIZE: usize = 16 * 1024;
-/// Headroom over a full TLS record for the FakeTLS read buffer (record header
-/// plus the slack `read_tls_record` needs for an oversized record).
+/// AEAD expansion allowance over a full TLS record payload (RFC 8446 §5.2
+/// caps a ciphertext record at 2^14 + 256).  The 5-byte record header is read
+/// separately and never lands in these buffers.
 const TLS_READ_HEADROOM: usize = 256;
+
+/// Buffer size for reads from the *client*.
+///
+/// With `--listen-faketls-domain` a client read is a whole TLS record, and
+/// `read_tls_appdata` reports a record that does not fit as `Ok(0)` — which
+/// every bridge loop reads as EOF and silently ends the session. Sizing this
+/// to the same tolerance the inbound handshake already accepts keeps a client
+/// that emits a slightly oversized record working, for 256 bytes per
+/// connection.
+const CLIENT_READ_BUF_SIZE: usize = TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM;
 
 // ─── Failure cooldowns ───────────────────────────────────────────────────────
 
@@ -1032,7 +1048,7 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
 
     let upload = tokio::spawn(async move {
         let mut reader = reader;
-        let mut buf = vec![0u8; RELAY_BUF_SIZE];
+        let mut buf = vec![0u8; CLIENT_READ_BUF_SIZE];
         let mut total = 0u64;
 
         loop {
@@ -1264,16 +1280,9 @@ async fn bridge_relay(reader: ClientReader, writer: ClientWriter, params: RelayP
     let upload = tokio::spawn(async move {
         let mut reader = reader;
         let mut rem_writer = rem_writer;
-        // A FakeTLS record cannot carry more than one full TLS record's worth
-        // of payload, so the read is capped to that in FakeTLS mode.
-        let mut buf = vec![
-            0u8;
-            if faketls {
-                TLS_MAX_RECORD_PAYLOAD
-            } else {
-                RELAY_BUF_SIZE
-            }
-        ];
+        // Sized for the client side; `write_tls_appdata` re-chunks to the TLS
+        // record limit on its way out, so a larger read is safe.
+        let mut buf = vec![0u8; CLIENT_READ_BUF_SIZE];
         let mut total = 0u64;
 
         loop {
@@ -1304,6 +1313,9 @@ async fn bridge_relay(reader: ClientReader, writer: ClientWriter, params: RelayP
     let download = tokio::spawn(async move {
         let mut rem_reader = rem_reader;
         let mut writer = writer;
+        // In FakeTLS mode this must fit a whole record: `read_tls_appdata`
+        // reports one that does not as `Ok(0)`, which the loop below cannot
+        // tell from a clean EOF.
         let mut buf = vec![
             0u8;
             if faketls {
@@ -1408,7 +1420,7 @@ async fn bridge_tcp(
     let start = Instant::now();
 
     let upload = tokio::spawn(async move {
-        let mut buf = vec![0u8; RELAY_BUF_SIZE];
+        let mut buf = vec![0u8; CLIENT_READ_BUF_SIZE];
         let mut total = 0u64;
 
         loop {

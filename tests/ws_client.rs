@@ -160,7 +160,7 @@ async fn cloudflare_ws_connector_uses_outbound_proxy() {
 async fn cloudflare_ws_connector_tries_every_record_of_every_domain() {
     // Two CF domains × the kwsN / kwsN-1 record pair = four attempts before
     // the caller is told the whole CF tier failed.
-    let (proxy_addr, proxy_task) = common::rejecting_http_proxy_requests(4).await;
+    let (proxy_addr, proxy_task) = common::rejecting_http_proxy_requests().await;
     let outbound =
         OutboundConnector::from_config(Some(&format!("http://{proxy_addr}")), None, false).unwrap();
 

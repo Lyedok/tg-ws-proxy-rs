@@ -33,7 +33,7 @@ async fn an_empty_pool_misses_and_lets_the_caller_connect_directly() {
 async fn pool_refill_dials_through_the_outbound_connector() {
     // A miss schedules a background refill; with an unreachable upstream it
     // must give up rather than spin, and it must honour the outbound proxy.
-    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests(1).await;
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
     let outbound =
         OutboundConnector::from_config(Some(&format!("http://{proxy_addr}")), None, false).unwrap();
     let pool = pool_with_outbound(1, outbound);
@@ -53,10 +53,11 @@ async fn pool_refill_dials_through_the_outbound_connector() {
 
 #[tokio::test]
 async fn warmup_gives_up_on_unreachable_dcs_instead_of_hanging() {
-    // One CONNECT per (DC, media) bucket: connect_batch stops a bucket after
-    // its first failure, so a fully blocked network costs 2 attempts per DC
-    // rather than 2 × --pool-size.
-    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests(2).await;
+    // `connect_batch` abandons a bucket after its first failure, so a fully
+    // blocked network costs one *attempt* per (DC, media) bucket rather than
+    // `--pool-size` of them. Each attempt still tries both Telegram hostnames,
+    // so one DC costs 2 buckets × 2 records = 4 CONNECTs, not 2 × 4 = 8.
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
     let config = Config::try_parse_from([
         "tg-ws-proxy",
         "--dc-ip",
@@ -75,7 +76,17 @@ async fn warmup_gives_up_on_unreachable_dcs_instead_of_hanging() {
         .expect("warmup should not hang on an unreachable DC");
 
     let requests = await_proxy_requests(proxy_task).await;
-    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests.len(),
+        4,
+        "warmup should try each bucket once, not --pool-size times: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.starts_with("CONNECT 203.0.113.10:443 HTTP/1.1")),
+        "warmup dialled something other than the configured DC IP: {requests:?}"
+    );
 
     // Nothing was pooled, so a subsequent get still misses.
     assert!(

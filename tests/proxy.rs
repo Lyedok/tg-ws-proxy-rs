@@ -6,8 +6,8 @@ use tokio::io::AsyncWriteExt;
 use tg_ws_proxy_rs::config::Config;
 use tg_ws_proxy_rs::crypto::{ProtoTag, generate_client_handshake};
 use tg_ws_proxy_rs::faketls::{
-    build_faketls_client_hello, drain_faketls_server_hello, sign_faketls_client_hello,
-    write_tls_appdata,
+    TLS_MAX_RECORD_PAYLOAD, build_faketls_client_hello, drain_faketls_server_hello,
+    sign_faketls_client_hello, write_tls_appdata,
 };
 use tg_ws_proxy_rs::proxy::split_mtproto_init_and_pending;
 
@@ -19,6 +19,14 @@ use common::{
 };
 
 const SECRET: &str = "00112233445566778899aabbccddeeff";
+
+// The upstream-failure cooldown is a process-global map keyed by `host:port`,
+// and every test in this binary shares it. Tests that need the upstream tier
+// to actually be attempted therefore each use their own hostname, so a
+// sibling test failing its upstream cannot make this one skip the tier and
+// fall through to TCP instead.
+const UPSTREAM_FULL_RECORD: &str = "upstream-full-record.example";
+const UPSTREAM_OVERSIZED: &str = "upstream-oversized.example";
 
 // ─── Inbound handshake framing ───────────────────────────────────────────────
 
@@ -97,7 +105,7 @@ fn connect_targets(requests: &[String]) -> Vec<&str> {
 
 #[tokio::test]
 async fn proxy_upstream_fallback_uses_outbound_proxy() {
-    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests(2).await;
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
     let config = proxy_config(
         &format!("http://{proxy_addr}"),
         &["--mtproto-proxy", &format!("upstream.example:443:{SECRET}")],
@@ -142,7 +150,7 @@ async fn cf_proxy_is_retried_fresh_on_every_connection_no_cooldown() {
     // before falling through to TCP: 3 CONNECTs per connection, 6 total.
     // The old cooldown-gated behavior would only produce 4 (connection 2
     // skips CF and goes straight to its single TCP-fallback attempt).
-    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests(6).await;
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
     let make_config = || {
         proxy_config(
             &format!("http://{proxy_addr}"),
@@ -166,7 +174,7 @@ async fn cf_proxy_is_retried_fresh_on_every_connection_no_cooldown() {
 async fn cf_worker_is_tried_before_the_cf_proxy() {
     // The Python fallback order for a DC without --dc-ip is Worker, then CF
     // proxy, then TCP: 1 + 2 + 1 = 4 CONNECTs.
-    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests(4).await;
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
     let config = proxy_config(
         &format!("http://{proxy_addr}"),
         &[
@@ -195,7 +203,7 @@ async fn cf_worker_is_tried_before_the_cf_proxy() {
 async fn cf_priority_tries_the_cf_proxy_before_the_direct_websocket() {
     // With --dc-ip set the direct WS path is normally first; --cf-priority
     // flips that, and the CF tier is then not retried after WS also fails.
-    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests(5).await;
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
     let config = proxy_config(
         &format!("http://{proxy_addr}"),
         &[
@@ -285,6 +293,121 @@ async fn inbound_faketls_handshake_is_accepted_and_routed() {
     // The camouflaged handshake was unwrapped and routed like any other.
     let request = await_proxy_request(proxy_task).await;
     assert!(request.starts_with("CONNECT 149.154.167.51:443 HTTP/1.1"));
+}
+
+/// Drive a FakeTLS client through the handshake and hand back the two halves,
+/// ready for the data phase.
+async fn faketls_client_handshake(
+    client: tokio::net::TcpStream,
+    domain: &str,
+    secret: &[u8],
+) -> (
+    tokio::io::ReadHalf<tokio::net::TcpStream>,
+    tokio::io::WriteHalf<tokio::net::TcpStream>,
+) {
+    let (mut reader, mut writer) = tokio::io::split(client);
+
+    let mut client_hello = build_faketls_client_hello(domain);
+    sign_faketls_client_hello(&mut client_hello, secret);
+    writer.write_all(&client_hello).await.unwrap();
+
+    assert!(
+        drain_faketls_server_hello(&mut reader).await,
+        "proxy did not answer with a valid FakeTLS ServerHello"
+    );
+
+    let (handshake, _, _) = generate_client_handshake(secret, 2, ProtoTag::PaddedIntermediate);
+    write_tls_appdata(&mut writer, &handshake).await.unwrap();
+
+    (reader, writer)
+}
+
+#[tokio::test]
+async fn inbound_faketls_relays_a_maximum_size_application_data_record() {
+    // A client read is a whole TLS record, and `read_tls_appdata` signals a
+    // record that does not fit the buffer as `Ok(0)` — indistinguishable from
+    // EOF to the bridge. A full-size record (and one spanning two records)
+    // must therefore still be relayed rather than silently ending the session.
+    let domain = "example.com";
+    let (upstream_addr, upstream_task) = common::counting_mtproto_acceptor().await;
+    let (proxy_addr, proxy_task) = common::tunneling_http_proxy(upstream_addr).await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--listen-faketls-domain",
+            domain,
+            "--mtproto-proxy",
+            &format!("{UPSTREAM_FULL_RECORD}:443:{SECRET}"),
+        ],
+    );
+    let secret = config.secret_bytes();
+
+    let (client, handler) = start_proxy_connection(config).await;
+    let (reader, mut writer) = faketls_client_handshake(client, domain, &secret).await;
+
+    // One maximum-size record, then a payload that spans two records.
+    let full_record = vec![0xa5u8; TLS_MAX_RECORD_PAYLOAD];
+    let spanning = vec![0x5au8; TLS_MAX_RECORD_PAYLOAD + 1024];
+    write_tls_appdata(&mut writer, &full_record).await.unwrap();
+    write_tls_appdata(&mut writer, &spanning).await.unwrap();
+    drop(writer);
+    drop(reader);
+
+    await_proxy_handler(handler).await;
+
+    let relayed = common::await_task(upstream_task).await;
+    assert_eq!(
+        relayed,
+        full_record.len() + spanning.len(),
+        "the proxy dropped part of the client's application data"
+    );
+    let request = await_proxy_request(proxy_task).await;
+    assert!(request.starts_with(&format!("CONNECT {UPSTREAM_FULL_RECORD}:443 HTTP/1.1")));
+}
+
+#[tokio::test]
+async fn inbound_faketls_tolerates_a_slightly_oversized_record() {
+    // Regression guard: `read_tls_appdata` reports any record larger than the
+    // read buffer as `Ok(0)`, so a client that emits a record above the RFC
+    // maximum used to have its session end silently. The client-read buffer
+    // keeps the same tolerance the inbound handshake already accepts.
+    let domain = "example.com";
+    let oversized_len = TLS_MAX_RECORD_PAYLOAD + 100;
+
+    let (upstream_addr, upstream_task) = common::counting_mtproto_acceptor().await;
+    let (proxy_addr, proxy_task) = common::tunneling_http_proxy(upstream_addr).await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--listen-faketls-domain",
+            domain,
+            "--mtproto-proxy",
+            &format!("{UPSTREAM_OVERSIZED}:443:{SECRET}"),
+        ],
+    );
+    let secret = config.secret_bytes();
+
+    let (client, handler) = start_proxy_connection(config).await;
+    let (reader, mut writer) = faketls_client_handshake(client, domain, &secret).await;
+
+    // Hand-rolled, because `write_tls_appdata` correctly chunks at the RFC
+    // maximum and would never emit an oversized record itself.
+    let mut record = vec![0x17, 0x03, 0x03];
+    record.extend_from_slice(&(oversized_len as u16).to_be_bytes());
+    record.extend(std::iter::repeat_n(0x33u8, oversized_len));
+    writer.write_all(&record).await.unwrap();
+    drop(writer);
+    drop(reader);
+
+    await_proxy_handler(handler).await;
+
+    let relayed = common::await_task(upstream_task).await;
+    assert_eq!(
+        relayed, oversized_len,
+        "an oversized record was treated as EOF instead of being relayed"
+    );
+    let request = await_proxy_request(proxy_task).await;
+    assert!(request.starts_with(&format!("CONNECT {UPSTREAM_OVERSIZED}:443 HTTP/1.1")));
 }
 
 #[tokio::test]

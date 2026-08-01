@@ -217,6 +217,27 @@ fn dc_ip_flags_are_parsed_and_looked_up_individually() {
 }
 
 #[test]
+fn a_repeated_dc_ip_resolves_to_the_last_one_given() {
+    // The pool warms itself from `dc_redirects()` (a HashMap, so last wins)
+    // while routing uses `dc_target_ip`. If the two disagreed, the pool would
+    // pre-connect to one IP and the connect path use another.
+    let cfg = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--dc-ip",
+        "2:149.154.167.220",
+        "--dc-ip",
+        "2:149.154.167.51",
+    ])
+    .unwrap();
+
+    assert_eq!(cfg.dc_target_ip(2), Some("149.154.167.51"));
+    assert_eq!(
+        cfg.dc_redirects().get(&2).map(String::as_str),
+        cfg.dc_target_ip(2)
+    );
+}
+
+#[test]
 fn dc_ip_rejects_malformed_values() {
     for bad in ["2", "2:not-an-ip", "notadc:1.2.3.4", ":1.2.3.4", "2:"] {
         assert!(

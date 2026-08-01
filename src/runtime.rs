@@ -1,8 +1,9 @@
 //! Shared per-process runtime state.
 //!
-//! Holds what every connection needs but nothing owns: the outbound
-//! connector, the DC metadata lookups, and the domain-fronting fallback's
-//! sticky window.
+//! Holds what every connection needs but nothing owns: the outbound connector
+//! and the domain-fronting fallback's sticky window.  The DC lookups are
+//! stateless pass-throughs to `config`, kept as methods so call sites can take
+//! everything they need from one place.
 
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};

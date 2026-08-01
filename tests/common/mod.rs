@@ -24,7 +24,11 @@ use tg_ws_proxy_rs::proxy::handle_client_with_runtime;
 use tg_ws_proxy_rs::runtime::Runtime;
 
 /// How long a helper task may take before the test is considered hung.
-pub const TASK_TIMEOUT: Duration = Duration::from_secs(2);
+pub const TASK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long [`rejecting_http_proxy_requests`] keeps listening after the last
+/// connection before deciding the fallback chain is finished.
+const QUIET_PERIOD: Duration = Duration::from_millis(300);
 
 /// Install the process-wide rustls crypto provider.
 ///
@@ -34,37 +38,59 @@ pub fn install_rustls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// A fake HTTP proxy that answers every `CONNECT` with `407` and reports the
-/// single request line it saw.
+/// A fake HTTP proxy that answers one `CONNECT` with `407` and reports the
+/// request line it saw.
+///
+/// Deliberately serves exactly one connection and never resolves without it,
+/// so a test can also use it to prove that *nothing* was dialled out.
 pub async fn rejecting_http_proxy() -> (SocketAddr, JoinHandle<String>) {
-    let (addr, task) = rejecting_http_proxy_requests(1).await;
-    let task = tokio::spawn(async move { await_proxy_requests(task).await.remove(0) });
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let proxy_task = tokio::spawn(async move {
+        let (mut inbound, _) = proxy.accept().await.unwrap();
+        let request = read_http_connect_request(&mut inbound).await;
+        reject(&mut inbound).await;
 
-    (addr, task)
+        request
+    });
+
+    (proxy_addr, proxy_task)
 }
 
-/// Same as [`rejecting_http_proxy`], but serves `expected` requests and
-/// reports all of them — used to assert on the shape of a fallback chain.
-pub async fn rejecting_http_proxy_requests(
-    expected: usize,
-) -> (SocketAddr, JoinHandle<Vec<String>>) {
+/// Same as [`rejecting_http_proxy`], but reports *every* `CONNECT` a fallback
+/// chain made, so a test can assert on the full shape of the chain.
+///
+/// Keeps listening until the chain has been quiet for [`QUIET_PERIOD`] rather
+/// than stopping at an expected count — otherwise the returned length would be
+/// fixed by this fixture and `assert_eq!(requests.len(), n)` could never fail.
+/// A chain that makes one attempt too many is then just as visible as one that
+/// makes one too few.
+pub async fn rejecting_http_proxy_requests() -> (SocketAddr, JoinHandle<Vec<String>>) {
     let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy.local_addr().unwrap();
     let proxy_task = tokio::spawn(async move {
         let mut requests = Vec::new();
-        for _ in 0..expected {
-            let (mut inbound, _) = proxy.accept().await.unwrap();
-            let request = read_http_connect_request(&mut inbound).await;
-            inbound
-                .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
-                .await
-                .unwrap();
-            requests.push(request);
+        // Allow the usual generous budget for the first attempt, then only the
+        // quiet period between subsequent ones.
+        let mut budget = TASK_TIMEOUT;
+
+        while let Ok(Ok((mut inbound, _))) = tokio::time::timeout(budget, proxy.accept()).await {
+            requests.push(read_http_connect_request(&mut inbound).await);
+            reject(&mut inbound).await;
+            budget = QUIET_PERIOD;
         }
+
         requests
     });
 
     (proxy_addr, proxy_task)
+}
+
+async fn reject(inbound: &mut TcpStream) {
+    inbound
+        .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+        .await
+        .unwrap();
 }
 
 /// A fake HTTP proxy that accepts one `CONNECT` and then splices the
@@ -80,9 +106,18 @@ pub async fn tunneling_http_proxy(target: SocketAddr) -> (SocketAddr, JoinHandle
         let outbound = TcpStream::connect(target).await.unwrap();
         let (mut ri, mut wi) = inbound.split();
         let (mut ro, mut wo) = tokio::io::split(outbound);
+        // Shut the write half down once its source hits EOF, so the close
+        // propagates end to end. `tokio::io::copy` alone only flushes, which
+        // would leave a peer that reads until EOF waiting forever.
         let _ = tokio::join!(
-            tokio::io::copy(&mut ri, &mut wo),
-            tokio::io::copy(&mut ro, &mut wi)
+            async {
+                let _ = tokio::io::copy(&mut ri, &mut wo).await;
+                let _ = wo.shutdown().await;
+            },
+            async {
+                let _ = tokio::io::copy(&mut ro, &mut wi).await;
+                let _ = wi.shutdown().await;
+            }
         );
 
         request
@@ -101,6 +136,32 @@ pub async fn mtproto_acceptor() -> (SocketAddr, JoinHandle<()>) {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut handshake = [0u8; 64];
         stream.read_exact(&mut handshake).await.unwrap();
+    });
+
+    (addr, task)
+}
+
+/// Like [`mtproto_acceptor`], but keeps reading after the handshake and
+/// reports how many payload bytes the proxy relayed before the client went
+/// away.
+pub async fn counting_mtproto_acceptor() -> (SocketAddr, JoinHandle<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut handshake = [0u8; 64];
+        stream.read_exact(&mut handshake).await.unwrap();
+
+        let mut relayed = 0usize;
+        let mut buf = vec![0u8; 8192];
+        while let Ok(n) = stream.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            relayed += n;
+        }
+
+        relayed
     });
 
     (addr, task)

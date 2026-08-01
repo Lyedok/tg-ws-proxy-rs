@@ -564,9 +564,15 @@ impl Config {
     /// A scan of the (tiny) flag list rather than [`Self::dc_redirects`], so
     /// the per-connection routing path doesn't build and drop a `HashMap` for
     /// one lookup.
+    ///
+    /// Scanned in reverse so a DC listed twice resolves to the last `--dc-ip`
+    /// given, matching what collecting into [`Self::dc_redirects`] does. The
+    /// two must agree: the pool warms itself from the map while the routing
+    /// path uses this lookup.
     pub fn dc_target_ip(&self, dc: u32) -> Option<&str> {
         self.dc_ip
             .iter()
+            .rev()
             .find_map(|(id, ip)| (*id == dc).then_some(ip.as_str()))
     }
 

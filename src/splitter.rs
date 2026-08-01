@@ -23,14 +23,20 @@ const IV_LEN: usize = 16;
 /// has to be buffered whole before it can be emitted as one WebSocket frame,
 /// and `Vec` never gives that capacity back on its own.  Two buffers per
 /// connection, held for the connection's lifetime, is real memory on the
-/// low-RAM routers this proxy runs on — so oversized buffers are released
-/// once the traffic settles down again.
+/// low-RAM routers this proxy runs on — so once a connection goes back to
+/// small packets, the oversized capacity is released.
 const RETAINED_CAPACITY: usize = 16 * 1024;
 
-/// Consecutive small, fully-drained `split` calls before oversized capacity is
-/// released.  Waiting a while keeps a sustained media transfer — which
-/// repeatedly needs the large buffer — from paying for a shrink-then-regrow
-/// cycle on every packet.
+/// Consecutive fully-drained `split` calls before oversized capacity is
+/// released.  Waiting keeps a sustained media transfer — which repeatedly
+/// needs the large buffer — from paying for a shrink-then-regrow cycle on
+/// every packet.
+///
+/// Note this counts *calls, not time*: the release happens on the connection's
+/// next reads, so a connection that finishes a transfer and then falls
+/// completely silent keeps its buffers until it carries traffic again (or
+/// closes, which frees them anyway). That is the intended trade — trimming is
+/// driven from the data path so it costs nothing to connections that are idle.
 const TRIM_AFTER_IDLE_CALLS: u8 = 64;
 
 pub struct MsgSplitter {
@@ -152,8 +158,8 @@ impl MsgSplitter {
     /// Release capacity grabbed by an unusually large packet once the stream
     /// settles back down — see [`RETAINED_CAPACITY`].
     fn trim_idle_buffers(&mut self) {
-        // `plain_buf` and `cipher_buf` always hold the same bytes, so one
-        // length check covers both.
+        // Both buffers always hold the same bytes, so emptiness is shared; only
+        // `cipher_buf`'s capacity is consulted, and both are shrunk together.
         if !self.cipher_buf.is_empty() || self.cipher_buf.capacity() <= RETAINED_CAPACITY {
             self.idle_calls = 0;
             return;
@@ -238,3 +244,6 @@ impl MsgSplitter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

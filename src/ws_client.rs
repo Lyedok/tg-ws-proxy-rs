@@ -7,7 +7,7 @@
 //!
 //! DC numbers that don't have dedicated WebSocket hostnames (e.g. DC 203, the
 //! test DC) are remapped to their canonical counterpart via
-//! `default_dc_overrides()` before the domain is constructed, so the TLS
+//! `config::websocket_dc()` before the domain is constructed, so the TLS
 //! certificate presented by Telegram's servers remains valid.
 //!
 //! TLS certificate verification is controlled by `Config::skip_tls_verify`.
@@ -56,7 +56,7 @@ pub(crate) fn media_tag(is_media: bool) -> &'static str {
 /// Media DCs prefer the `kwsN-1` variant first.
 ///
 /// Non-standard DC numbers (e.g. DC 203, the test/alternate DC) are remapped
-/// to their canonical WebSocket DC via `default_dc_overrides()` so that TLS
+/// to their canonical WebSocket DC via `config::websocket_dc()` so that TLS
 /// certificate validation succeeds — Telegram's wildcard cert only covers the
 /// real DC numbers (1-5).
 pub fn ws_domains(dc: u32, is_media: bool) -> Vec<String> {
@@ -397,7 +397,7 @@ pub async fn connect_ws_for_dc_with_outbound(
 /// from our side and forwards the WebSocket traffic as plain HTTP to Telegram.
 ///
 /// Unlike `ws_domains()`, the raw DC number is used **without** applying
-/// `default_dc_overrides()`.  The user controls the Cloudflare DNS zone and
+/// the `config::websocket_dc()` remap.  The user controls the Cloudflare DNS zone and
 /// creates explicit records for every DC — including non-canonical ones like
 /// DC 203 (`kws203.{cf_domain}`).  Remapping 203 → 2 would incorrectly route
 /// traffic to DC 2 instead of DC 203 (they have different IPs/servers).
