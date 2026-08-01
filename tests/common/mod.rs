@@ -1,0 +1,201 @@
+//! Shared fixtures for the integration tests.
+//!
+//! Most subsystems are exercised by pointing them at a local fake HTTP
+//! CONNECT proxy and asserting on the `CONNECT` line it received — that
+//! proves the code path both reached the outbound connector and asked for the
+//! right target, without needing real network access.
+//!
+//! Each test binary only uses a subset of these helpers, so unused ones are
+//! expected in any given crate.
+#![allow(dead_code)]
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
+
+use tg_ws_proxy_rs::config::Config;
+use tg_ws_proxy_rs::crypto::{ProtoTag, generate_client_handshake};
+use tg_ws_proxy_rs::pool::WsPool;
+use tg_ws_proxy_rs::proxy::handle_client_with_runtime;
+use tg_ws_proxy_rs::runtime::Runtime;
+
+/// How long a helper task may take before the test is considered hung.
+pub const TASK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Install the process-wide rustls crypto provider.
+///
+/// Required by any test that performs a TLS handshake; safe to call from
+/// several tests in the same binary.
+pub fn install_rustls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// A fake HTTP proxy that answers every `CONNECT` with `407` and reports the
+/// single request line it saw.
+pub async fn rejecting_http_proxy() -> (SocketAddr, JoinHandle<String>) {
+    let (addr, task) = rejecting_http_proxy_requests(1).await;
+    let task = tokio::spawn(async move { await_proxy_requests(task).await.remove(0) });
+
+    (addr, task)
+}
+
+/// Same as [`rejecting_http_proxy`], but serves `expected` requests and
+/// reports all of them — used to assert on the shape of a fallback chain.
+pub async fn rejecting_http_proxy_requests(
+    expected: usize,
+) -> (SocketAddr, JoinHandle<Vec<String>>) {
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let proxy_task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for _ in 0..expected {
+            let (mut inbound, _) = proxy.accept().await.unwrap();
+            let request = read_http_connect_request(&mut inbound).await;
+            inbound
+                .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+                .await
+                .unwrap();
+            requests.push(request);
+        }
+        requests
+    });
+
+    (proxy_addr, proxy_task)
+}
+
+/// A fake HTTP proxy that accepts one `CONNECT` and then splices the
+/// connection through to `target`.
+pub async fn tunneling_http_proxy(target: SocketAddr) -> (SocketAddr, JoinHandle<String>) {
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let proxy_task = tokio::spawn(async move {
+        let (mut inbound, _) = proxy.accept().await.unwrap();
+        let request = read_http_connect_request(&mut inbound).await;
+        inbound.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+
+        let outbound = TcpStream::connect(target).await.unwrap();
+        let (mut ri, mut wi) = inbound.split();
+        let (mut ro, mut wo) = tokio::io::split(outbound);
+        let _ = tokio::join!(
+            tokio::io::copy(&mut ri, &mut wo),
+            tokio::io::copy(&mut ro, &mut wi)
+        );
+
+        request
+    });
+
+    (proxy_addr, proxy_task)
+}
+
+/// A server that accepts one connection and reads a 64-byte MTProto
+/// obfuscation handshake — the minimum an upstream MTProto proxy must do for
+/// a `--check` probe to pass.
+pub async fn mtproto_acceptor() -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut handshake = [0u8; 64];
+        stream.read_exact(&mut handshake).await.unwrap();
+    });
+
+    (addr, task)
+}
+
+pub async fn read_http_connect_request(stream: &mut TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(n > 0, "proxy client closed before sending a full request");
+        request.extend_from_slice(&buf[..n]);
+        if request.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    String::from_utf8_lossy(&request).to_string()
+}
+
+pub async fn await_proxy_request(proxy_task: JoinHandle<String>) -> String {
+    await_task(proxy_task).await
+}
+
+pub async fn await_proxy_requests(proxy_task: JoinHandle<Vec<String>>) -> Vec<String> {
+    await_task(proxy_task).await
+}
+
+pub async fn await_unit_task(task: JoinHandle<()>) {
+    await_task(task).await;
+}
+
+pub async fn await_task<T>(task: JoinHandle<T>) -> T {
+    tokio::time::timeout(TASK_TIMEOUT, task)
+        .await
+        .expect("test helper task timed out")
+        .expect("test helper task panicked")
+}
+
+/// Drive one full client connection through the proxy: connect, send a valid
+/// MTProto handshake for DC 2, then disconnect and wait for the handler to
+/// finish its fallback chain.
+pub async fn run_proxy_once(config: Config) {
+    run_proxy_once_for_dc(config, 2).await;
+}
+
+/// Same as [`run_proxy_once`], but lets the caller pick the DC so tests that
+/// touch DC-keyed global cooldown state (e.g. the fronting fail-cooldown)
+/// don't collide with other tests sharing the same test binary process.
+pub async fn run_proxy_once_for_dc(config: Config, dc: i16) {
+    let secret = config.secret_bytes();
+    let (mut client, handler) = start_proxy_connection(config).await;
+
+    let (handshake, _, _) = generate_client_handshake(&secret, dc, ProtoTag::PaddedIntermediate);
+    client.write_all(&handshake).await.unwrap();
+    drop(client);
+
+    await_proxy_handler(handler).await;
+}
+
+/// Wire up a loopback client socket to a spawned `handle_client_with_runtime`
+/// task built from `config`, leaving the client end to the caller.
+///
+/// Tests that need to speak something other than a plain MTProto handshake
+/// (e.g. the inbound FakeTLS camouflage) drive the client side themselves.
+pub async fn start_proxy_connection(config: Config) -> (TcpStream, JoinHandle<()>) {
+    let outbound = config.outbound_connector().unwrap();
+    let runtime = Arc::new(Runtime::new(outbound).with_fronting(
+        config.fronting_domain.clone(),
+        Duration::from_secs(config.fronting_cooldown),
+    ));
+    let pool = Arc::new(WsPool::with_runtime(
+        0,
+        Duration::from_secs(config.pool_max_age),
+        Arc::clone(&runtime),
+    ));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = TcpStream::connect(addr);
+    let accept = listener.accept();
+    let (client, accepted) = tokio::join!(client, accept);
+    let (server, peer) = accepted.unwrap();
+
+    let handler = tokio::spawn(handle_client_with_runtime(
+        server, peer, config, pool, runtime,
+    ));
+
+    (client.unwrap(), handler)
+}
+
+/// Wait for a proxy connection handler to run its fallback chain to the end.
+pub async fn await_proxy_handler(handler: JoinHandle<()>) {
+    tokio::time::timeout(Duration::from_secs(5), handler)
+        .await
+        .expect("proxy handler timed out")
+        .expect("proxy handler panicked");
+}

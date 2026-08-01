@@ -22,55 +22,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
-// ── File-descriptor budget helpers ───────────────────────────────────────────
-
-/// Read the soft per-process open-file limit from `/proc/self/limits` (Linux).
-/// Falls back to 1 024 on other platforms or when the file cannot be parsed.
-fn soft_nofile_limit() -> usize {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(content) = std::fs::read_to_string("/proc/self/limits") {
-            for line in content.lines() {
-                // Example line:
-                //   Max open files            1024                 4096                 files
-                if line.starts_with("Max open files")
-                    && let Some(soft_str) = line.split_whitespace().nth(3)
-                {
-                    if soft_str == "unlimited" {
-                        return usize::MAX;
-                    }
-                    if let Ok(n) = soft_str.parse::<usize>() {
-                        return n;
-                    }
-                }
-            }
-        }
-    }
-
-    1024 // conservative fallback for non-Linux or parse failures
-}
-
-/// Compute a safe default for the maximum number of concurrent connections
-/// given the system FD limit and pool configuration.
-///
-/// FD budget:
-///   1 (listener) + pool_size × dc_buckets × 2 (idle + one refill per bucket)
-///   + 32 (Tokio runtime, stdio, safety margin)
-///   + max_connections × 2 (one client socket + one outbound socket per conn)
-///
-/// Rearranging for max_connections:
-///   max_connections = (fd_limit − reserved) / 2
-fn auto_max_connections(fd_limit: usize, pool_size: usize, dc_buckets: usize) -> usize {
-    if fd_limit == usize::MAX {
-        // Unlimited FDs: cap at a large but sane value.
-        return 512;
-    }
-
-    let reserved = 1 + pool_size * dc_buckets * 2 + 32;
-
-    (fd_limit.saturating_sub(reserved) / 2).max(4)
-}
-
+use tg_ws_proxy_rs::limits::{auto_max_connections, soft_nofile_limit};
 use tg_ws_proxy_rs::{
     check, config::Config, default_domains, pool::WsPool, proxy, runtime::Runtime,
 };

@@ -20,7 +20,7 @@ use futures_util::{FutureExt, StreamExt};
 use crate::config::Config;
 use crate::outbound::OutboundConnector;
 use crate::runtime::Runtime;
-use crate::ws_client::{TgWsStream, connect_ws_for_dc_with_outbound};
+use crate::ws_client::{TgWsStream, connect_ws_for_dc_with_outbound, media_tag};
 
 struct PoolEntry {
     ws: TgWsStream,
@@ -111,7 +111,7 @@ impl WsPool {
                 debug!(
                     "pool: discarding stale DC{}{} connection",
                     dc,
-                    if is_media { "m" } else { "" }
+                    media_tag(is_media)
                 );
                 continue;
             }
@@ -122,7 +122,7 @@ impl WsPool {
             debug!(
                 "pool hit DC{}{} ({} left)",
                 dc,
-                if is_media { "m" } else { "" },
+                media_tag(is_media),
                 remaining
             );
 
@@ -223,7 +223,7 @@ impl WsPool {
             debug!(
                 "pool refilled DC{}{}: {} ready",
                 dc,
-                if is_media { "m" } else { "" },
+                media_tag(is_media),
                 lock.get(&(dc, is_media)).map_or(0, |b| b.len())
             );
         }
@@ -267,7 +267,7 @@ impl WsPool {
                     warn!(
                         "pool: failed to pre-connect DC{}{}",
                         dc,
-                        if is_media { "m" } else { "" }
+                        media_tag(is_media)
                     );
 
                     break;

@@ -8,34 +8,39 @@
 //!       ▼
 //!  [parse_handshake]  ← validates secret, extracts DC id + protocol
 //!       │
-//!       ├─ WebSocket path (preferred):
-//!       │   [connect WebSocket]  →  wss://kwsN.web.telegram.org/apiws
-//!       │   [bridge_ws]          ←  bidirectional re-encrypted bridge
-//!       │
-//!       ├─ Upstream MTProto proxy fallback (when WS fails, if configured):
-//!       │   [connect_mtproto_upstream]  →  external MTProto proxy TCP
-//!       │   [bridge_mtproto_relay]      ←  bidirectional re-encrypted bridge
-//!       │
-//!       └─ Direct TCP fallback (last resort):
-//!           [bridge_tcp]  →  direct TCP to Telegram DC IP:443
+//!       ▼
+//!  [select_upstream]  ← the fallback ladder: pooled/direct WebSocket,
+//!       │                Cloudflare Worker, Cloudflare proxy, upstream
+//!       │                MTProto proxy, and finally raw TCP
+//!       ▼
+//!  [bridge_ws / bridge_relay / bridge_tcp]  ← bidirectional re-encryption
 //! ```
+//!
+//! Routing and bridging are deliberately separated: [`select_upstream`] owns
+//! the whole fallback ladder and hands back a connected upstream, so the
+//! client's own reader/writer halves only ever have to be moved into a single
+//! bridge call.
 
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use cipher::StreamCipher;
-use futures_util::SinkExt;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use tungstenite::Message;
 
 use crate::config::Config;
 use crate::crypto::{
-    AesCtr256, ConnectionCiphers, build_connection_ciphers, generate_client_handshake,
-    generate_relay_init, parse_handshake,
+    AesCtr256, ConnectionCiphers, ProtoTag, build_connection_ciphers, faketls_hostname,
+    generate_client_handshake, generate_relay_init, parse_handshake, secret_key,
 };
 use crate::faketls::{
     TLS_MAX_RECORD_PAYLOAD, TLS_RECORD_HANDSHAKE, build_faketls_client_hello,
@@ -48,200 +53,140 @@ use crate::runtime::Runtime;
 use crate::splitter::MsgSplitter;
 use crate::ws_client::{
     TgWsStream, connect_cf_worker_ws_for_dc_with_outbound, connect_cf_ws_for_dc_with_outbound,
-    connect_ws_for_dc_with_outbound, ws_send,
+    connect_ws_for_dc_with_outbound, media_tag, ws_send,
 };
 
-// WS failure cooldown is global for the process lifetime.
-use std::collections::HashMap;
-use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+type TcpReader = ReadHalf<TcpStream>;
+type TcpWriter = WriteHalf<TcpStream>;
 
-// ─── Global failure tracking ─────────────────────────────────────────────────
+/// Relay buffer size for the plain (non-FakeTLS) bridge directions.
+///
+/// Deliberately small: this is allocated (and zeroed) **per direction, per
+/// connection**, so on the routers and embedded boxes this proxy targets it
+/// dominates the per-connection footprint.  16 KiB matches the cap the
+/// FakeTLS bridge has always run at — a full TLS record — and costs only
+/// extra `read` syscalls, since the per-byte work (AES-CTR, framing) is
+/// unchanged.  At 64 KiB, 200 concurrent connections reserved 25 MiB of
+/// buffers alone; at 16 KiB they reserve 6 MiB.
+const RELAY_BUF_SIZE: usize = 16 * 1024;
+/// Headroom over a full TLS record for the FakeTLS read buffer (record header
+/// plus the slack `read_tls_record` needs for an oversized record).
+const TLS_READ_HEADROOM: usize = 256;
 
-/// Per-DC cooldown: avoid retrying WS until this instant.
-/// Also used for the "all redirects" case (longer cooldown of 5 min).
-static DC_FAIL_UNTIL: StdMutex<Option<HashMap<(u32, bool), Instant>>> = StdMutex::new(None);
+// ─── Failure cooldowns ───────────────────────────────────────────────────────
 
-// ─── Upstream MTProto proxy failure tracking ─────────────────────────────────
+/// Process-wide "do not retry until" deadlines for one fallback tier.
+///
+/// Each tier backs off independently after a failure so that a dead path is
+/// not re-probed on every single connection.  Cooldowns are deliberately used
+/// instead of a permanent blacklist: the proxy recovers on its own once the
+/// network changes (or Telegram's redirect policy does).
+struct CooldownMap<K> {
+    entries: StdMutex<Option<HashMap<K, Instant>>>,
+}
 
-/// Per-upstream cooldown: keyed by "host:port".
-static UPSTREAM_FAIL_UNTIL: StdMutex<Option<HashMap<String, Instant>>> = StdMutex::new(None);
+impl<K: Eq + Hash> CooldownMap<K> {
+    const fn new() -> Self {
+        Self {
+            entries: StdMutex::new(None),
+        }
+    }
+
+    fn set(&self, key: K, cooldown: Duration) {
+        self.entries
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(key, Instant::now() + cooldown);
+    }
+
+    fn clear<Q>(&self, key: &Q)
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        if let Some(entries) = self.entries.lock().unwrap().as_mut() {
+            entries.remove(key);
+        }
+    }
+
+    /// Whether `key` is still inside its cooldown window.
+    fn active<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let entries = self.entries.lock().unwrap();
+        match entries.as_ref().and_then(|entries| entries.get(key)) {
+            Some(&until) => Instant::now() < until,
+            None => false,
+        }
+    }
+}
+
+/// Per-DC cooldown for the direct WebSocket path, keyed by `(dc, is_media)`.
+/// Also carries the longer "all domains redirected" cooldown.
+static WS_FAIL: CooldownMap<(u32, bool)> = CooldownMap::new();
+/// Per-upstream cooldown for MTProto proxies, keyed by `host:port`.
+static UPSTREAM_FAIL: CooldownMap<String> = CooldownMap::new();
+/// Per-Worker cooldown for the Cloudflare Worker path.
+static CF_WORKER_FAIL: CooldownMap<String> = CooldownMap::new();
+/// Per-DC cooldown for a *failed* domain-fronting attempt — distinct from
+/// `Runtime`'s sticky "fronting is currently working" state.  Without this, a
+/// network that blocks Telegram's DC IPs outright (not just by SNI) would
+/// retry a doomed fronting attempt on every single connection; see
+/// `Config::fronting_fail_cooldown`.
+static FRONTING_FAIL: CooldownMap<(u32, bool)> = CooldownMap::new();
 
 fn upstream_key(host: &str, port: u16) -> String {
     format!("{}:{}", host, port)
 }
 
-fn set_upstream_cooldown(host: &str, port: u16, cooldown: Duration) {
-    let key = upstream_key(host, port);
-    let mut lock = UPSTREAM_FAIL_UNTIL.lock().unwrap();
-    lock.get_or_insert_with(HashMap::new)
-        .insert(key, Instant::now() + cooldown);
-}
-
-fn clear_upstream_cooldown(host: &str, port: u16) {
-    let key = upstream_key(host, port);
-    let mut lock = UPSTREAM_FAIL_UNTIL.lock().unwrap();
-    if let Some(map) = lock.as_mut() {
-        map.remove(&key);
-    }
-}
-
-fn upstream_in_cooldown(host: &str, port: u16) -> bool {
-    let key = upstream_key(host, port);
-    let lock = UPSTREAM_FAIL_UNTIL.lock().unwrap();
-    if let Some(map) = lock.as_ref()
-        && let Some(&until) = map.get(&key)
-    {
-        return Instant::now() < until;
-    }
-    false
-}
-
-// ─── Cloudflare proxy failure tracking ───────────────────────────────────────
+// ─── Cloudflare domain balancing ─────────────────────────────────────────────
 
 /// Round-robin counter for CF domain balancing (`--cf-balance`).
 static CF_BALANCE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// Round-robin counter for CF Worker domain balancing (`--cf-balance`).
 static CF_WORKER_BALANCE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// Return a rotated view of `cf_domains` based on a global round-robin counter.
+/// Return a rotated view of `domains` based on a global round-robin counter.
 ///
 /// Each call atomically increments the counter and uses it to determine which
 /// domain should be tried first.  The remaining domains follow in their
-/// original order, wrapping around to the beginning of the slice, so the
-/// full fallback chain is always available.
+/// original order, wrapping around to the beginning of the slice, so the full
+/// fallback chain is always available.
 ///
-/// `Relaxed` ordering is intentional: the counter only drives load distribution
-/// and does not guard access to any other shared state, so no cross-thread
-/// memory synchronisation is required.  Wrapping overflow on `usize` is
-/// harmless — the modulo operation still produces a valid index.
-fn balanced_cf_domains(cf_domains: &[String]) -> Vec<String> {
-    let n = cf_domains.len();
+/// `Relaxed` ordering is intentional: the counter only drives load
+/// distribution and does not guard access to any other shared state, so no
+/// cross-thread memory synchronisation is required.  Wrapping overflow on
+/// `usize` is harmless — the modulo operation still produces a valid index.
+fn balanced(domains: &[String], counter: &AtomicUsize) -> Vec<String> {
+    let n = domains.len();
     if n <= 1 {
-        return cf_domains.to_vec();
+        return domains.to_vec();
     }
+
     // `fetch_add` wraps silently on overflow, keeping the index valid.
-    let idx = CF_BALANCE_COUNTER.fetch_add(1, Ordering::Relaxed) % n;
-    let mut result = Vec::with_capacity(n);
-    for i in 0..n {
-        result.push(cf_domains[(idx + i) % n].clone());
-    }
-    result
+    let idx = counter.fetch_add(1, Ordering::Relaxed) % n;
+
+    (0..n).map(|i| domains[(idx + i) % n].clone()).collect()
 }
 
-/// Return a rotated view of `cf_worker_domains` for Worker load balancing.
-fn balanced_cf_workers(cf_worker_domains: &[String]) -> Vec<String> {
-    let n = cf_worker_domains.len();
-    if n <= 1 {
-        return cf_worker_domains.to_vec();
-    }
-    let idx = CF_WORKER_BALANCE_COUNTER.fetch_add(1, Ordering::Relaxed) % n;
-    let mut result = Vec::with_capacity(n);
-    for i in 0..n {
-        result.push(cf_worker_domains[(idx + i) % n].clone());
-    }
-    result
-}
-
-/// Per-Worker cooldown for the Cloudflare Worker path.
-static CF_WORKER_FAIL_UNTIL: StdMutex<Option<HashMap<String, Instant>>> = StdMutex::new(None);
-type TcpReader = ReadHalf<TcpStream>;
-type TcpWriter = WriteHalf<TcpStream>;
-
-fn set_cf_worker_cooldown(worker_domain: &str, cooldown: Duration) {
-    let mut lock = CF_WORKER_FAIL_UNTIL.lock().unwrap();
-    lock.get_or_insert_with(HashMap::new)
-        .insert(worker_domain.to_string(), Instant::now() + cooldown);
-}
-
-fn clear_cf_worker_cooldown(worker_domain: &str) {
-    let mut lock = CF_WORKER_FAIL_UNTIL.lock().unwrap();
-    if let Some(map) = lock.as_mut() {
-        map.remove(worker_domain);
+/// Apply `--cf-balance` rotation to `domains`, borrowing them unchanged when
+/// balancing is off.
+fn balance_order<'a>(
+    domains: &'a [String],
+    enabled: bool,
+    counter: &AtomicUsize,
+) -> Cow<'a, [String]> {
+    if enabled {
+        Cow::Owned(balanced(domains, counter))
+    } else {
+        Cow::Borrowed(domains)
     }
 }
 
-fn cf_worker_in_cooldown(worker_domain: &str) -> bool {
-    let lock = CF_WORKER_FAIL_UNTIL.lock().unwrap();
-    if let Some(map) = lock.as_ref()
-        && let Some(&until) = map.get(worker_domain)
-    {
-        return Instant::now() < until;
-    }
-    false
-}
-
-// ─── Domain-fronting failure tracking ────────────────────────────────────────
-
-/// Per-DC cooldown for a *failed* fronting attempt — distinct from
-/// `Runtime`'s sticky "fronting is currently working" state. Without this,
-/// a network that blocks Telegram's DC IPs outright (not just by SNI) would
-/// retry a doomed fronting attempt on every single connection; see
-/// `Config::fronting_fail_cooldown`.
-static FRONTING_FAIL_UNTIL: StdMutex<Option<HashMap<(u32, bool), Instant>>> = StdMutex::new(None);
-
-fn set_fronting_fail_cooldown(dc: u32, is_media: bool, cooldown: Duration) {
-    let mut lock = FRONTING_FAIL_UNTIL.lock().unwrap();
-    lock.get_or_insert_with(HashMap::new)
-        .insert((dc, is_media), Instant::now() + cooldown);
-}
-
-fn clear_fronting_fail_cooldown(dc: u32, is_media: bool) {
-    let mut lock = FRONTING_FAIL_UNTIL.lock().unwrap();
-    if let Some(map) = lock.as_mut() {
-        map.remove(&(dc, is_media));
-    }
-}
-
-fn fronting_in_fail_cooldown(dc: u32, is_media: bool) -> bool {
-    let lock = FRONTING_FAIL_UNTIL.lock().unwrap();
-    if let Some(map) = lock.as_ref()
-        && let Some(&until) = map.get(&(dc, is_media))
-    {
-        return Instant::now() < until;
-    }
-    false
-}
-
-fn blacklist_ws(dc: u32, is_media: bool, cooldown: Duration) {
-    // Instead of a permanent blacklist, apply a long cooldown so the proxy
-    // can recover automatically if WS becomes available again (e.g. after a
-    // network change or Telegram-side redirect policy change).
-    let mut lock = DC_FAIL_UNTIL.lock().unwrap();
-    lock.get_or_insert_with(HashMap::new)
-        .insert((dc, is_media), Instant::now() + cooldown);
-}
-
-fn set_dc_cooldown(dc: u32, is_media: bool, cooldown: Duration) {
-    let mut lock = DC_FAIL_UNTIL.lock().unwrap();
-    lock.get_or_insert_with(HashMap::new)
-        .insert((dc, is_media), Instant::now() + cooldown);
-}
-
-fn clear_dc_cooldown(dc: u32, is_media: bool) {
-    let mut lock = DC_FAIL_UNTIL.lock().unwrap();
-    if let Some(map) = lock.as_mut() {
-        map.remove(&(dc, is_media));
-    }
-}
-
-fn ws_timeout_for(
-    dc: u32,
-    is_media: bool,
-    normal_timeout: Duration,
-    fail_probe_timeout: Duration,
-) -> Duration {
-    let lock = DC_FAIL_UNTIL.lock().unwrap();
-    if let Some(map) = lock.as_ref()
-        && let Some(&until) = map.get(&(dc, is_media))
-        && Instant::now() < until
-    {
-        return fail_probe_timeout; // still in cooldown → try fast
-    }
-
-    normal_timeout
-}
+// ─── Client-side framing ─────────────────────────────────────────────────────
 
 enum ClientReader {
     Plain(TcpReader),
@@ -295,9 +240,10 @@ async fn accept_inbound_faketls(
     secrets: &[Vec<u8>],
     expected_domain: &str,
 ) -> Option<([u8; 64], Vec<u8>)> {
-    let (record_type, version, payload) = read_tls_record(reader, TLS_MAX_RECORD_PAYLOAD + 256)
-        .await
-        .ok()??;
+    let (record_type, version, payload) =
+        read_tls_record(reader, TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM)
+            .await
+            .ok()??;
     if record_type != TLS_RECORD_HANDSHAKE || version != [0x03, 0x01] {
         debug!("[{}] bad FakeTLS ClientHello record", label);
         return None;
@@ -309,15 +255,11 @@ async fn accept_inbound_faketls(
     record.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     record.extend_from_slice(&payload);
 
-    let (hello, matched_secret) = match secrets
-        .iter()
-        .find_map(|secret| parse_faketls_client_hello(&record, secret).map(|hello| (hello, secret)))
-    {
-        Some(v) => v,
-        None => {
-            debug!("[{}] bad FakeTLS ClientHello digest", label);
-            return None;
-        }
+    let Some((hello, matched_secret)) = secrets.iter().find_map(|secret| {
+        parse_faketls_client_hello(&record, secret).map(|hello| (hello, secret))
+    }) else {
+        debug!("[{}] bad FakeTLS ClientHello digest", label);
+        return None;
     };
 
     if hello.hostname.as_deref() != Some(expected_domain) {
@@ -336,7 +278,7 @@ async fn accept_inbound_faketls(
 
     let mut handshake_buf = [0u8; 64];
     let mut filled = 0;
-    let mut buf = vec![0u8; TLS_MAX_RECORD_PAYLOAD + 256];
+    let mut buf = vec![0u8; TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM];
     while filled < handshake_buf.len() {
         let n = match read_tls_appdata(reader, &mut buf).await {
             Ok(0) | Err(_) => return None,
@@ -358,6 +300,40 @@ async fn accept_inbound_faketls(
 }
 
 // ─── Client handler ──────────────────────────────────────────────────────────
+
+/// Connect timeouts and failure cooldowns for one connection, resolved from
+/// the CLI/env configuration.
+struct Timeouts {
+    ws_connect: Duration,
+    ws_fail_probe: Duration,
+    ws_fail_cooldown: Duration,
+    ws_redirect_cooldown: Duration,
+    handshake: Duration,
+    tcp_fallback: Duration,
+    upstream_connect: Duration,
+    upstream_fail_cooldown: Duration,
+    cf_connect: Duration,
+    cf_fail_cooldown: Duration,
+    fronting_fail_cooldown: Duration,
+}
+
+impl Timeouts {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            ws_connect: Duration::from_secs(config.ws_connect_timeout),
+            ws_fail_probe: Duration::from_secs(config.ws_fail_probe_timeout),
+            ws_fail_cooldown: Duration::from_secs(config.ws_fail_cooldown),
+            ws_redirect_cooldown: Duration::from_secs(config.ws_redirect_cooldown),
+            handshake: Duration::from_secs(config.handshake_timeout),
+            tcp_fallback: Duration::from_secs(config.tcp_fallback_timeout),
+            upstream_connect: Duration::from_secs(config.upstream_connect_timeout),
+            upstream_fail_cooldown: Duration::from_secs(config.upstream_fail_cooldown),
+            cf_connect: Duration::from_secs(config.cf_connect_timeout),
+            cf_fail_cooldown: Duration::from_secs(config.cf_fail_cooldown),
+            fronting_fail_cooldown: Duration::from_secs(config.fronting_fail_cooldown),
+        }
+    }
+}
 
 /// Handle one inbound client connection end-to-end.
 pub async fn handle_client(
@@ -389,29 +365,15 @@ pub async fn handle_client_with_runtime(
     let _ = stream.set_nodelay(true);
 
     let secrets = config.secret_bytes_list();
-    let dc_redirects = config.dc_redirects();
-    let skip_tls = config.skip_tls_verify;
-
-    // ── Timeouts / cooldowns from config ─────────────────────────────────
-    let ws_connect_timeout = Duration::from_secs(config.ws_connect_timeout);
-    let ws_fail_probe_timeout = Duration::from_secs(config.ws_fail_probe_timeout);
-    let ws_fail_cooldown = Duration::from_secs(config.ws_fail_cooldown);
-    let ws_redirect_cooldown = Duration::from_secs(config.ws_redirect_cooldown);
-    let handshake_timeout = Duration::from_secs(config.handshake_timeout);
-    let tcp_fallback_timeout = Duration::from_secs(config.tcp_fallback_timeout);
-    let upstream_connect_timeout = Duration::from_secs(config.upstream_connect_timeout);
-    let upstream_fail_cooldown = Duration::from_secs(config.upstream_fail_cooldown);
-    let cf_connect_timeout = Duration::from_secs(config.cf_connect_timeout);
-    let cf_fail_cooldown = Duration::from_secs(config.cf_fail_cooldown);
-    let fronting_fail_cooldown = Duration::from_secs(config.fronting_fail_cooldown);
+    let timeouts = Timeouts::from_config(&config);
 
     // Split into independent read / write halves.
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     // ── Step 1: read the 64-byte MTProto obfuscation init ────────────────
     let inbound_faketls_domain = config.listen_faketls_domain();
-    let (handshake_buf, faketls_pending) = match tokio::time::timeout(
-        handshake_timeout,
+    let handshake = tokio::time::timeout(
+        timeouts.handshake,
         read_inbound_handshake(
             &label,
             &mut reader,
@@ -420,8 +382,9 @@ pub async fn handle_client_with_runtime(
             inbound_faketls_domain.as_deref(),
         ),
     )
-    .await
-    {
+    .await;
+
+    let (handshake_buf, faketls_pending) = match handshake {
         Ok(Some(result)) => result,
         Ok(None) => return,
         Err(_) => {
@@ -430,45 +393,37 @@ pub async fn handle_client_with_runtime(
         }
     };
 
-    let reader = if inbound_faketls_domain.is_some() {
-        ClientReader::FakeTls {
-            reader,
-            pending: faketls_pending,
-        }
+    let (reader, writer) = if inbound_faketls_domain.is_some() {
+        (
+            ClientReader::FakeTls {
+                reader,
+                pending: faketls_pending,
+            },
+            ClientWriter::FakeTls(writer),
+        )
     } else {
-        ClientReader::Plain(reader)
-    };
-    let writer = if inbound_faketls_domain.is_some() {
-        ClientWriter::FakeTls(writer)
-    } else {
-        ClientWriter::Plain(writer)
+        (ClientReader::Plain(reader), ClientWriter::Plain(writer))
     };
 
     // ── Step 2: parse and validate the handshake ─────────────────────────
-    let (info, secret) = match secrets
+    let Some((info, secret)) = secrets
         .iter()
         .find_map(|secret| parse_handshake(&handshake_buf, secret).map(|i| (i, secret.as_slice())))
-    {
-        Some(v) => v,
-        None => {
-            debug!(
-                "[{}] bad handshake (wrong secret or reserved prefix)",
-                label
-            );
+    else {
+        debug!(
+            "[{}] bad handshake (wrong secret or reserved prefix)",
+            label
+        );
 
-            // Drain the connection silently to avoid giving information to scanners.
-            reader.drain().await;
+        // Drain the connection silently to avoid giving information to scanners.
+        reader.drain().await;
 
-            return;
-        }
+        return;
     };
 
     let dc_id = info.dc_id;
     let is_media = info.is_media;
     let proto = info.proto;
-
-    // Apply DC override (e.g. DC 203 → DC 2 for WS domain selection).
-    let ws_dc = runtime.websocket_dc(dc_id);
     let dc_idx: i16 = if is_media {
         -(dc_id as i16)
     } else {
@@ -479,7 +434,7 @@ pub async fn handle_client_with_runtime(
         "[{}] handshake ok: DC{}{} proto={:?}",
         label,
         dc_id,
-        if is_media { " media" } else { "" },
+        media_tag(is_media),
         proto
     );
 
@@ -489,296 +444,23 @@ pub async fn handle_client_with_runtime(
     // ── Step 4: build all four AES-256-CTR ciphers ───────────────────────
     let ciphers = build_connection_ciphers(&info.prekey_and_iv, secret, &relay_init);
 
-    // ── Step 5: route the connection ──────────────────────────────────────
-    let target_ip = dc_redirects.get(&dc_id).cloned();
-    let cf_worker_domains = config.cf_worker_domains();
-    let media_tag = if is_media { "m" } else { "" };
+    // ── Step 5: walk the fallback ladder ─────────────────────────────────
+    let route = Route {
+        label: &label,
+        config: &config,
+        runtime: &runtime,
+        timeouts,
+        dc: dc_id,
+        is_media,
+        media: media_tag(is_media),
+        dc_idx,
+        proto,
+    };
+    let target_ip = config.dc_target_ip(dc_id).map(str::to_string);
 
-    if target_ip.is_none() {
-        // DC not in config — match the Python fallback order:
-        // CF Worker, CF proxy/default domains, then TCP fallback.  Rust keeps
-        // upstream MTProto proxies before TCP as an extra fallback tier.
-        let reason = format!("DC{} not in --dc-ip config", dc_id);
-        let fallback = match runtime.fallback_ip(dc_id) {
-            Some(ip) => ip.to_string(),
-            None => {
-                warn!("[{}] {} — no fallback IP available", label, reason);
-                return;
-            }
-        };
-
-        // ── Try Cloudflare Worker if configured ──────────────────────────
-        if !cf_worker_domains.is_empty() {
-            let workers_for_conn: Cow<'_, [String]> = if config.cf_balance {
-                Cow::Owned(balanced_cf_workers(&cf_worker_domains))
-            } else {
-                Cow::Borrowed(&cf_worker_domains)
-            };
-            for worker_domain in workers_for_conn.iter() {
-                if cf_worker_in_cooldown(worker_domain) {
-                    debug!(
-                        "[{}] DC{}{} CF Worker {} in cooldown, skipping",
-                        label, dc_id, media_tag, worker_domain
-                    );
-                    continue;
-                }
-
-                debug!(
-                    "[{}] DC{}{} {} → trying CF Worker {} for {}",
-                    label, dc_id, media_tag, reason, worker_domain, fallback
-                );
-
-                if let Some(ws) = connect_cf_worker_ws_for_dc_with_outbound(
-                    worker_domain,
-                    &fallback,
-                    dc_id,
-                    is_media,
-                    skip_tls,
-                    cf_connect_timeout,
-                    runtime.outbound(),
-                )
-                .await
-                {
-                    clear_cf_worker_cooldown(worker_domain);
-                    info!(
-                        "[{}] DC{}{} {} → CF Worker connected ({})",
-                        label, dc_id, media_tag, reason, worker_domain
-                    );
-                    bridge_ws(
-                        reader,
-                        writer,
-                        WsBridgeParams {
-                            label: &label,
-                            ws,
-                            relay_init,
-                            ciphers,
-                            proto,
-                            dc: dc_id,
-                            is_media,
-                        },
-                    )
-                    .await;
-                    return;
-                } else {
-                    set_cf_worker_cooldown(worker_domain, cf_fail_cooldown);
-                    warn!(
-                        "[{}] DC{}{} CF Worker {} failed, cooldown {}s",
-                        label,
-                        dc_id,
-                        media_tag,
-                        worker_domain,
-                        cf_fail_cooldown.as_secs()
-                    );
-                }
-            }
-        }
-
-        // ── Try Cloudflare proxy if configured ────────────────────────────
-        // Always attempted fresh — no per-DC cooldown here, matching
-        // upstream's `_cfproxy_fallback`, which retries every configured
-        // domain on every single connection with no failure memory at all.
-        // A per-DC cooldown (removed) meant one flaky domain among many
-        // (e.g. with --cf-balance/--default-domains) blocked *all* of them
-        // for the whole cooldown window, forcing every connection in that
-        // window down into the fronting/TCP fallback instead.
-        if !config.cf_domains.is_empty() {
-            let cf_domains_for_conn = if config.cf_balance {
-                balanced_cf_domains(&config.cf_domains)
-            } else {
-                config.cf_domains.clone()
-            };
-            debug!(
-                "[{}] DC{}{} {} → trying CF proxy via {:?}",
-                label, dc_id, media_tag, reason, cf_domains_for_conn
-            );
-
-            let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
-                dc_id,
-                &cf_domains_for_conn,
-                is_media,
-                skip_tls,
-                cf_connect_timeout,
-                runtime.outbound(),
-            )
-            .await;
-
-            if let Some(ws) = cf_ws_opt {
-                info!(
-                    "[{}] DC{}{} {} → CF proxy connected",
-                    label, dc_id, media_tag, reason
-                );
-                bridge_ws(
-                    reader,
-                    writer,
-                    WsBridgeParams {
-                        label: &label,
-                        ws,
-                        relay_init,
-                        ciphers,
-                        proto,
-                        dc: dc_id,
-                        is_media,
-                    },
-                )
-                .await;
-                return;
-            } else {
-                warn!(
-                    "[{}] DC{}{} CF proxy failed (all configured domains)",
-                    label, dc_id, media_tag
-                );
-            }
-        }
-
-        // Try each configured upstream MTProto proxy.
-        for upstream in &config.mtproto_proxies {
-            if upstream_in_cooldown(&upstream.host, upstream.port) {
-                debug!(
-                    "[{}] upstream {}:{} in cooldown, skipping",
-                    label, upstream.host, upstream.port
-                );
-                continue;
-            }
-
-            match connect_mtproto_upstream(
-                &upstream.host,
-                upstream.port,
-                &upstream.secret,
-                dc_idx,
-                proto,
-                upstream_connect_timeout,
-                runtime.outbound(),
-            )
-            .await
-            {
-                Some(conn) => {
-                    let is_ft = matches!(conn, UpstreamConnection::FakeTls(..));
-                    clear_upstream_cooldown(&upstream.host, upstream.port);
-                    info!(
-                        "[{}] DC{}{} {} → upstream {} MTProto {}:{}",
-                        label,
-                        dc_id,
-                        media_tag,
-                        reason,
-                        if is_ft { "FakeTLS" } else { "plain" },
-                        upstream.host,
-                        upstream.port
-                    );
-                    let ConnectionCiphers {
-                        clt_dec, clt_enc, ..
-                    } = ciphers;
-                    match conn {
-                        UpstreamConnection::Plain(rem_reader, rem_writer, up_enc, up_dec) => {
-                            let up_ciphers = ConnectionCiphers {
-                                clt_dec,
-                                clt_enc,
-                                tg_enc: up_enc,
-                                tg_dec: up_dec,
-                            };
-                            bridge_mtproto_relay(
-                                reader,
-                                writer,
-                                MtprotoRelayParams {
-                                    label: &label,
-                                    rem_reader,
-                                    rem_writer,
-                                    ciphers: up_ciphers,
-                                    dc: dc_id,
-                                    is_media,
-                                },
-                            )
-                            .await;
-                        }
-                        UpstreamConnection::FakeTls(rem_reader, rem_writer, up_enc, up_dec) => {
-                            let up_ciphers = ConnectionCiphers {
-                                clt_dec,
-                                clt_enc,
-                                tg_enc: up_enc,
-                                tg_dec: up_dec,
-                            };
-                            bridge_faketls_relay(
-                                reader,
-                                writer,
-                                FaketlsRelayParams {
-                                    label: &label,
-                                    rem_reader,
-                                    rem_writer,
-                                    ciphers: up_ciphers,
-                                    dc: dc_id,
-                                    is_media,
-                                },
-                            )
-                            .await;
-                        }
-                    }
-                    return;
-                }
-                None => {
-                    set_upstream_cooldown(&upstream.host, upstream.port, upstream_fail_cooldown);
-                    warn!(
-                        "[{}] upstream {}:{} failed, cooldown {}s",
-                        label,
-                        upstream.host,
-                        upstream.port,
-                        upstream_fail_cooldown.as_secs()
-                    );
-                }
-            }
-        }
-
-        info!("[{}] {} → TCP fallback {}:443", label, reason, fallback);
-
-        bridge_tcp(
-            reader,
-            writer,
-            TcpBridgeParams {
-                label: &label,
-                dst: &fallback,
-                relay_init: &relay_init,
-                ciphers,
-                dc: dc_id,
-                is_media,
-                connect_timeout: tcp_fallback_timeout,
-                runtime: Arc::clone(&runtime),
-            },
-        )
-        .await;
-
-        return;
-    }
-
-    let target_ip = target_ip.unwrap();
-    let ws_timeout = ws_timeout_for(dc_id, is_media, ws_connect_timeout, ws_fail_probe_timeout);
-
-    // ── Step 6: CF priority — try CF proxy before direct WS if enabled ──
-    // No per-DC cooldown gate — see the note on the other CF proxy attempt
-    // below for why (matches upstream's memoryless per-connection retry).
-    if config.cf_priority && !config.cf_domains.is_empty() {
-        let cf_domains_for_conn = if config.cf_balance {
-            balanced_cf_domains(&config.cf_domains)
-        } else {
-            config.cf_domains.clone()
-        };
-        debug!(
-            "[{}] DC{}{} cf-priority → trying CF proxy first",
-            label, dc_id, media_tag
-        );
-
-        let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
-            dc_id,
-            &cf_domains_for_conn,
-            is_media,
-            skip_tls,
-            cf_connect_timeout,
-            runtime.outbound(),
-        )
-        .await;
-
-        if let Some(ws) = cf_ws_opt {
-            info!(
-                "[{}] DC{}{} → CF proxy connected (priority)",
-                label, dc_id, media_tag
-            );
+    // ── Step 6: bridge whatever we ended up connected to ─────────────────
+    match select_upstream(&route, &pool, target_ip).await {
+        Some(Upstream::Ws(ws)) => {
             bridge_ws(
                 reader,
                 writer,
@@ -793,418 +475,505 @@ pub async fn handle_client_with_runtime(
                 },
             )
             .await;
-            return;
-        } else {
-            warn!(
-                "[{}] DC{}{} CF proxy failed (priority) — falling back to WS",
-                label, dc_id, media_tag
-            );
         }
+        Some(Upstream::Mtproto(conn)) => {
+            let ConnectionCiphers {
+                clt_dec, clt_enc, ..
+            } = ciphers;
+
+            bridge_relay(
+                reader,
+                writer,
+                RelayParams {
+                    label: &label,
+                    rem_reader: conn.reader,
+                    rem_writer: conn.writer,
+                    ciphers: ConnectionCiphers {
+                        clt_dec,
+                        clt_enc,
+                        tg_enc: conn.enc,
+                        tg_dec: conn.dec,
+                    },
+                    faketls: conn.faketls,
+                    dc: dc_id,
+                    is_media,
+                },
+            )
+            .await;
+        }
+        Some(Upstream::Tcp(dst)) => {
+            bridge_tcp(
+                reader,
+                writer,
+                TcpBridgeParams {
+                    label: &label,
+                    dst: &dst,
+                    relay_init: &relay_init,
+                    ciphers,
+                    dc: dc_id,
+                    is_media,
+                    connect_timeout: route.timeouts.tcp_fallback,
+                    runtime: Arc::clone(&runtime),
+                },
+            )
+            .await;
+        }
+        None => {}
+    }
+}
+
+// ─── Routing ─────────────────────────────────────────────────────────────────
+
+/// The upstream a connection was routed to, ready to be bridged.
+// Every other layer (the pool, `WsConnectResult`, the bridges) moves
+// `TgWsStream` unboxed; boxing it only here would add a heap allocation to the
+// connect path for one move per connection.
+#[allow(clippy::large_enum_variant)]
+enum Upstream {
+    /// A WebSocket to Telegram — direct, via the Cloudflare proxy, or through
+    /// a Cloudflare Worker tunnel.
+    Ws(TgWsStream),
+    /// An upstream MTProto proxy, plain or FakeTLS-wrapped.
+    Mtproto(UpstreamConnection),
+    /// Last resort: a direct TCP connection to this Telegram DC IP.
+    Tcp(String),
+}
+
+/// Everything the fallback ladder needs to route one client connection.
+struct Route<'a> {
+    label: &'a str,
+    config: &'a Config,
+    runtime: &'a Runtime,
+    timeouts: Timeouts,
+    dc: u32,
+    is_media: bool,
+    /// Cached [`media_tag`] for this DC, used in every log line.
+    media: &'static str,
+    dc_idx: i16,
+    proto: ProtoTag,
+}
+
+/// Walk the fallback ladder and return the upstream to bridge, or `None` when
+/// the connection cannot be routed at all.
+///
+/// `target_ip` is the DC's `--dc-ip` override, if the user configured one.
+/// Without it the direct WebSocket path is skipped entirely and the Python
+/// reference's order is used (Worker, CF proxy, upstream proxies, then TCP).
+async fn select_upstream(
+    route: &Route<'_>,
+    pool: &Arc<WsPool>,
+    target_ip: Option<String>,
+) -> Option<Upstream> {
+    let Some(target_ip) = target_ip else {
+        let reason = format!("DC{} not in --dc-ip config", route.dc);
+        let Some(fallback) = route.runtime.fallback_ip(route.dc).map(str::to_string) else {
+            warn!("[{}] {} — no fallback IP available", route.label, reason);
+            return None;
+        };
+
+        return Some(
+            route
+                .fallback_chain(&fallback, &reason, false)
+                .await
+                .unwrap_or_else(|| route.tcp_fallback(fallback, &reason)),
+        );
+    };
+
+    // ── CF priority — try the CF proxy before direct WS if enabled ───────
+    if route.config.cf_priority
+        && let Some(ws) = route.cf_proxy("cf-priority").await
+    {
+        return Some(Upstream::Ws(ws));
     }
 
-    // ── Step 6a: try pool first ──────────────────────────────────────────
-    let ws_opt = pool.get(dc_id, is_media, target_ip.clone(), skip_tls).await;
-
-    let ws = if let Some(ws) = ws_opt {
+    // ── Pool first, then a fresh WebSocket connect ───────────────────────
+    let pooled = pool
+        .get(
+            route.dc,
+            route.is_media,
+            target_ip.clone(),
+            route.config.skip_tls_verify,
+        )
+        .await;
+    if let Some(ws) = pooled {
         info!(
             "[{}] DC{}{} → pool hit via {}",
-            label, dc_id, media_tag, target_ip
+            route.label, route.dc, route.media, target_ip
+        );
+        return Some(Upstream::Ws(ws));
+    }
+
+    if let Some(ws) = route.direct_ws(&target_ip).await {
+        return Some(Upstream::Ws(ws));
+    }
+
+    // WS failed (and is now in cooldown) — walk the rest of the ladder.
+    // `--cf-priority` already tried the CF proxy above, so skip it here.
+    let reason = "WS failed";
+    Some(
+        route
+            .fallback_chain(&target_ip, reason, route.config.cf_priority)
+            .await
+            .unwrap_or_else(|| {
+                let fallback = route
+                    .runtime
+                    .fallback_ip(route.dc)
+                    .map_or(target_ip, str::to_string);
+
+                route.tcp_fallback(fallback, reason)
+            }),
+    )
+}
+
+impl Route<'_> {
+    /// The Cloudflare Worker → Cloudflare proxy → upstream MTProto ladder,
+    /// shared by both entry points into the fallback chain.
+    ///
+    /// `dst` is the Telegram DC IP the Worker should open its TCP tunnel to.
+    /// Returns `None` when every configured tier failed or was skipped.
+    async fn fallback_chain(
+        &self,
+        dst: &str,
+        reason: &str,
+        skip_cf_proxy: bool,
+    ) -> Option<Upstream> {
+        if let Some(ws) = self.cf_worker(dst, reason).await {
+            return Some(Upstream::Ws(ws));
+        }
+
+        if !skip_cf_proxy && let Some(ws) = self.cf_proxy(reason).await {
+            return Some(Upstream::Ws(ws));
+        }
+
+        self.upstream_proxies(reason).await.map(Upstream::Mtproto)
+    }
+
+    /// Try every configured Cloudflare Worker tunnel in `--cf-balance` order.
+    async fn cf_worker(&self, dst: &str, reason: &str) -> Option<TgWsStream> {
+        let worker_domains = self.config.cf_worker_domains();
+        let workers = balance_order(
+            &worker_domains,
+            self.config.cf_balance,
+            &CF_WORKER_BALANCE_COUNTER,
         );
 
+        for worker_domain in workers.iter() {
+            if CF_WORKER_FAIL.active(worker_domain.as_str()) {
+                debug!(
+                    "[{}] DC{}{} CF Worker {} in cooldown, skipping",
+                    self.label, self.dc, self.media, worker_domain
+                );
+                continue;
+            }
+
+            debug!(
+                "[{}] DC{}{} {} → trying CF Worker {} for {}",
+                self.label, self.dc, self.media, reason, worker_domain, dst
+            );
+
+            let ws = connect_cf_worker_ws_for_dc_with_outbound(
+                worker_domain,
+                dst,
+                self.dc,
+                self.is_media,
+                self.config.skip_tls_verify,
+                self.timeouts.cf_connect,
+                self.runtime.outbound(),
+            )
+            .await;
+
+            match ws {
+                Some(ws) => {
+                    CF_WORKER_FAIL.clear(worker_domain.as_str());
+                    info!(
+                        "[{}] DC{}{} {} → CF Worker connected ({})",
+                        self.label, self.dc, self.media, reason, worker_domain
+                    );
+                    return Some(ws);
+                }
+                None => {
+                    CF_WORKER_FAIL.set(worker_domain.clone(), self.timeouts.cf_fail_cooldown);
+                    warn!(
+                        "[{}] DC{}{} CF Worker {} failed, cooldown {}s",
+                        self.label,
+                        self.dc,
+                        self.media,
+                        worker_domain,
+                        self.timeouts.cf_fail_cooldown.as_secs()
+                    );
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Try the configured Cloudflare proxy domains in `--cf-balance` order.
+    ///
+    /// Deliberately has no per-DC cooldown, matching upstream's
+    /// `_cfproxy_fallback`, which retries every configured domain on every
+    /// single connection with no failure memory at all.  A per-DC cooldown
+    /// (removed) meant one flaky domain among many (e.g. with
+    /// `--cf-balance`/`--default-domains`) blocked *all* of them for the whole
+    /// cooldown window, forcing every connection in that window down into the
+    /// fronting/TCP fallback instead.
+    async fn cf_proxy(&self, reason: &str) -> Option<TgWsStream> {
+        if self.config.cf_domains.is_empty() {
+            return None;
+        }
+
+        let cf_domains = balance_order(
+            &self.config.cf_domains,
+            self.config.cf_balance,
+            &CF_BALANCE_COUNTER,
+        );
+        debug!(
+            "[{}] DC{}{} {} → trying CF proxy via {:?}",
+            self.label, self.dc, self.media, reason, cf_domains
+        );
+
+        let (ws, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
+            self.dc,
+            &cf_domains,
+            self.is_media,
+            self.config.skip_tls_verify,
+            self.timeouts.cf_connect,
+            self.runtime.outbound(),
+        )
+        .await;
+
+        if ws.is_some() {
+            info!(
+                "[{}] DC{}{} {} → CF proxy connected",
+                self.label, self.dc, self.media, reason
+            );
+        } else {
+            warn!(
+                "[{}] DC{}{} CF proxy failed (all configured domains)",
+                self.label, self.dc, self.media
+            );
+        }
+
         ws
-    } else {
-        // ── Step 6b: fresh WebSocket connect ────────────────────────────
+    }
+
+    /// Try each configured upstream MTProto proxy in order.
+    async fn upstream_proxies(&self, reason: &str) -> Option<UpstreamConnection> {
+        for upstream in &self.config.mtproto_proxies {
+            let key = upstream_key(&upstream.host, upstream.port);
+            if UPSTREAM_FAIL.active(key.as_str()) {
+                debug!("[{}] upstream {} in cooldown, skipping", self.label, key);
+                continue;
+            }
+
+            let conn = connect_mtproto_upstream(
+                &upstream.host,
+                upstream.port,
+                &upstream.secret,
+                self.dc_idx,
+                self.proto,
+                self.timeouts.upstream_connect,
+                self.runtime.outbound(),
+            )
+            .await;
+
+            match conn {
+                Some(conn) => {
+                    UPSTREAM_FAIL.clear(key.as_str());
+                    info!(
+                        "[{}] DC{}{} {} → upstream {} MTProto {}",
+                        self.label,
+                        self.dc,
+                        self.media,
+                        reason,
+                        if conn.faketls { "FakeTLS" } else { "plain" },
+                        key
+                    );
+                    return Some(conn);
+                }
+                None => {
+                    UPSTREAM_FAIL.set(key.clone(), self.timeouts.upstream_fail_cooldown);
+                    warn!(
+                        "[{}] upstream {} failed, cooldown {}s",
+                        self.label,
+                        key,
+                        self.timeouts.upstream_fail_cooldown.as_secs()
+                    );
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Open a fresh direct WebSocket to `target_ip`, applying the
+    /// domain-fronting fallback and the per-DC cooldown on failure.
+    async fn direct_ws(&self, target_ip: &str) -> Option<TgWsStream> {
         // While the domain-fronting fallback is in its sticky window, skip
         // straight to a fronted attempt instead of the normal per-domain
         // loop — matching upstream's "stay fronted while it keeps working"
         // behavior instead of re-probing the (likely still-blocked) direct
         // path on every connection.
-        let sticky_fronting_domain = runtime
+        let sticky_fronting = self
+            .runtime
             .fronting_active()
-            .then(|| runtime.fronting_domain())
+            .then(|| self.runtime.fronting_domain())
             .flatten();
 
-        let (mut ws_opt, all_redirects, timed_out) = connect_ws_for_dc_with_outbound(
-            &target_ip,
-            ws_dc,
-            is_media,
-            skip_tls,
-            ws_timeout,
-            runtime.outbound(),
-            sticky_fronting_domain,
-        )
-        .await;
+        let (ws, all_redirects, timed_out) = self.connect_ws(target_ip, sticky_fronting).await;
 
-        if let Some(domain) = sticky_fronting_domain {
-            if ws_opt.is_some() {
-                clear_fronting_fail_cooldown(dc_id, is_media);
-                runtime.activate_fronting();
-                info!(
-                    "[{}] DC{}{} → fronting connected (SNI {})",
-                    label, dc_id, media_tag, domain
-                );
-            } else {
-                runtime.deactivate_fronting();
-                set_fronting_fail_cooldown(dc_id, is_media, fronting_fail_cooldown);
-                warn!(
-                    "[{}] DC{}{} fronting (sticky) failed, falling back, cooldown {}s",
-                    label,
-                    dc_id,
-                    media_tag,
-                    fronting_fail_cooldown.as_secs()
-                );
+        if let Some(domain) = sticky_fronting {
+            if ws.is_some() {
+                self.on_fronting_success(domain);
+                return ws;
             }
-        } else if ws_opt.is_some() {
-            clear_dc_cooldown(dc_id, is_media);
 
+            self.runtime.deactivate_fronting();
+            FRONTING_FAIL.set(
+                (self.dc, self.is_media),
+                self.timeouts.fronting_fail_cooldown,
+            );
+            warn!(
+                "[{}] DC{}{} fronting (sticky) failed, falling back, cooldown {}s",
+                self.label,
+                self.dc,
+                self.media,
+                self.timeouts.fronting_fail_cooldown.as_secs()
+            );
+        } else if ws.is_some() {
+            WS_FAIL.clear(&(self.dc, self.is_media));
             info!(
                 "[{}] DC{}{} → WS connected via {}",
-                label, dc_id, media_tag, target_ip
-            );
-        } else if timed_out
-            && !fronting_in_fail_cooldown(dc_id, is_media)
-            && let Some(domain) = runtime.fronting_domain()
-        {
-            // Reactive fronting: the normal (non-fronted) attempt above
-            // timed out — a sign of SNI-based DPI blocking — so try once
-            // more with the fronted SNI before falling back to cooldown +
-            // CF/upstream/TCP. Skipped while a previous fronting attempt is
-            // in its own fail-cooldown — a network that blocks the DC IP
-            // outright would otherwise pay for this doomed attempt on every
-            // single connection (see `fronting_fail_cooldown` docs).
-            info!(
-                "[{}] DC{}{} WS timed out → trying fronting (SNI {})",
-                label, dc_id, media_tag, domain
+                self.label, self.dc, self.media, target_ip
             );
 
-            let (front_opt, _all_redirects, _timed_out) = connect_ws_for_dc_with_outbound(
-                &target_ip,
-                ws_dc,
-                is_media,
-                skip_tls,
-                ws_timeout,
-                runtime.outbound(),
-                Some(domain),
-            )
-            .await;
+            return ws;
+        } else if let Some(ws) = self.reactive_fronting(target_ip, timed_out).await {
+            return Some(ws);
+        }
 
-            if front_opt.is_some() {
-                clear_fronting_fail_cooldown(dc_id, is_media);
-                runtime.activate_fronting();
-                info!(
-                    "[{}] DC{}{} → fronting connected (SNI {})",
-                    label, dc_id, media_tag, domain
+        self.cool_down_ws(all_redirects);
+
+        None
+    }
+
+    /// Retry a timed-out WebSocket connect once with a fronted SNI.
+    ///
+    /// A timeout (as opposed to a redirect or connection error) is the signal
+    /// for SNI-based DPI blocking, which is exactly what fronting works
+    /// around.  Skipped while a previous fronting attempt is in its own
+    /// fail-cooldown: a network that blocks the DC IP outright would otherwise
+    /// pay for this doomed attempt on every single connection (see
+    /// `Config::fronting_fail_cooldown`).
+    async fn reactive_fronting(&self, target_ip: &str, timed_out: bool) -> Option<TgWsStream> {
+        if !timed_out || FRONTING_FAIL.active(&(self.dc, self.is_media)) {
+            return None;
+        }
+        let domain = self.runtime.fronting_domain()?;
+
+        info!(
+            "[{}] DC{}{} WS timed out → trying fronting (SNI {})",
+            self.label, self.dc, self.media, domain
+        );
+
+        let (ws, _all_redirects, _timed_out) = self.connect_ws(target_ip, Some(domain)).await;
+
+        match ws {
+            Some(ws) => {
+                self.on_fronting_success(domain);
+                Some(ws)
+            }
+            None => {
+                FRONTING_FAIL.set(
+                    (self.dc, self.is_media),
+                    self.timeouts.fronting_fail_cooldown,
                 );
-            } else {
-                set_fronting_fail_cooldown(dc_id, is_media, fronting_fail_cooldown);
                 warn!(
                     "[{}] DC{}{} fronting fallback failed, cooldown {}s",
-                    label,
-                    dc_id,
-                    media_tag,
-                    fronting_fail_cooldown.as_secs()
+                    self.label,
+                    self.dc,
+                    self.media,
+                    self.timeouts.fronting_fail_cooldown.as_secs()
                 );
-            }
-            ws_opt = front_opt;
-        }
-
-        match ws_opt {
-            Some(ws) => ws,
-            None => {
-                // WS failed — apply cooldown and try CF proxy, upstream proxies, or TCP fallback.
-                if all_redirects {
-                    blacklist_ws(dc_id, is_media, ws_redirect_cooldown);
-
-                    warn!(
-                        "[{}] DC{}{} WS cooldown {}s (all domains returned redirect)",
-                        label,
-                        dc_id,
-                        media_tag,
-                        ws_redirect_cooldown.as_secs()
-                    );
-                } else {
-                    set_dc_cooldown(dc_id, is_media, ws_fail_cooldown);
-
-                    info!(
-                        "[{}] DC{}{} WS cooldown {}s",
-                        label,
-                        dc_id,
-                        media_tag,
-                        ws_fail_cooldown.as_secs()
-                    );
-                }
-
-                // ── Try Cloudflare Worker if configured ──────────────────
-                if !cf_worker_domains.is_empty() {
-                    let workers_for_conn: Cow<'_, [String]> = if config.cf_balance {
-                        Cow::Owned(balanced_cf_workers(&cf_worker_domains))
-                    } else {
-                        Cow::Borrowed(&cf_worker_domains)
-                    };
-                    for worker_domain in workers_for_conn.iter() {
-                        if cf_worker_in_cooldown(worker_domain) {
-                            debug!(
-                                "[{}] DC{}{} CF Worker {} in cooldown, skipping",
-                                label, dc_id, media_tag, worker_domain
-                            );
-                            continue;
-                        }
-
-                        debug!(
-                            "[{}] DC{}{} WS failed → trying CF Worker {} for {}",
-                            label, dc_id, media_tag, worker_domain, target_ip
-                        );
-
-                        if let Some(ws) = connect_cf_worker_ws_for_dc_with_outbound(
-                            worker_domain,
-                            &target_ip,
-                            dc_id,
-                            is_media,
-                            skip_tls,
-                            cf_connect_timeout,
-                            runtime.outbound(),
-                        )
-                        .await
-                        {
-                            clear_cf_worker_cooldown(worker_domain);
-                            info!(
-                                "[{}] DC{}{} → CF Worker connected ({})",
-                                label, dc_id, media_tag, worker_domain
-                            );
-                            bridge_ws(
-                                reader,
-                                writer,
-                                WsBridgeParams {
-                                    label: &label,
-                                    ws,
-                                    relay_init,
-                                    ciphers,
-                                    proto,
-                                    dc: dc_id,
-                                    is_media,
-                                },
-                            )
-                            .await;
-                            return;
-                        } else {
-                            set_cf_worker_cooldown(worker_domain, cf_fail_cooldown);
-                            warn!(
-                                "[{}] DC{}{} CF Worker {} failed, cooldown {}s",
-                                label,
-                                dc_id,
-                                media_tag,
-                                worker_domain,
-                                cf_fail_cooldown.as_secs()
-                            );
-                        }
-                    }
-                }
-
-                // ── Try Cloudflare proxy if configured ────────────────────
-                // (Skip if --cf-priority already tried the CF path above.)
-                // No per-DC cooldown gate here either — see the note on the
-                // other CF proxy attempt above.
-                if !config.cf_priority && !config.cf_domains.is_empty() {
-                    let cf_domains_for_conn = if config.cf_balance {
-                        balanced_cf_domains(&config.cf_domains)
-                    } else {
-                        config.cf_domains.clone()
-                    };
-                    debug!(
-                        "[{}] DC{}{} WS/Worker failed → trying CF proxy",
-                        label, dc_id, media_tag
-                    );
-
-                    let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
-                        dc_id,
-                        &cf_domains_for_conn,
-                        is_media,
-                        skip_tls,
-                        cf_connect_timeout,
-                        runtime.outbound(),
-                    )
-                    .await;
-
-                    if let Some(ws) = cf_ws_opt {
-                        info!("[{}] DC{}{} → CF proxy connected", label, dc_id, media_tag);
-                        bridge_ws(
-                            reader,
-                            writer,
-                            WsBridgeParams {
-                                label: &label,
-                                ws,
-                                relay_init,
-                                ciphers,
-                                proto,
-                                dc: dc_id,
-                                is_media,
-                            },
-                        )
-                        .await;
-                        return;
-                    } else {
-                        warn!(
-                            "[{}] DC{}{} CF proxy failed (all configured domains)",
-                            label, dc_id, media_tag
-                        );
-                    }
-                }
-
-                // Try each configured upstream MTProto proxy before direct TCP.
-                for upstream in &config.mtproto_proxies {
-                    if upstream_in_cooldown(&upstream.host, upstream.port) {
-                        debug!(
-                            "[{}] upstream {}:{} in cooldown, skipping",
-                            label, upstream.host, upstream.port
-                        );
-                        continue;
-                    }
-
-                    match connect_mtproto_upstream(
-                        &upstream.host,
-                        upstream.port,
-                        &upstream.secret,
-                        dc_idx,
-                        proto,
-                        upstream_connect_timeout,
-                        runtime.outbound(),
-                    )
-                    .await
-                    {
-                        Some(conn) => {
-                            let is_ft = matches!(conn, UpstreamConnection::FakeTls(..));
-                            clear_upstream_cooldown(&upstream.host, upstream.port);
-                            info!(
-                                "[{}] DC{}{} → upstream {} MTProto {}:{}",
-                                label,
-                                dc_id,
-                                media_tag,
-                                if is_ft { "FakeTLS" } else { "plain" },
-                                upstream.host,
-                                upstream.port
-                            );
-                            let ConnectionCiphers {
-                                clt_dec, clt_enc, ..
-                            } = ciphers;
-                            match conn {
-                                UpstreamConnection::Plain(
-                                    rem_reader,
-                                    rem_writer,
-                                    up_enc,
-                                    up_dec,
-                                ) => {
-                                    let up_ciphers = ConnectionCiphers {
-                                        clt_dec,
-                                        clt_enc,
-                                        tg_enc: up_enc,
-                                        tg_dec: up_dec,
-                                    };
-                                    bridge_mtproto_relay(
-                                        reader,
-                                        writer,
-                                        MtprotoRelayParams {
-                                            label: &label,
-                                            rem_reader,
-                                            rem_writer,
-                                            ciphers: up_ciphers,
-                                            dc: dc_id,
-                                            is_media,
-                                        },
-                                    )
-                                    .await;
-                                }
-                                UpstreamConnection::FakeTls(
-                                    rem_reader,
-                                    rem_writer,
-                                    up_enc,
-                                    up_dec,
-                                ) => {
-                                    let up_ciphers = ConnectionCiphers {
-                                        clt_dec,
-                                        clt_enc,
-                                        tg_enc: up_enc,
-                                        tg_dec: up_dec,
-                                    };
-                                    bridge_faketls_relay(
-                                        reader,
-                                        writer,
-                                        FaketlsRelayParams {
-                                            label: &label,
-                                            rem_reader,
-                                            rem_writer,
-                                            ciphers: up_ciphers,
-                                            dc: dc_id,
-                                            is_media,
-                                        },
-                                    )
-                                    .await;
-                                }
-                            }
-                            return;
-                        }
-                        None => {
-                            set_upstream_cooldown(
-                                &upstream.host,
-                                upstream.port,
-                                upstream_fail_cooldown,
-                            );
-                            warn!(
-                                "[{}] upstream {}:{} failed, cooldown {}s",
-                                label,
-                                upstream.host,
-                                upstream.port,
-                                upstream_fail_cooldown.as_secs()
-                            );
-                        }
-                    }
-                }
-
-                let fallback = runtime
-                    .fallback_ip(dc_id)
-                    .map(str::to_string)
-                    .unwrap_or(target_ip.clone());
-
-                info!(
-                    "[{}] DC{}{} → TCP fallback {}:443",
-                    label, dc_id, media_tag, fallback
-                );
-
-                bridge_tcp(
-                    reader,
-                    writer,
-                    TcpBridgeParams {
-                        label: &label,
-                        dst: &fallback,
-                        relay_init: &relay_init,
-                        ciphers,
-                        dc: dc_id,
-                        is_media,
-                        connect_timeout: tcp_fallback_timeout,
-                        runtime: Arc::clone(&runtime),
-                    },
-                )
-                .await;
-
-                return;
+                None
             }
         }
-    };
+    }
 
-    // ── Step 7: bidirectional WebSocket bridge ───────────────────────────
-    bridge_ws(
-        reader,
-        writer,
-        WsBridgeParams {
-            label: &label,
-            ws,
-            relay_init,
-            ciphers,
-            proto,
-            dc: dc_id,
-            is_media,
-        },
-    )
-    .await;
+    async fn connect_ws(
+        &self,
+        target_ip: &str,
+        sni_override: Option<&str>,
+    ) -> (Option<TgWsStream>, bool, bool) {
+        // A DC still inside its failure cooldown is probed with a much shorter
+        // timeout so a doomed attempt does not delay the fallback chain.
+        let timeout = if WS_FAIL.active(&(self.dc, self.is_media)) {
+            self.timeouts.ws_fail_probe
+        } else {
+            self.timeouts.ws_connect
+        };
+
+        connect_ws_for_dc_with_outbound(
+            target_ip,
+            self.runtime.websocket_dc(self.dc),
+            self.is_media,
+            self.config.skip_tls_verify,
+            timeout,
+            self.runtime.outbound(),
+            sni_override,
+        )
+        .await
+    }
+
+    fn on_fronting_success(&self, domain: &str) {
+        FRONTING_FAIL.clear(&(self.dc, self.is_media));
+        self.runtime.activate_fronting();
+        info!(
+            "[{}] DC{}{} → fronting connected (SNI {})",
+            self.label, self.dc, self.media, domain
+        );
+    }
+
+    /// Back off from this DC's WebSocket path after a failed attempt.
+    ///
+    /// A cooldown rather than a permanent blacklist, so the proxy recovers
+    /// automatically if WS becomes available again (e.g. after a network
+    /// change or a Telegram-side redirect policy change).
+    fn cool_down_ws(&self, all_redirects: bool) {
+        let cooldown = if all_redirects {
+            self.timeouts.ws_redirect_cooldown
+        } else {
+            self.timeouts.ws_fail_cooldown
+        };
+        WS_FAIL.set((self.dc, self.is_media), cooldown);
+
+        if all_redirects {
+            warn!(
+                "[{}] DC{}{} WS cooldown {}s (all domains returned redirect)",
+                self.label,
+                self.dc,
+                self.media,
+                cooldown.as_secs()
+            );
+        } else {
+            info!(
+                "[{}] DC{}{} WS cooldown {}s",
+                self.label,
+                self.dc,
+                self.media,
+                cooldown.as_secs()
+            );
+        }
+    }
+
+    fn tcp_fallback(&self, dst: String, reason: &str) -> Upstream {
+        info!(
+            "[{}] DC{}{} {} → TCP fallback {}:443",
+            self.label, self.dc, self.media, reason, dst
+        );
+
+        Upstream::Tcp(dst)
+    }
 }
 
 // ─── WebSocket bridge ────────────────────────────────────────────────────────
@@ -1221,7 +990,7 @@ struct WsBridgeParams<'a> {
     ws: TgWsStream,
     relay_init: [u8; 64],
     ciphers: ConnectionCiphers,
-    proto: crate::crypto::ProtoTag,
+    proto: ProtoTag,
     dc: u32,
     is_media: bool,
 }
@@ -1249,64 +1018,52 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
         mut tg_enc,
         mut tg_dec,
     } = ciphers;
-    let splitter = MsgSplitter::new(&relay_init, proto);
+    let mut splitter = MsgSplitter::new(&relay_init, proto);
 
     // Split the WebSocket stream into sink (send) and source (recv).
     let (mut ws_sink, mut ws_source) = ws.split();
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
 
-    // Spawn each bridge direction as an independent task so that when one
-    // side closes (e.g. Telegram drops the WS after an idle timeout), the
-    // other side is aborted immediately rather than hanging on blocked I/O
-    // until the OS-level connection eventually times out.  With tokio::join!
-    // both halves had to complete before the function returned, causing
-    // zombie connections that exhausted the process file-descriptor limit.
+    let upload = tokio::spawn(async move {
+        let mut reader = reader;
+        let mut buf = vec![0u8; RELAY_BUF_SIZE];
+        let mut total = 0u64;
 
-    let mut upload = tokio::spawn({
-        let mut splitter = splitter;
+        loop {
+            let n = match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let chunk = &mut buf[..n];
 
-        async move {
-            let mut reader = reader;
-            let mut buf = vec![0u8; 65536];
-            let mut total = 0u64;
+            // Decrypt from client, then re-encrypt for Telegram.
+            clt_dec.apply_keystream(chunk);
+            tg_enc.apply_keystream(chunk);
 
-            loop {
-                let n = match reader.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
-                };
-                let chunk = &mut buf[..n];
-
-                // Decrypt from client, then re-encrypt for Telegram.
-                clt_dec.apply_keystream(chunk);
-                tg_enc.apply_keystream(chunk);
-
-                // Split into MTProto packets and send as separate WS frames.
-                let parts = splitter.split(chunk);
-                for part in parts {
-                    if ws_sink.send(Message::Binary(part)).await.is_err() {
-                        return total;
-                    }
+            // Split into MTProto packets and send as separate WS frames.
+            for part in splitter.split(chunk) {
+                if ws_sink.send(Message::Binary(part)).await.is_err() {
+                    return total;
                 }
-
-                total += n as u64;
             }
 
-            // Flush any partial last packet.
-            for part in splitter.flush() {
-                let _ = ws_sink.send(Message::Binary(part)).await;
-            }
-
-            // Close the WS sink so Telegram knows we are done and the
-            // download direction (ws_source) receives the close frame and
-            // terminates promptly instead of waiting indefinitely.
-            let _ = ws_sink.close().await;
-            total
+            total += n as u64;
         }
+
+        // Flush any partial last packet.
+        for part in splitter.flush() {
+            let _ = ws_sink.send(Message::Binary(part)).await;
+        }
+
+        // Close the WS sink so Telegram knows we are done and the download
+        // direction (ws_source) receives the close frame and terminates
+        // promptly instead of waiting indefinitely.
+        let _ = ws_sink.close().await;
+        total
     });
 
-    let mut download = tokio::spawn(async move {
+    let download = tokio::spawn(async move {
         let mut writer = writer;
         let mut total = 0u64;
 
@@ -1334,59 +1091,24 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
         total
     });
 
-    // Wait for whichever direction finishes first, then abort the other so
-    // its I/O handles (and file descriptors) are released immediately.
-    let (bytes_up, bytes_down) = tokio::select! {
-        result = &mut upload => {
-            let up = result.unwrap_or(0);
-            download.abort();
+    let (bytes_up, bytes_down) = join_bridge(upload, download).await;
 
-            let down = download.await.unwrap_or(0);
-
-            (up, down)
-        }
-        result = &mut download => {
-            let down = result.unwrap_or(0);
-            upload.abort();
-
-            let up = upload.await.unwrap_or(0);
-
-            (up, down)
-        }
-    };
-
-    let elapsed = start.elapsed().as_secs_f32();
-
-    info!(
-        "[{}] DC{}{} WS session closed: ↑{}  ↓{}  {:.1}s",
-        label,
-        dc,
-        if is_media { "m" } else { "" },
-        human_bytes(bytes_up),
-        human_bytes(bytes_down),
-        elapsed
-    );
+    log_session_closed(label, dc, is_media, "WS", bytes_up, bytes_down, start);
 }
 
 // ─── Upstream MTProto proxy connection ───────────────────────────────────────
 
-/// Result of connecting to an upstream MTProto proxy.
-///
-/// - `Plain`: standard obfuscated TCP — data is sent/received raw.
-/// - `FakeTls`: the connection is wrapped in TLS Application Data records.
-enum UpstreamConnection {
-    Plain(
-        tokio::io::ReadHalf<TcpStream>,
-        tokio::io::WriteHalf<TcpStream>,
-        AesCtr256,
-        AesCtr256,
-    ),
-    FakeTls(
-        tokio::io::ReadHalf<TcpStream>,
-        tokio::io::WriteHalf<TcpStream>,
-        AesCtr256,
-        AesCtr256,
-    ),
+/// A connected upstream MTProto proxy, ready to be bridged.
+struct UpstreamConnection {
+    reader: TcpReader,
+    writer: TcpWriter,
+    /// Encrypts data we send to the upstream proxy.
+    enc: AesCtr256,
+    /// Decrypts data we receive from the upstream proxy.
+    dec: AesCtr256,
+    /// Whether the session is wrapped in TLS Application Data records
+    /// (`0xee` FakeTLS secrets) rather than sent as raw obfuscated TCP.
+    faketls: bool,
 }
 
 /// Connect to an upstream MTProto proxy and perform the client handshake.
@@ -1395,18 +1117,14 @@ enum UpstreamConnection {
 /// - `0xee` secrets (≥17 bytes): FakeTLS — sends a TLS ClientHello with HMAC
 ///   authentication, drains the server's fake handshake, then sends the 64-byte
 ///   MTProto init inside a TLS Application Data record.
-///
-/// Returns the split TCP stream and the two ciphers for the session:
-/// - `enc`: encrypts data we send to the upstream proxy.
-/// - `dec`: decrypts data we receive from the upstream proxy.
 async fn connect_mtproto_upstream(
     host: &str,
     port: u16,
     secret_hex: &str,
     dc_idx: i16,
-    proto: crate::crypto::ProtoTag,
+    proto: ProtoTag,
     timeout: Duration,
-    outbound: &crate::outbound::OutboundConnector,
+    outbound: &OutboundConnector,
 ) -> Option<UpstreamConnection> {
     let secret = match hex::decode(secret_hex) {
         Ok(b) => b,
@@ -1415,18 +1133,7 @@ async fn connect_mtproto_upstream(
             return None;
         }
     };
-
-    // ── Secret parsing ────────────────────────────────────────────────────
-    //
-    // Telegram MTProto proxy secrets start with an optional 1-byte mode flag:
-    //   0xdd → padded-intermediate, key = secret[1..17]
-    //   0xee → FakeTLS, key = secret[1..17], hostname = secret[17..]
-    let is_faketls = secret.len() > 17 && secret[0] == 0xee;
-    let key_bytes: &[u8] = if secret.len() >= 17 && matches!(secret[0], 0xdd | 0xee) {
-        &secret[1..17]
-    } else {
-        &secret
-    };
+    let key_bytes = secret_key(&secret);
 
     // ── TCP connect ───────────────────────────────────────────────────────
     let stream = match outbound.connect(host, port, timeout).await {
@@ -1441,59 +1148,68 @@ async fn connect_mtproto_upstream(
     let (handshake, enc, dec) = generate_client_handshake(key_bytes, dc_idx, proto);
     let (mut reader, mut writer) = tokio::io::split(stream);
 
-    if is_faketls {
-        // ── FakeTLS path ──────────────────────────────────────────────────
-        let hostname = match std::str::from_utf8(&secret[17..]) {
-            Ok(h) => h,
-            Err(_) => {
-                warn!(
-                    "[upstream] {}:{} FakeTLS secret has non-UTF-8 hostname",
-                    host, port
-                );
-                return None;
-            }
-        };
-
-        // Build the ClientHello with HMAC authentication.
-        let mut client_hello = build_faketls_client_hello(hostname);
-        sign_faketls_client_hello(&mut client_hello, key_bytes);
-
-        if let Err(e) = writer.write_all(&client_hello).await {
-            warn!(
-                "[upstream] {}:{} FakeTLS send ClientHello error: {}",
-                host, port, e
-            );
-            return None;
-        }
-
-        // Drain the server's fake TLS handshake response.
-        if !drain_faketls_server_hello(&mut reader).await {
-            warn!(
-                "[upstream] {}:{} FakeTLS server handshake failed",
-                host, port
-            );
-            return None;
-        }
-
-        // Send the 64-byte MTProto init as the first Application Data record.
-        if let Err(e) = write_tls_appdata(&mut writer, &handshake).await {
-            warn!(
-                "[upstream] {}:{} FakeTLS send MTProto init error: {}",
-                host, port, e
-            );
-            return None;
-        }
-
-        Some(UpstreamConnection::FakeTls(reader, writer, enc, dec))
-    } else {
+    let Some(hostname) = faketls_hostname(&secret) else {
         // ── Plain MTProto path ────────────────────────────────────────────
         if let Err(e) = writer.write_all(&handshake).await {
             warn!("[upstream] {}:{} send handshake error: {}", host, port, e);
             return None;
         }
 
-        Some(UpstreamConnection::Plain(reader, writer, enc, dec))
+        return Some(UpstreamConnection {
+            reader,
+            writer,
+            enc,
+            dec,
+            faketls: false,
+        });
+    };
+
+    // ── FakeTLS path ──────────────────────────────────────────────────────
+    let Ok(hostname) = std::str::from_utf8(hostname) else {
+        warn!(
+            "[upstream] {}:{} FakeTLS secret has non-UTF-8 hostname",
+            host, port
+        );
+        return None;
+    };
+
+    // Build the ClientHello with HMAC authentication.
+    let mut client_hello = build_faketls_client_hello(hostname);
+    sign_faketls_client_hello(&mut client_hello, key_bytes);
+
+    if let Err(e) = writer.write_all(&client_hello).await {
+        warn!(
+            "[upstream] {}:{} FakeTLS send ClientHello error: {}",
+            host, port, e
+        );
+        return None;
     }
+
+    // Drain the server's fake TLS handshake response.
+    if !drain_faketls_server_hello(&mut reader).await {
+        warn!(
+            "[upstream] {}:{} FakeTLS server handshake failed",
+            host, port
+        );
+        return None;
+    }
+
+    // Send the 64-byte MTProto init as the first Application Data record.
+    if let Err(e) = write_tls_appdata(&mut writer, &handshake).await {
+        warn!(
+            "[upstream] {}:{} FakeTLS send MTProto init error: {}",
+            host, port, e
+        );
+        return None;
+    }
+
+    Some(UpstreamConnection {
+        reader,
+        writer,
+        enc,
+        dec,
+        faketls: true,
+    })
 }
 
 // ─── Upstream MTProto relay bridge ───────────────────────────────────────────
@@ -1501,143 +1217,31 @@ async fn connect_mtproto_upstream(
 /// Bidirectional bridge between the client (TCP) and an upstream MTProto proxy
 /// (TCP).  The upstream proxy handles the onward Telegram connection.
 ///
+/// With `faketls` set, traffic to and from the upstream is additionally
+/// wrapped in TLS Application Data records (`\x17\x03\x03` + 2-byte
+/// big-endian length + payload).  The AES-CTR re-encryption operates on the
+/// payload inside those records, exactly as in the plain case.
+///
 /// `ciphers.tg_enc` / `ciphers.tg_dec` must already be set to the upstream
-/// session ciphers returned by [`connect_mtproto_upstream`].
-struct MtprotoRelayParams<'a> {
+/// session ciphers returned by [`connect_mtproto_upstream`].  No relay init is
+/// sent here — the client handshake was the only setup packet.
+struct RelayParams<'a> {
     label: &'a str,
-    rem_reader: tokio::io::ReadHalf<TcpStream>,
-    rem_writer: tokio::io::WriteHalf<TcpStream>,
+    rem_reader: TcpReader,
+    rem_writer: TcpWriter,
     ciphers: ConnectionCiphers,
+    faketls: bool,
     dc: u32,
     is_media: bool,
 }
 
-async fn bridge_mtproto_relay(
-    reader: ClientReader,
-    writer: ClientWriter,
-    params: MtprotoRelayParams<'_>,
-) {
-    let MtprotoRelayParams {
-        label,
-        rem_reader,
-        mut rem_writer,
-        ciphers,
-        dc,
-        is_media,
-    } = params;
-
-    let ConnectionCiphers {
-        mut clt_dec,
-        mut clt_enc,
-        mut tg_enc,
-        mut tg_dec,
-    } = ciphers;
-
-    // The upstream proxy is already expecting encrypted data (the client
-    // handshake was the only "setup" packet; no additional relay_init is sent).
-
-    let start = std::time::Instant::now();
-
-    let mut upload = tokio::spawn(async move {
-        let mut reader = reader;
-        let mut buf = vec![0u8; 65536];
-        let mut total = 0u64;
-
-        loop {
-            let n = match reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            let chunk = &mut buf[..n];
-            clt_dec.apply_keystream(chunk);
-            tg_enc.apply_keystream(chunk);
-            if rem_writer.write_all(chunk).await.is_err() {
-                break;
-            }
-            total += n as u64;
-        }
-        total
-    });
-
-    let mut download = tokio::spawn(async move {
-        let mut rem_reader = rem_reader;
-        let mut writer = writer;
-        let mut buf = vec![0u8; 65536];
-        let mut total = 0u64;
-
-        loop {
-            let n = match rem_reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            let chunk = &mut buf[..n];
-            tg_dec.apply_keystream(chunk);
-            clt_enc.apply_keystream(chunk);
-            if writer.write_all(chunk).await.is_err() {
-                break;
-            }
-            total += n as u64;
-        }
-        total
-    });
-
-    let (bytes_up, bytes_down) = tokio::select! {
-        result = &mut upload => {
-            let up = result.unwrap_or(0);
-            download.abort();
-            let down = download.await.unwrap_or(0);
-            (up, down)
-        }
-        result = &mut download => {
-            let down = result.unwrap_or(0);
-            upload.abort();
-            let up = upload.await.unwrap_or(0);
-            (up, down)
-        }
-    };
-
-    let elapsed = start.elapsed().as_secs_f32();
-    info!(
-        "[{}] DC{}{} upstream session closed: ↑{}  ↓{}  {:.1}s",
-        label,
-        dc,
-        if is_media { "m" } else { "" },
-        human_bytes(bytes_up),
-        human_bytes(bytes_down),
-        elapsed
-    );
-}
-
-// ─── FakeTLS upstream relay bridge ───────────────────────────────────────────
-
-/// Bidirectional bridge between the client (TCP) and an upstream FakeTLS proxy.
-///
-/// Identical to [`bridge_mtproto_relay`] except that:
-/// - **Writes to upstream** are wrapped in TLS Application Data records
-///   (`\x17\x03\x03` + 2-byte big-endian length + payload).
-/// - **Reads from upstream** parse TLS record headers and extract payloads.
-///
-/// The AES-CTR re-encryption (`clt_dec` / `tg_enc` and `tg_dec` / `clt_enc`)
-/// operates on the payload inside TLS records, exactly as in the plain bridge.
-struct FaketlsRelayParams<'a> {
-    label: &'a str,
-    rem_reader: tokio::io::ReadHalf<TcpStream>,
-    rem_writer: tokio::io::WriteHalf<TcpStream>,
-    ciphers: ConnectionCiphers,
-    dc: u32,
-    is_media: bool,
-}
-
-async fn bridge_faketls_relay(
-    reader: ClientReader,
-    writer: ClientWriter,
-    params: FaketlsRelayParams<'_>,
-) {
-    let FaketlsRelayParams {
+async fn bridge_relay(reader: ClientReader, writer: ClientWriter, params: RelayParams<'_>) {
+    let RelayParams {
         label,
         rem_reader,
         rem_writer,
         ciphers,
+        faketls,
         dc,
         is_media,
     } = params;
@@ -1649,13 +1253,22 @@ async fn bridge_faketls_relay(
         mut tg_dec,
     } = ciphers;
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
 
-    // ── Upload: client → upstream (wrapped in TLS Application Data records)
-    let mut upload = tokio::spawn(async move {
+    // ── Upload: client → upstream ────────────────────────────────────────
+    let upload = tokio::spawn(async move {
         let mut reader = reader;
         let mut rem_writer = rem_writer;
-        let mut buf = vec![0u8; TLS_MAX_RECORD_PAYLOAD];
+        // A FakeTLS record cannot carry more than one full TLS record's worth
+        // of payload, so the read is capped to that in FakeTLS mode.
+        let mut buf = vec![
+            0u8;
+            if faketls {
+                TLS_MAX_RECORD_PAYLOAD
+            } else {
+                RELAY_BUF_SIZE
+            }
+        ];
         let mut total = 0u64;
 
         loop {
@@ -1667,27 +1280,44 @@ async fn bridge_faketls_relay(
             clt_dec.apply_keystream(chunk);
             tg_enc.apply_keystream(chunk);
 
-            if write_tls_appdata(&mut rem_writer, &buf[..n]).await.is_err() {
+            let written = if faketls {
+                write_tls_appdata(&mut rem_writer, chunk).await
+            } else {
+                rem_writer.write_all(chunk).await
+            };
+            if written.is_err() {
                 break;
             }
+
             total += n as u64;
         }
 
         total
     });
 
-    // ── Download: upstream → client (unwrap TLS Application Data records)
-    let mut download = tokio::spawn(async move {
+    // ── Download: upstream → client ──────────────────────────────────────
+    let download = tokio::spawn(async move {
         let mut rem_reader = rem_reader;
         let mut writer = writer;
-        let mut buf = vec![0u8; TLS_MAX_RECORD_PAYLOAD + 256];
+        let mut buf = vec![
+            0u8;
+            if faketls {
+                TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM
+            } else {
+                RELAY_BUF_SIZE
+            }
+        ];
         let mut total = 0u64;
 
         loop {
-            let n = match read_tls_appdata(&mut rem_reader, &mut buf).await {
-                Ok(0) => break,
+            let read = if faketls {
+                read_tls_appdata(&mut rem_reader, &mut buf).await
+            } else {
+                rem_reader.read(&mut buf).await
+            };
+            let n = match read {
+                Ok(0) | Err(_) => break,
                 Ok(n) => n,
-                Err(_) => break,
             };
 
             let chunk = &mut buf[..n];
@@ -1697,37 +1327,21 @@ async fn bridge_faketls_relay(
             if writer.write_all(chunk).await.is_err() {
                 break;
             }
+
             total += n as u64;
         }
 
         total
     });
 
-    let (bytes_up, bytes_down) = tokio::select! {
-        result = &mut upload => {
-            let up = result.unwrap_or(0);
-            download.abort();
-            let down = download.await.unwrap_or(0);
-            (up, down)
-        }
-        result = &mut download => {
-            let down = result.unwrap_or(0);
-            upload.abort();
-            let up = upload.await.unwrap_or(0);
-            (up, down)
-        }
-    };
+    let (bytes_up, bytes_down) = join_bridge(upload, download).await;
 
-    let elapsed = start.elapsed().as_secs_f32();
-    info!(
-        "[{}] DC{}{} upstream FakeTLS session closed: ↑{}  ↓{}  {:.1}s",
-        label,
-        dc,
-        if is_media { "m" } else { "" },
-        human_bytes(bytes_up),
-        human_bytes(bytes_down),
-        elapsed
-    );
+    let kind = if faketls {
+        "upstream FakeTLS"
+    } else {
+        "upstream"
+    };
+    log_session_closed(label, dc, is_media, kind, bytes_up, bytes_down, start);
 }
 
 // ─── TCP fallback bridge ─────────────────────────────────────────────────────
@@ -1739,7 +1353,7 @@ struct TcpBridgeParams<'a> {
     label: &'a str,
     dst: &'a str,
     relay_init: &'a [u8; 64],
-    ciphers: crate::crypto::ConnectionCiphers,
+    ciphers: ConnectionCiphers,
     dc: u32,
     is_media: bool,
     connect_timeout: Duration,
@@ -1779,17 +1393,17 @@ async fn bridge_tcp(
         return;
     }
 
-    let crate::crypto::ConnectionCiphers {
+    let ConnectionCiphers {
         mut clt_dec,
         mut clt_enc,
         mut tg_enc,
         mut tg_dec,
     } = ciphers;
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
 
-    let mut upload = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
+    let upload = tokio::spawn(async move {
+        let mut buf = vec![0u8; RELAY_BUF_SIZE];
         let mut total = 0u64;
 
         loop {
@@ -1812,8 +1426,8 @@ async fn bridge_tcp(
         total
     });
 
-    let mut download = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
+    let download = tokio::spawn(async move {
+        let mut buf = vec![0u8; RELAY_BUF_SIZE];
         let mut total = 0u64;
 
         loop {
@@ -1832,44 +1446,63 @@ async fn bridge_tcp(
 
             total += n as u64;
         }
+
         total
     });
 
-    // Same cross-direction cancellation as bridge_ws: abort the peer task
-    // when one direction closes so FDs are freed immediately.
-    let (bytes_up, bytes_down) = tokio::select! {
+    let (bytes_up, bytes_down) = join_bridge(upload, download).await;
+
+    log_session_closed(label, dc, is_media, "TCP", bytes_up, bytes_down, start);
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Wait for whichever bridge direction finishes first, then abort the other.
+///
+/// Each direction runs as an independent task so that when one side closes
+/// (e.g. Telegram drops the WS after an idle timeout) the other is cancelled
+/// immediately rather than hanging on blocked I/O until the OS-level
+/// connection times out.  Joining both halves instead left zombie connections
+/// behind that exhausted the process file-descriptor limit.
+///
+/// Returns `(bytes_up, bytes_down)`.
+async fn join_bridge(mut upload: JoinHandle<u64>, mut download: JoinHandle<u64>) -> (u64, u64) {
+    tokio::select! {
         result = &mut upload => {
             let up = result.unwrap_or(0);
             download.abort();
 
-            let down = download.await.unwrap_or(0);
-
-            (up, down)
+            (up, download.await.unwrap_or(0))
         }
         result = &mut download => {
             let down = result.unwrap_or(0);
             upload.abort();
 
-            let up = upload.await.unwrap_or(0);
-
-            (up, down)
+            (upload.await.unwrap_or(0), down)
         }
-    };
-
-    let elapsed = start.elapsed().as_secs_f32();
-
-    info!(
-        "[{}] DC{}{} TCP session closed: ↑{}  ↓{}  {:.1}s",
-        label,
-        dc,
-        if is_media { "m" } else { "" },
-        human_bytes(bytes_up),
-        human_bytes(bytes_down),
-        elapsed
-    );
+    }
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+fn log_session_closed(
+    label: &str,
+    dc: u32,
+    is_media: bool,
+    kind: &str,
+    bytes_up: u64,
+    bytes_down: u64,
+    start: Instant,
+) {
+    info!(
+        "[{}] DC{}{} {} session closed: ↑{}  ↓{}  {:.1}s",
+        label,
+        dc,
+        media_tag(is_media),
+        kind,
+        human_bytes(bytes_up),
+        human_bytes(bytes_down),
+        start.elapsed().as_secs_f32()
+    );
+}
 
 async fn read_inbound_handshake(
     label: &str,
@@ -1918,77 +1551,4 @@ fn human_bytes(n: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn balanced_cf_workers_rotates_start_domain() {
-        CF_WORKER_BALANCE_COUNTER.store(0, Ordering::Relaxed);
-        let workers = vec![
-            "w1.example.workers.dev".to_string(),
-            "w2.example.workers.dev".to_string(),
-            "w3.example.workers.dev".to_string(),
-        ];
-
-        assert_eq!(
-            balanced_cf_workers(&workers),
-            vec![
-                "w1.example.workers.dev".to_string(),
-                "w2.example.workers.dev".to_string(),
-                "w3.example.workers.dev".to_string(),
-            ]
-        );
-        assert_eq!(
-            balanced_cf_workers(&workers),
-            vec![
-                "w2.example.workers.dev".to_string(),
-                "w3.example.workers.dev".to_string(),
-                "w1.example.workers.dev".to_string(),
-            ]
-        );
-        assert_eq!(
-            balanced_cf_workers(&workers),
-            vec![
-                "w3.example.workers.dev".to_string(),
-                "w1.example.workers.dev".to_string(),
-                "w2.example.workers.dev".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn worker_cooldown_is_tracked_per_domain() {
-        clear_cf_worker_cooldown("w1.example.workers.dev");
-        clear_cf_worker_cooldown("w2.example.workers.dev");
-
-        assert!(!cf_worker_in_cooldown("w1.example.workers.dev"));
-        assert!(!cf_worker_in_cooldown("w2.example.workers.dev"));
-
-        set_cf_worker_cooldown("w1.example.workers.dev", Duration::from_secs(60));
-        assert!(cf_worker_in_cooldown("w1.example.workers.dev"));
-        assert!(!cf_worker_in_cooldown("w2.example.workers.dev"));
-
-        clear_cf_worker_cooldown("w1.example.workers.dev");
-        assert!(!cf_worker_in_cooldown("w1.example.workers.dev"));
-    }
-
-    #[test]
-    fn fronting_fail_cooldown_is_tracked_per_dc_and_media_flag() {
-        // Use DC numbers not touched by other tests in this file (which run
-        // concurrently and share this same global static).
-        clear_fronting_fail_cooldown(90, false);
-        clear_fronting_fail_cooldown(90, true);
-
-        assert!(!fronting_in_fail_cooldown(90, false));
-        assert!(!fronting_in_fail_cooldown(90, true));
-
-        set_fronting_fail_cooldown(90, false, Duration::from_secs(60));
-        assert!(fronting_in_fail_cooldown(90, false));
-        // The media flag is part of the key — a non-media cooldown must not
-        // leak into the media bucket for the same DC.
-        assert!(!fronting_in_fail_cooldown(90, true));
-
-        clear_fronting_fail_cooldown(90, false);
-        assert!(!fronting_in_fail_cooldown(90, false));
-    }
-}
+mod tests;

@@ -18,6 +18,69 @@ fn test_certificate(domain: &str) -> (CertificateDer<'static>, PrivateKeyDer<'st
     (cert_der, key_der)
 }
 
+#[test]
+fn media_tag_marks_only_media_dcs() {
+    assert_eq!(media_tag(true), "m");
+    assert_eq!(media_tag(false), "");
+}
+
+#[test]
+fn base_cf_record_strips_only_the_dash_one_label() {
+    assert_eq!(
+        base_cf_record("kws2-1.example.net").as_deref(),
+        Some("kws2.example.net")
+    );
+    // Only the first `-1.` is replaced, so a customer domain that itself
+    // contains `-1.` keeps its own labels intact.
+    assert_eq!(
+        base_cf_record("kws2-1.node-1.example.net").as_deref(),
+        Some("kws2.node-1.example.net")
+    );
+    assert_eq!(base_cf_record("kws2.example.net"), None);
+    assert_eq!(base_cf_record("kws2-1"), None);
+}
+
+#[test]
+fn dns_not_found_is_recognised_on_every_platform() {
+    // The `-1` record fallback keys off this, and each libc words the failure
+    // differently — a missed variant turns an optional record into a hard
+    // failure of the whole CF tier.
+    for reason in [
+        "TCP connect: failed to lookup address information: Name or service not known",
+        "TCP connect: nodename nor servname provided, or not known",
+        "TCP connect: No such host is known. (os error 11001)",
+    ] {
+        assert!(is_dns_not_found(reason), "not recognised: {reason}");
+    }
+
+    // Anything that is not a resolver failure on the connect step must not
+    // trigger the silent retry.
+    for reason in [
+        "TCP connect: Connection refused (os error 111)",
+        "TCP connect timed out",
+        "HTTP proxy http://127.0.0.1:1: 407 from server",
+        // Same text, but from a later phase than the TCP connect.
+        "TLS handshake: failed to lookup address information",
+    ] {
+        assert!(!is_dns_not_found(reason), "wrongly recognised: {reason}");
+    }
+}
+
+#[test]
+fn ordered_records_put_the_preferred_variant_first() {
+    let base = || "kws2.example".to_string();
+    let dash_one = || "kws2-1.example".to_string();
+
+    assert_eq!(
+        ordered_records(base(), dash_one(), false),
+        ["kws2.example", "kws2-1.example"]
+    );
+    assert_eq!(
+        ordered_records(base(), dash_one(), true),
+        ["kws2-1.example", "kws2.example"]
+    );
+}
+
 /// Regression test for the domain-fronting fallback (issue #81): the TLS SNI
 /// sent on the wire must be the fronted domain, while the WebSocket upgrade's
 /// `Host` header must still be the real one — and the handshake must succeed

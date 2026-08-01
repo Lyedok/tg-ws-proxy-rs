@@ -1,9 +1,17 @@
+//! Compile-time guards for the crate's published API.
+//!
+//! `tg-ws-proxy-rs` is released as a library as well as a binary, so the
+//! pre-`_with_outbound` entry points have to keep both their names and their
+//! signatures. Nothing here asserts on behavior — the point is that these
+//! calls still type-check.
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 use tg_ws_proxy_rs::check::run_check;
-use tg_ws_proxy_rs::config::Config;
+use tg_ws_proxy_rs::config::{Config, default_dc_ips, default_dc_overrides};
+use tg_ws_proxy_rs::default_domains::fetch_default_domains;
 use tg_ws_proxy_rs::pool::WsPool;
 use tg_ws_proxy_rs::proxy::handle_client;
 use tg_ws_proxy_rs::ws_client::{
@@ -53,6 +61,34 @@ async fn old_handle_client_public_signature_still_compiles() {
     let (server, peer) = accepted.unwrap();
 
     let _future = handle_client(server, peer, config, pool);
+}
+
+#[test]
+fn old_default_domain_helpers_still_compile() {
+    let _future = fetch_default_domains();
+}
+
+#[test]
+fn dc_metadata_maps_still_agree_with_the_single_entry_lookups() {
+    // The map-returning helpers are public API; the per-DC lookups the hot
+    // path now uses must stay consistent with them.
+    let ips = default_dc_ips();
+    for dc in [1, 2, 3, 4, 5, 203] {
+        assert_eq!(
+            tg_ws_proxy_rs::config::default_dc_ip(dc),
+            ips.get(&dc).map(String::as_str),
+            "default_dc_ip disagrees with default_dc_ips for DC{dc}"
+        );
+    }
+
+    let overrides = default_dc_overrides();
+    for dc in [1, 2, 3, 4, 5, 42, 203] {
+        assert_eq!(
+            tg_ws_proxy_rs::config::websocket_dc(dc),
+            overrides.get(&dc).copied().unwrap_or(dc),
+            "websocket_dc disagrees with default_dc_overrides for DC{dc}"
+        );
+    }
 }
 
 #[allow(dead_code)]

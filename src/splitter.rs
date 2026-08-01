@@ -17,17 +17,36 @@ use crate::crypto::{AesCtr256, HANDSHAKE_LEN, ProtoTag, SKIP_LEN, make_cipher};
 const PREKEY_LEN: usize = 32;
 const IV_LEN: usize = 16;
 
+/// Buffer capacity kept between packets.
+///
+/// A single large media packet (Telegram file chunks run to hundreds of KiB)
+/// has to be buffered whole before it can be emitted as one WebSocket frame,
+/// and `Vec` never gives that capacity back on its own.  Two buffers per
+/// connection, held for the connection's lifetime, is real memory on the
+/// low-RAM routers this proxy runs on — so oversized buffers are released
+/// once the traffic settles down again.
+const RETAINED_CAPACITY: usize = 16 * 1024;
+
+/// Consecutive small, fully-drained `split` calls before oversized capacity is
+/// released.  Waiting a while keeps a sustained media transfer — which
+/// repeatedly needs the large buffer — from paying for a shrink-then-regrow
+/// cycle on every packet.
+const TRIM_AFTER_IDLE_CALLS: u8 = 64;
+
 pub struct MsgSplitter {
     /// Internal cipher that shadows `tg_enc` to decrypt the stream in-band.
     dec: AesCtr256,
     proto: ProtoTag,
     /// Buffered encrypted bytes (ready to be returned as WS frames).
     cipher_buf: Vec<u8>,
-    /// Buffered plaintext (used only for length-parsing).
+    /// Buffered plaintext (used only for length-parsing).  Always the same
+    /// length as `cipher_buf`.
     plain_buf: Vec<u8>,
     /// Once set, the splitter stops trying to parse lengths and returns
     /// any buffered data as a single chunk (unknown / unsupported proto).
     disabled: bool,
+    /// How many consecutive calls have left the buffers empty and oversized.
+    idle_calls: u8,
 }
 
 impl MsgSplitter {
@@ -53,6 +72,7 @@ impl MsgSplitter {
             cipher_buf: Vec::new(),
             plain_buf: Vec::new(),
             disabled: false,
+            idle_calls: 0,
         }
     }
 
@@ -70,12 +90,15 @@ impl MsgSplitter {
             return vec![encrypted.to_vec()];
         }
 
-        // Decrypt to a temporary buffer for length parsing.
-        let mut plain = encrypted.to_vec();
-        self.dec.apply_keystream(&mut plain);
-
+        // Decrypt straight into the plaintext buffer: the CTR cipher is
+        // stateful and already advanced past everything buffered earlier, so
+        // only the freshly appended bytes need the keystream applied.  Doing
+        // it in place avoids a second full-size allocation and copy on every
+        // read.
+        let fresh_from = self.plain_buf.len();
+        self.plain_buf.extend_from_slice(encrypted);
+        self.dec.apply_keystream(&mut self.plain_buf[fresh_from..]);
         self.cipher_buf.extend_from_slice(encrypted);
-        self.plain_buf.extend_from_slice(&plain);
 
         let mut parts = Vec::new();
         let mut consumed = 0usize;
@@ -84,11 +107,12 @@ impl MsgSplitter {
                 None => break, // need more bytes
                 Some(0) => {
                     // Unsupported / unknown protocol variant — disable parsing
-                    // and flush everything buffered so far.
+                    // and flush everything buffered so far.  Neither buffer is
+                    // ever used again, so release them outright.
                     parts.push(self.cipher_buf[consumed..].to_vec());
 
-                    self.cipher_buf.clear();
-                    self.plain_buf.clear();
+                    self.cipher_buf = Vec::new();
+                    self.plain_buf = Vec::new();
                     self.disabled = true;
 
                     return parts;
@@ -106,6 +130,8 @@ impl MsgSplitter {
             self.plain_buf.drain(..consumed);
         }
 
+        self.trim_idle_buffers();
+
         parts
     }
 
@@ -115,12 +141,32 @@ impl MsgSplitter {
             return Vec::new();
         }
 
-        let tail = self.cipher_buf.clone();
+        let tail = std::mem::take(&mut self.cipher_buf);
 
-        self.cipher_buf.clear();
         self.plain_buf.clear();
+        self.plain_buf.shrink_to(RETAINED_CAPACITY);
 
         vec![tail]
+    }
+
+    /// Release capacity grabbed by an unusually large packet once the stream
+    /// settles back down — see [`RETAINED_CAPACITY`].
+    fn trim_idle_buffers(&mut self) {
+        // `plain_buf` and `cipher_buf` always hold the same bytes, so one
+        // length check covers both.
+        if !self.cipher_buf.is_empty() || self.cipher_buf.capacity() <= RETAINED_CAPACITY {
+            self.idle_calls = 0;
+            return;
+        }
+
+        self.idle_calls = self.idle_calls.saturating_add(1);
+        if self.idle_calls < TRIM_AFTER_IDLE_CALLS {
+            return;
+        }
+
+        self.cipher_buf.shrink_to(RETAINED_CAPACITY);
+        self.plain_buf.shrink_to(RETAINED_CAPACITY);
+        self.idle_calls = 0;
     }
 
     // ── Length parsers ────────────────────────────────────────────────────

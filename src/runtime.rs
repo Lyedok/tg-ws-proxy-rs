@@ -1,14 +1,20 @@
-use std::collections::HashMap;
+//! Shared per-process runtime state.
+//!
+//! Holds what every connection needs but nothing owns: the outbound
+//! connector, the DC metadata lookups, and the domain-fronting fallback's
+//! sticky window.
+
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
-use crate::config::{default_dc_ips, default_dc_overrides};
+use crate::config::{default_dc_ip, websocket_dc};
 use crate::outbound::OutboundConnector;
+
+/// Default sticky window for the domain-fronting fallback.
+const DEFAULT_FRONTING_COOLDOWN: Duration = Duration::from_secs(1800);
 
 pub struct Runtime {
     outbound: OutboundConnector,
-    dc_overrides: HashMap<u32, u32>,
-    dc_fallback_ips: HashMap<u32, String>,
     /// Domain-fronting SNI, when enabled via `--fronting-domain`. `None` means
     /// the fallback is disabled entirely (the default).
     fronting_domain: Option<String>,
@@ -24,10 +30,8 @@ impl Runtime {
     pub fn new(outbound: OutboundConnector) -> Self {
         Self {
             outbound,
-            dc_overrides: default_dc_overrides(),
-            dc_fallback_ips: default_dc_ips(),
             fronting_domain: None,
-            fronting_cooldown: Duration::from_secs(1800),
+            fronting_cooldown: DEFAULT_FRONTING_COOLDOWN,
             fronting_until: StdMutex::new(None),
         }
     }
@@ -44,11 +48,11 @@ impl Runtime {
     }
 
     pub fn websocket_dc(&self, dc: u32) -> u32 {
-        *self.dc_overrides.get(&dc).unwrap_or(&dc)
+        websocket_dc(dc)
     }
 
-    pub fn fallback_ip(&self, dc: u32) -> Option<&str> {
-        self.dc_fallback_ips.get(&dc).map(String::as_str)
+    pub fn fallback_ip(&self, dc: u32) -> Option<&'static str> {
+        default_dc_ip(dc)
     }
 
     /// The configured fronting SNI, if the fallback is enabled.

@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
 
-use crate::config::{Config, MtProtoProxy, default_dc_ips};
-use crate::crypto::{ProtoTag, generate_client_handshake};
+use crate::config::{Config, MtProtoProxy, default_dc_ip};
+use crate::crypto::{self, ProtoTag, generate_client_handshake};
 use crate::faketls;
 use crate::outbound::OutboundConnector;
 use crate::ws_client::{
@@ -100,13 +100,13 @@ async fn probe_cf_worker(
     timeout: Duration,
     outbound: &OutboundConnector,
 ) -> ProbeStatus {
-    let Some(dst) = default_dc_ips().get(&2).cloned() else {
+    let Some(dst) = default_dc_ip(2) else {
         return ProbeStatus::Fail("DC 2 default IP is missing".to_string());
     };
 
     let start = Instant::now();
     let ws = connect_cf_worker_ws_for_dc_with_outbound(
-        domain, &dst, 2, false, skip_tls, timeout, outbound,
+        domain, dst, 2, false, skip_tls, timeout, outbound,
     )
     .await;
     if ws.is_some() {
@@ -134,12 +134,8 @@ async fn probe_mtproto_proxy(
         Err(e) => return ProbeStatus::Fail(format!("invalid hex secret: {}", e)),
     };
 
-    let is_faketls = secret.len() > 17 && secret[0] == 0xee;
-    let key_bytes: &[u8] = if secret.len() >= 17 && matches!(secret[0], 0xdd | 0xee) {
-        &secret[1..17]
-    } else {
-        &secret
-    };
+    let key_bytes = crypto::secret_key(&secret);
+    let faketls_hostname = crypto::faketls_hostname(&secret);
 
     let start = Instant::now();
 
@@ -155,13 +151,10 @@ async fn probe_mtproto_proxy(
         generate_client_handshake(key_bytes, 2, ProtoTag::PaddedIntermediate);
     let (mut reader, mut writer) = tokio::io::split(stream);
 
-    if is_faketls {
+    if let Some(hostname) = faketls_hostname {
         // ── FakeTLS path ──────────────────────────────────────────────────
-        let hostname = match std::str::from_utf8(&secret[17..]) {
-            Ok(h) => h,
-            Err(_) => {
-                return ProbeStatus::Fail("FakeTLS secret contains non-UTF-8 hostname".to_string());
-            }
+        let Ok(hostname) = std::str::from_utf8(hostname) else {
+            return ProbeStatus::Fail("FakeTLS secret contains non-UTF-8 hostname".to_string());
         };
 
         let mut client_hello = faketls::build_faketls_client_hello(hostname);
@@ -280,7 +273,7 @@ pub async fn run_check_with_outbound(config: &Config, outbound: &OutboundConnect
             print!("  {:40}  ... ", domain);
             let _ = std::io::Write::flush(&mut std::io::stdout());
 
-            let status = probe_cf_worker(&domain, skip_tls, cf_timeout, outbound).await;
+            let status = probe_cf_worker(domain, skip_tls, cf_timeout, outbound).await;
             println!("[{}]  {}", status.marker(), status.detail());
 
             if !status.is_ok() {

@@ -16,10 +16,11 @@
 //! used — matching the Python reference implementation which always passes
 //! `verify_mode = CERT_NONE`.
 
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::default_dc_overrides;
+use crate::config::websocket_dc;
 use crate::outbound::OutboundConnector;
 
 use futures_util::{SinkExt, StreamExt};
@@ -41,6 +42,14 @@ use tungstenite::Message;
 /// A live WebSocket connection to a Telegram DC.
 pub type TgWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// Suffix that marks a media DC in log lines (`DC2` vs `DC2m`).
+///
+/// Every DC is logged together with its media flag, so this keeps the format
+/// arguments readable at the ~30 call sites across the proxy.
+pub(crate) fn media_tag(is_media: bool) -> &'static str {
+    if is_media { "m" } else { "" }
+}
+
 /// WebSocket domains for a given DC.
 ///
 /// Telegram provides two hostnames per DC; trying both increases resilience.
@@ -51,18 +60,22 @@ pub type TgWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// certificate validation succeeds — Telegram's wildcard cert only covers the
 /// real DC numbers (1-5).
 pub fn ws_domains(dc: u32, is_media: bool) -> Vec<String> {
-    let overrides = default_dc_overrides();
-    let effective_dc = *overrides.get(&dc).unwrap_or(&dc);
+    let effective_dc = websocket_dc(dc);
+
+    ordered_records(
+        format!("kws{}.web.telegram.org", effective_dc),
+        format!("kws{}-1.web.telegram.org", effective_dc),
+        is_media,
+    )
+}
+
+/// Order a `kws{N}` / `kws{N}-1` record pair by preference: media DCs prefer
+/// the `-1` variant, everything else prefers the base record.
+fn ordered_records(base: String, dash_one: String, is_media: bool) -> Vec<String> {
     if is_media {
-        vec![
-            format!("kws{}-1.web.telegram.org", effective_dc),
-            format!("kws{}.web.telegram.org", effective_dc),
-        ]
+        vec![dash_one, base]
     } else {
-        vec![
-            format!("kws{}.web.telegram.org", effective_dc),
-            format!("kws{}-1.web.telegram.org", effective_dc),
-        ]
+        vec![base, dash_one]
     }
 }
 
@@ -338,17 +351,12 @@ pub async fn connect_ws_for_dc_with_outbound(
     sni_override: Option<&str>,
 ) -> (Option<TgWsStream>, bool, bool) {
     let domains = ws_domains(dc, is_media);
+    let media = media_tag(is_media);
     let mut all_redirects = true;
     let mut any_timed_out = false;
 
     for domain in &domains {
-        debug!(
-            "WS trying DC{}{} → {} via {}",
-            dc,
-            if is_media { "m" } else { "" },
-            domain,
-            ip
-        );
+        debug!("WS trying DC{}{} → {} via {}", dc, media, domain, ip);
 
         match connect_ws_with_outbound(ip, domain, skip_tls_verify, timeout, outbound, sni_override)
             .await
@@ -359,31 +367,17 @@ pub async fn connect_ws_for_dc_with_outbound(
             WsConnectResult::Redirect(code) => {
                 warn!(
                     "WS DC{}{} got {} from {} (redirect)",
-                    dc,
-                    if is_media { "m" } else { "" },
-                    code,
-                    domain
+                    dc, media, code, domain
                 );
                 // Keep trying next domain; still counts as all_redirects.
             }
             WsConnectResult::Failed(reason) => {
-                warn!(
-                    "WS DC{}{} failed on {}: {}",
-                    dc,
-                    if is_media { "m" } else { "" },
-                    domain,
-                    reason
-                );
+                warn!("WS DC{}{} failed on {}: {}", dc, media, domain, reason);
 
                 all_redirects = false; // a real failure, not just a redirect
             }
             WsConnectResult::TimedOut => {
-                warn!(
-                    "WS DC{}{} timed out on {}",
-                    dc,
-                    if is_media { "m" } else { "" },
-                    domain
-                );
+                warn!("WS DC{}{} timed out on {}", dc, media, domain);
 
                 all_redirects = false;
                 any_timed_out = true;
@@ -411,17 +405,26 @@ pub async fn connect_ws_for_dc_with_outbound(
 /// When multiple CF domains are given, each domain's subdomains are generated
 /// in order — the first domain has highest priority.
 pub fn cf_ws_domains(dc: u32, cf_domains: &[String], is_media: bool) -> Vec<String> {
-    let mut result = Vec::new();
-    for cf_domain in cf_domains {
-        if is_media {
-            result.push(format!("kws{}-1.{}", dc, cf_domain));
-            result.push(format!("kws{}.{}", dc, cf_domain));
-        } else {
-            result.push(format!("kws{}.{}", dc, cf_domain));
-            result.push(format!("kws{}-1.{}", dc, cf_domain));
-        }
-    }
-    result
+    cf_domains
+        .iter()
+        .flat_map(|cf_domain| {
+            ordered_records(
+                format!("kws{}.{}", dc, cf_domain),
+                format!("kws{}-1.{}", dc, cf_domain),
+                is_media,
+            )
+        })
+        .collect()
+}
+
+/// The base `kws{N}` record matching a `kws{N}-1` record, if `domain` is one.
+///
+/// `kws{N}-1` records are optional in a user-managed Cloudflare zone, so a
+/// missing DNS entry transparently falls back to the base record.
+fn base_cf_record(domain: &str) -> Option<String> {
+    domain
+        .contains("-1.")
+        .then(|| domain.replacen("-1.", ".", 1))
 }
 
 /// Try all Cloudflare-proxy domains for a DC in order.
@@ -464,29 +467,26 @@ pub async fn connect_cf_ws_for_dc_with_outbound(
     timeout: Duration,
     outbound: &OutboundConnector,
 ) -> (Option<TgWsStream>, bool) {
-    let domains = cf_ws_domains(dc, cf_domains, is_media);
+    let media = media_tag(is_media);
     let mut all_redirects = true;
+    // A `-1` record that is absent from DNS pushes its base record onto the
+    // front of the queue, so the work list grows while it is being drained.
+    let mut queue: VecDeque<String> = cf_ws_domains(dc, cf_domains, is_media).into();
     // Track domains we have already attempted so that a transparent `-1` →
     // base fallback does not cause the base domain to be tried a second time
     // when it appears later in the list.
-    let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut tried: HashSet<String> = HashSet::new();
 
-    for domain in &domains {
-        if tried.contains(domain) {
+    while let Some(domain) = queue.pop_front() {
+        if !tried.insert(domain.clone()) {
             continue;
         }
-        tried.insert(domain.clone());
 
-        debug!(
-            "CF WS trying DC{}{} → {}",
-            dc,
-            if is_media { "m" } else { "" },
-            domain
-        );
+        debug!("CF WS trying DC{}{} → {}", dc, media, domain);
 
         // Pass the CF domain as the TCP host so that Tokio's DNS resolution
         // returns Cloudflare's anycast IP rather than Telegram's DC IP.
-        match connect_ws_with_outbound(domain, domain, skip_tls_verify, timeout, outbound, None)
+        match connect_ws_with_outbound(&domain, &domain, skip_tls_verify, timeout, outbound, None)
             .await
         {
             WsConnectResult::Connected(ws) => {
@@ -495,86 +495,30 @@ pub async fn connect_cf_ws_for_dc_with_outbound(
             WsConnectResult::Redirect(code) => {
                 warn!(
                     "CF WS DC{}{} got {} from {} (redirect)",
-                    dc,
-                    if is_media { "m" } else { "" },
-                    code,
-                    domain
+                    dc, media, code, domain
                 );
             }
             WsConnectResult::Failed(reason) => {
-                // kws{N}-1 records are optional in a user-managed CF zone.
-                // When one is absent in DNS, transparently retry using the
-                // base kws{N} record — no warning, as this is expected.
-                if is_dns_not_found(&reason) && domain.contains("-1.") {
-                    let fallback = domain.replacen("-1.", ".", 1);
+                // A `kws{N}-1` record that is simply absent from the user's CF
+                // zone is expected, not a failure: retry the base record next
+                // without a warning and without counting it against
+                // `all_redirects`.
+                if is_dns_not_found(&reason)
+                    && let Some(base) = base_cf_record(&domain)
+                {
                     debug!(
                         "CF WS DC{}{}: {} not in DNS, retrying with {}",
-                        dc,
-                        if is_media { "m" } else { "" },
-                        domain,
-                        fallback
+                        dc, media, domain, base
                     );
-                    tried.insert(fallback.clone());
-                    match connect_ws_with_outbound(
-                        &fallback,
-                        &fallback,
-                        skip_tls_verify,
-                        timeout,
-                        outbound,
-                        None,
-                    )
-                    .await
-                    {
-                        WsConnectResult::Connected(ws) => {
-                            return (Some(ws), false);
-                        }
-                        WsConnectResult::Redirect(code) => {
-                            warn!(
-                                "CF WS DC{}{} got {} from {} (redirect)",
-                                dc,
-                                if is_media { "m" } else { "" },
-                                code,
-                                fallback
-                            );
-                        }
-                        WsConnectResult::Failed(reason2) => {
-                            warn!(
-                                "CF WS DC{}{} failed on {}: {}",
-                                dc,
-                                if is_media { "m" } else { "" },
-                                fallback,
-                                reason2
-                            );
-                            all_redirects = false;
-                        }
-                        WsConnectResult::TimedOut => {
-                            warn!(
-                                "CF WS DC{}{} timed out on {}",
-                                dc,
-                                if is_media { "m" } else { "" },
-                                fallback
-                            );
-                            all_redirects = false;
-                        }
-                    }
-                } else {
-                    warn!(
-                        "CF WS DC{}{} failed on {}: {}",
-                        dc,
-                        if is_media { "m" } else { "" },
-                        domain,
-                        reason
-                    );
-                    all_redirects = false;
+                    queue.push_front(base);
+                    continue;
                 }
+
+                warn!("CF WS DC{}{} failed on {}: {}", dc, media, domain, reason);
+                all_redirects = false;
             }
             WsConnectResult::TimedOut => {
-                warn!(
-                    "CF WS DC{}{} timed out on {}",
-                    dc,
-                    if is_media { "m" } else { "" },
-                    domain
-                );
+                warn!("CF WS DC{}{} timed out on {}", dc, media, domain);
                 all_redirects = false;
             }
         }
@@ -621,12 +565,10 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound(
     outbound: &OutboundConnector,
 ) -> Option<TgWsStream> {
     let path = cf_worker_path(dst, dc, is_media);
+    let media = media_tag(is_media);
     debug!(
         "CF Worker trying DC{}{} → {} via {}",
-        dc,
-        if is_media { "m" } else { "" },
-        dst,
-        worker_domain
+        dc, media, dst, worker_domain
     );
 
     match connect_ws_with_path(
@@ -645,30 +587,19 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound(
         WsConnectResult::Redirect(code) => {
             warn!(
                 "CF Worker DC{}{} got {} from {} (redirect)",
-                dc,
-                if is_media { "m" } else { "" },
-                code,
-                worker_domain
+                dc, media, code, worker_domain
             );
             None
         }
         WsConnectResult::Failed(reason) => {
             warn!(
                 "CF Worker DC{}{} failed on {}: {}",
-                dc,
-                if is_media { "m" } else { "" },
-                worker_domain,
-                reason
+                dc, media, worker_domain, reason
             );
             None
         }
         WsConnectResult::TimedOut => {
-            warn!(
-                "CF Worker DC{}{} timed out on {}",
-                dc,
-                if is_media { "m" } else { "" },
-                worker_domain
-            );
+            warn!("CF Worker DC{}{} timed out on {}", dc, media, worker_domain);
             None
         }
     }
