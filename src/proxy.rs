@@ -565,17 +565,22 @@ async fn select_upstream(
     target_ip: Option<String>,
 ) -> Option<Upstream> {
     let Some(target_ip) = target_ip else {
-        let reason = format!("DC{} not in --dc-ip config", route.dc);
+        // Every log line already carries the DC, so the reason only has to say
+        // what is missing.
+        let reason = "not in --dc-ip config";
         let Some(fallback) = route.runtime.fallback_ip(route.dc).map(str::to_string) else {
-            warn!("[{}] {} — no fallback IP available", route.label, reason);
+            warn!(
+                "[{}] DC{}{} {} — no fallback IP available",
+                route.label, route.dc, route.media, reason
+            );
             return None;
         };
 
         return Some(
             route
-                .fallback_chain(&fallback, &reason, false)
+                .fallback_chain(&fallback, reason, false)
                 .await
-                .unwrap_or_else(|| route.tcp_fallback(fallback, &reason)),
+                .unwrap_or_else(|| route.tcp_fallback(fallback, reason)),
         );
     };
 
