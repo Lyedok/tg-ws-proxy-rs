@@ -200,3 +200,93 @@ async fn no_sni_override_uses_domain_for_both_and_verifies_the_certificate() {
         .expect("server task timed out")
         .ok();
 }
+
+#[test]
+fn tls_client_configs_are_built_once_and_shared() {
+    install_rustls_provider();
+
+    // Rebuilding the config per connection re-copied the ~150-entry root store
+    // and, worse, threw away the TLS session cache — so no connection could
+    // ever resume. Both configs must be the same allocation every time.
+    let first = verifying_rustls_config();
+    let second = verifying_rustls_config();
+    assert!(Arc::ptr_eq(&first, &second));
+
+    let first_no_verify = no_verify_rustls_config();
+    let second_no_verify = no_verify_rustls_config();
+    assert!(Arc::ptr_eq(&first_no_verify, &second_no_verify));
+
+    // The two are genuinely different configs, not one aliased twice.
+    assert!(!Arc::ptr_eq(&first, &first_no_verify));
+}
+
+/// Regression test for TLS session resumption.
+///
+/// The shared `ClientConfig` owns the session cache, so a config rebuilt per
+/// connection — as this used to be — could never resume: every handshake was a
+/// full one. Two connections through one config must produce a full handshake
+/// then a resumed one.
+#[tokio::test]
+async fn a_second_connection_to_the_same_host_resumes_its_tls_session() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    install_rustls_provider();
+
+    let domain = "resumption.example.test";
+    let (cert, key) = test_certificate(domain);
+
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.clone()], key)
+        .unwrap();
+    // Hand out a ticket so the client has something to resume with.
+    server_config.send_tls13_tickets = 1;
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(stream).await.unwrap();
+            tls.write_all(b"hi").await.unwrap();
+            tls.flush().await.unwrap();
+            let mut sink = Vec::new();
+            let _ = tls.read_to_end(&mut sink).await;
+        }
+    });
+
+    // Trust the test certificate, but otherwise the same resumption defaults
+    // the shared config uses.
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert).unwrap();
+    let config = Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let connector = tokio_rustls::TlsConnector::from(Arc::clone(&config));
+    let name = rustls::pki_types::ServerName::try_from(domain).unwrap();
+
+    let mut kinds = Vec::new();
+    for _ in 0..2 {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut tls = connector.connect(name.clone(), tcp).await.unwrap();
+        // Read the server's greeting; the session ticket arrives with it and
+        // has to be processed before it can be reused.
+        let mut buf = [0u8; 2];
+        tls.read_exact(&mut buf).await.unwrap();
+        kinds.push(tls.get_ref().1.handshake_kind());
+        tls.shutdown().await.unwrap();
+    }
+
+    assert_eq!(
+        kinds,
+        vec![
+            Some(rustls::HandshakeKind::Full),
+            Some(rustls::HandshakeKind::Resumed),
+        ],
+        "the shared config must let the second handshake resume"
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+}

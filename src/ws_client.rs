@@ -17,7 +17,7 @@
 //! `verify_mode = CERT_NONE`.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::config::websocket_dc;
@@ -265,7 +265,7 @@ where
         let server_name = ServerName::try_from(sni)
             .map_err(|_| WsError::Url(tungstenite::error::UrlError::NoHostName))?
             .to_owned();
-        let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(no_verify_rustls_config()));
+        let tls_connector = tokio_rustls::TlsConnector::from(no_verify_rustls_config());
         let tls_stream = tls_connector
             .connect(server_name, tcp)
             .await
@@ -630,47 +630,65 @@ pub async fn ws_recv(ws: &mut TgWsStream) -> Option<Vec<u8>> {
 
 // ─── TLS connector helpers ───────────────────────────────────────────────────
 
+// Both client configs are built once and shared by every connection.
+//
+// Rebuilding them per connection — as this used to — cost a fresh copy of the
+// ~150-entry WebPKI root store each time, and, far worse, a fresh TLS session
+// cache: `rustls` keeps resumption tickets in the `ClientConfig`, so a config
+// that lives for one connection can never resume anything. Every single
+// connection therefore paid a full TLS 1.3 handshake. Sharing the config lets
+// repeat connections to the same DC or CF domain resume instead, which is the
+// difference between a key exchange plus certificate verification and almost
+// nothing — the dominant CPU cost on the routers and phones this runs on.
+//
+// `ClientConfig` is `Sync` and its session store is internally locked, so
+// sharing one across connections is the intended usage.
+static VERIFYING_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+static NO_VERIFY_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+
 fn build_tls_connector(skip_verify: bool) -> Connector {
-    if skip_verify {
-        build_no_verify_connector()
+    let config = if skip_verify {
+        no_verify_rustls_config()
     } else {
-        // Use the default connector; tokio-tungstenite with
-        // `rustls-tls-webpki-roots` bundles the WebPKI root store.
-        Connector::Rustls(Arc::new(build_default_rustls_config()))
-    }
+        verifying_rustls_config()
+    };
+
+    Connector::Rustls(config)
 }
 
-fn build_default_rustls_config() -> rustls::ClientConfig {
-    // The `rustls-tls-webpki-roots` feature pulls in the Mozilla root store.
-    // We recreate an equivalent config here so we can share the type.
-    let root_store = webpki_roots_store();
-    rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth()
+/// The shared certificate-verifying client config, using the bundled WebPKI
+/// root store.
+fn verifying_rustls_config() -> Arc<rustls::ClientConfig> {
+    VERIFYING_CONFIG
+        .get_or_init(|| {
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+            Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth(),
+            )
+        })
+        .clone()
 }
 
-fn build_no_verify_connector() -> Connector {
-    Connector::Rustls(Arc::new(no_verify_rustls_config()))
-}
-
-/// A `rustls::ClientConfig` that accepts any certificate, regardless of
-/// hostname or trust chain. Shared by `--danger-accept-invalid-certs` and by
+/// The shared `rustls::ClientConfig` that accepts any certificate, regardless
+/// of hostname or trust chain. Used by `--danger-accept-invalid-certs` and by
 /// the domain-fronting path, which *always* needs it: the real certificate
 /// presented by Telegram can never match a fronted (spoofed) SNI hostname, so
 /// hostname verification would fail even for an otherwise-legitimate server.
-fn no_verify_rustls_config() -> rustls::ClientConfig {
-    rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerifier))
-        .with_no_client_auth()
-}
-
-/// Build a root certificate store from the bundled WebPKI roots.
-fn webpki_roots_store() -> rustls::RootCertStore {
-    let mut store = rustls::RootCertStore::empty();
-    store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    store
+fn no_verify_rustls_config() -> Arc<rustls::ClientConfig> {
+    NO_VERIFY_CONFIG
+        .get_or_init(|| {
+            Arc::new(
+                rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                    .with_no_client_auth(),
+            )
+        })
+        .clone()
 }
 
 // ── No-op certificate verifier for `--danger-accept-invalid-certs` ──────────
