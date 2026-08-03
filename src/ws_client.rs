@@ -427,6 +427,71 @@ fn base_cf_record(domain: &str) -> Option<String> {
         .then(|| domain.replacen("-1.", ".", 1))
 }
 
+/// Ordering policy for the Cloudflare connect loop.
+///
+/// The configured records are attempted in order, skipping any already tried.
+/// A `kws{N}-1` record missing from DNS additionally queues its base record —
+/// and that queued retry is *not* subject to the skip, so a base record whose
+/// first attempt failed transiently gets a second chance.
+///
+/// That second chance is load-bearing, not an accident. `kws{N}-1` records are
+/// optional and most zones omit them, so for a non-media DC the sequence is
+/// `kws{N}` then `kws{N}-1` (absent) then `kws{N}` again. Deduplicating that
+/// away measurably pushed more connections into the (often blocked) TCP
+/// fallback: on one tester's network the fallback share nearly doubled, from
+/// 5.9% to 11.4% of connections, and each of those costs a full
+/// `--tcp-fallback-timeout` before the client gives up.
+struct CfAttempts {
+    queue: VecDeque<CfAttempt>,
+    tried: HashSet<String>,
+}
+
+struct CfAttempt {
+    domain: String,
+    /// Queued by the `-1` fallback, so it runs even if already attempted.
+    forced: bool,
+}
+
+impl CfAttempts {
+    fn new(domains: Vec<String>) -> Self {
+        Self {
+            queue: domains
+                .into_iter()
+                .map(|domain| CfAttempt {
+                    domain,
+                    forced: false,
+                })
+                .collect(),
+            tried: HashSet::new(),
+        }
+    }
+
+    /// The next record to attempt, skipping ones already tried unless they
+    /// were queued as a forced retry.
+    fn next_domain(&mut self) -> Option<String> {
+        while let Some(attempt) = self.queue.pop_front() {
+            let first_time = self.tried.insert(attempt.domain.clone());
+            if first_time || attempt.forced {
+                return Some(attempt.domain);
+            }
+        }
+
+        None
+    }
+
+    /// Queue the base record for `domain` as a forced retry, if `domain` is a
+    /// `-1` record. Returns the queued record.
+    fn retry_base_of(&mut self, domain: &str) -> Option<String> {
+        let base = base_cf_record(domain)?;
+        self.queue.push_front(CfAttempt {
+            domain: base.clone(),
+            forced: true,
+        });
+
+        Some(base)
+    }
+}
+
 /// Try all Cloudflare-proxy domains for a DC in order.
 ///
 /// The hostname serves as both the TCP destination (DNS resolves to Cloudflare's
@@ -469,19 +534,9 @@ pub async fn connect_cf_ws_for_dc_with_outbound(
 ) -> (Option<TgWsStream>, bool) {
     let media = media_tag(is_media);
     let mut all_redirects = true;
-    // A `-1` record that is absent from DNS pushes its base record onto the
-    // front of the queue, so the work list grows while it is being drained.
-    let mut queue: VecDeque<String> = cf_ws_domains(dc, cf_domains, is_media).into();
-    // Track domains we have already attempted so that a transparent `-1` →
-    // base fallback does not cause the base domain to be tried a second time
-    // when it appears later in the list.
-    let mut tried: HashSet<String> = HashSet::new();
+    let mut attempts = CfAttempts::new(cf_ws_domains(dc, cf_domains, is_media));
 
-    while let Some(domain) = queue.pop_front() {
-        if !tried.insert(domain.clone()) {
-            continue;
-        }
-
+    while let Some(domain) = attempts.next_domain() {
         debug!("CF WS trying DC{}{} → {}", dc, media, domain);
 
         // Pass the CF domain as the TCP host so that Tokio's DNS resolution
@@ -504,13 +559,12 @@ pub async fn connect_cf_ws_for_dc_with_outbound(
                 // without a warning and without counting it against
                 // `all_redirects`.
                 if is_dns_not_found(&reason)
-                    && let Some(base) = base_cf_record(&domain)
+                    && let Some(base) = attempts.retry_base_of(&domain)
                 {
                     debug!(
                         "CF WS DC{}{}: {} not in DNS, retrying with {}",
                         dc, media, domain, base
                     );
-                    queue.push_front(base);
                     continue;
                 }
 
@@ -646,6 +700,18 @@ pub async fn ws_recv(ws: &mut TgWsStream) -> Option<Vec<u8>> {
 static VERIFYING_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
 static NO_VERIFY_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
 
+/// How many TLS sessions to keep for resumption.
+///
+/// `rustls` defaults to 256, which is far more than this proxy can use: it
+/// only ever dials `kws{1..5}[-1]` on `web.telegram.org` plus the same records
+/// under each configured CF domain, so a couple of dozen hostnames covers a
+/// realistic deployment. The cache is not free — a stored session holds the
+/// server's certificate chain, several KiB apiece — and it is held for the
+/// life of the process, which is memory a router does not get back. 64 keeps
+/// resumption working for every normal config while bounding the cache to a
+/// fraction of the default.
+const TLS_SESSION_CACHE_SIZE: usize = 64;
+
 fn build_tls_connector(skip_verify: bool) -> Connector {
     let config = if skip_verify {
         no_verify_rustls_config()
@@ -664,11 +730,13 @@ fn verifying_rustls_config() -> Arc<rustls::ClientConfig> {
             let mut root_store = rustls::RootCertStore::empty();
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-            Arc::new(
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(root_store)
-                    .with_no_client_auth(),
-            )
+            let mut config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            config.resumption =
+                rustls::client::Resumption::in_memory_sessions(TLS_SESSION_CACHE_SIZE);
+
+            Arc::new(config)
         })
         .clone()
 }
@@ -681,12 +749,14 @@ fn verifying_rustls_config() -> Arc<rustls::ClientConfig> {
 fn no_verify_rustls_config() -> Arc<rustls::ClientConfig> {
     NO_VERIFY_CONFIG
         .get_or_init(|| {
-            Arc::new(
-                rustls::ClientConfig::builder()
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(NoVerifier))
-                    .with_no_client_auth(),
-            )
+            let mut config = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
+            config.resumption =
+                rustls::client::Resumption::in_memory_sessions(TLS_SESSION_CACHE_SIZE);
+
+            Arc::new(config)
         })
         .clone()
 }

@@ -290,3 +290,78 @@ async fn a_second_connection_to_the_same_host_resumes_its_tls_session() {
     );
     let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
 }
+
+// ─── Cloudflare attempt ordering ─────────────────────────────────────────────
+
+fn drain(attempts: &mut CfAttempts, missing_dash_one: bool) -> Vec<String> {
+    let mut order = Vec::new();
+    while let Some(domain) = attempts.next_domain() {
+        order.push(domain.clone());
+        // Simulate the `-1` record being absent from DNS.
+        if missing_dash_one && domain.contains("-1.") {
+            attempts.retry_base_of(&domain);
+        }
+    }
+
+    order
+}
+
+#[test]
+fn a_missing_dash_one_record_buys_the_base_record_a_second_attempt() {
+    // Regression test: deduplicating this retry away measurably pushed
+    // connections into the TCP fallback (see CfAttempts' docs). For a
+    // non-media DC the base record must be attempted twice.
+    let mut attempts = CfAttempts::new(cf_ws_domains(2, &["example.net".to_string()], false));
+
+    assert_eq!(
+        drain(&mut attempts, true),
+        [
+            "kws2.example.net",
+            "kws2-1.example.net",
+            // ...the retry queued by the missing `-1` record.
+            "kws2.example.net",
+        ]
+    );
+}
+
+#[test]
+fn a_media_dc_still_attempts_the_base_record_once() {
+    // Media DCs try the `-1` variant first, so its fallback *is* the base
+    // record's only attempt — it must not be inflated to two.
+    let mut attempts = CfAttempts::new(cf_ws_domains(2, &["example.net".to_string()], true));
+
+    assert_eq!(
+        drain(&mut attempts, true),
+        ["kws2-1.example.net", "kws2.example.net"]
+    );
+}
+
+#[test]
+fn records_present_in_dns_are_each_attempted_once() {
+    // With both records resolving, nothing is retried and nothing repeats,
+    // across several domains.
+    let domains = ["a.example".to_string(), "b.example".to_string()];
+    let mut attempts = CfAttempts::new(cf_ws_domains(2, &domains, false));
+
+    assert_eq!(
+        drain(&mut attempts, false),
+        [
+            "kws2.a.example",
+            "kws2-1.a.example",
+            "kws2.b.example",
+            "kws2-1.b.example",
+        ]
+    );
+}
+
+#[test]
+fn a_forced_retry_is_not_itself_retried_forever() {
+    // The queued base record has no `-1.` label, so it cannot queue another
+    // retry — the loop is guaranteed to terminate.
+    let mut attempts = CfAttempts::new(cf_ws_domains(2, &["example.net".to_string()], false));
+    let order = drain(&mut attempts, true);
+
+    assert_eq!(order.len(), 3);
+    assert!(attempts.next_domain().is_none());
+    assert_eq!(attempts.retry_base_of("kws2.example.net"), None);
+}
