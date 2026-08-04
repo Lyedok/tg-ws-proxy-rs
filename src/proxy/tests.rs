@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::crypto::HANDSHAKE_LEN;
+
 #[test]
 fn balanced_rotates_the_starting_domain() {
     let counter = AtomicUsize::new(0);
@@ -164,4 +166,99 @@ fn bridge_counters_accumulate_across_many_chunks() {
     }
 
     assert_eq!(counters.totals(), (1000, 2500));
+}
+
+// ─── WebSocket framing ───────────────────────────────────────────────────────
+
+/// Bridge one client payload through `bridge_ws` and report the size of every
+/// WebSocket message the upstream received.
+///
+/// Both ends are plain TCP: the framing decision under test happens above the
+/// transport, so wrapping the stream in `MaybeTlsStream::Plain` exercises the
+/// same code a real TLS connection would.
+async fn upstream_frame_sizes(framing: WsFraming, payload: &[u8]) -> Vec<usize> {
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{MaybeTlsStream, accept_async, client_async};
+
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let sizes = tokio::spawn(async move {
+        let (stream, _) = upstream.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        let mut sizes = Vec::new();
+
+        while let Some(Ok(message)) = ws.next().await {
+            match message {
+                Message::Binary(data) => sizes.push(data.len()),
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+
+        sizes
+    });
+
+    let tcp = TcpStream::connect(upstream_addr).await.unwrap();
+    let (ws, _) = client_async("ws://127.0.0.1/apiws", MaybeTlsStream::Plain(tcp))
+        .await
+        .unwrap();
+
+    // The client half of the bridge, driven from this test.
+    let clients = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let clients_addr = clients.local_addr().unwrap();
+    let mut client = TcpStream::connect(clients_addr).await.unwrap();
+    let (server, _) = clients.accept().await.unwrap();
+    let (reader, writer) = tokio::io::split(server);
+
+    let relay_init = generate_relay_init(ProtoTag::PaddedIntermediate, 2);
+    let ciphers = build_connection_ciphers(&[0u8; 48], &[0u8; 32], &relay_init);
+
+    let bridge = tokio::spawn(async move {
+        bridge_ws(
+            ClientReader::Plain(reader),
+            ClientWriter::Plain(writer),
+            WsBridgeParams {
+                label: "test",
+                ws,
+                framing,
+                relay_init,
+                ciphers,
+                proto: ProtoTag::PaddedIntermediate,
+                dc: 2,
+                is_media: false,
+            },
+        )
+        .await;
+    });
+
+    client.write_all(payload).await.unwrap();
+    drop(client);
+    bridge.await.unwrap();
+
+    sizes.await.unwrap()
+}
+
+#[tokio::test]
+async fn a_worker_tunnel_never_emits_an_oversized_frame() {
+    // Regression for the upload bug upstream fixed in v1.9.1: packet-aligning
+    // a Worker tunnel produces one WebSocket message per MTProto packet, and a
+    // media upload's packets run past Cloudflare's 1 MiB message cap, which
+    // kills the connection mid-transfer. A tunnel is a raw TCP socket at the
+    // far end, so it is chunked by client reads instead — and the relay init
+    // still goes out as its own first frame.
+    const CF_MESSAGE_CAP: usize = 1024 * 1024;
+    let payload = vec![0xA5; 3 * CF_MESSAGE_CAP];
+
+    let sizes = upstream_frame_sizes(WsFraming::Tunnel, &payload).await;
+
+    assert_eq!(sizes.first(), Some(&HANDSHAKE_LEN));
+    assert!(
+        sizes[1..].iter().all(|size| *size <= CLIENT_READ_BUF_SIZE),
+        "a tunnel frame must not exceed one client read: {sizes:?}"
+    );
+    assert_eq!(
+        sizes[1..].iter().sum::<usize>(),
+        payload.len(),
+        "every byte the client sent has to reach the upstream: {sizes:?}"
+    );
 }
