@@ -66,12 +66,10 @@ fn cf_worker_domain_accepts_python_alias_and_normalizes_url() {
         "--cfproxy-worker-domain",
         "https://example.user.workers.dev/apiws",
     ])
-    .unwrap();
+    .unwrap()
+    .with_defaults();
 
-    assert_eq!(
-        cfg.cf_worker_domain().as_deref(),
-        Some("example.user.workers.dev")
-    );
+    assert_eq!(cfg.cf_worker_domain(), Some("example.user.workers.dev"));
 }
 
 #[test]
@@ -81,7 +79,8 @@ fn cf_worker_domains_accept_multiple_values_and_normalize() {
         "--cf-worker-domain",
         "https://a.user.workers.dev/apiws,b.user.workers.dev/",
     ])
-    .unwrap();
+    .unwrap()
+    .with_defaults();
 
     assert_eq!(
         cfg.cf_worker_domains(),
@@ -180,14 +179,17 @@ fn cf_worker_domains_drop_empty_entries() {
         "--cf-worker-domain",
         "a.user.workers.dev,,  ,https://",
     ])
-    .unwrap();
+    .unwrap()
+    .with_defaults();
 
     assert_eq!(cfg.cf_worker_domains(), vec!["a.user.workers.dev"]);
 }
 
 #[test]
 fn cf_worker_domain_is_none_when_nothing_is_configured() {
-    let cfg = Config::try_parse_from(["tg-ws-proxy"]).unwrap();
+    let cfg = Config::try_parse_from(["tg-ws-proxy"])
+        .unwrap()
+        .with_defaults();
 
     assert_eq!(cfg.cf_worker_domain(), None);
     assert!(cfg.cf_worker_domains().is_empty());

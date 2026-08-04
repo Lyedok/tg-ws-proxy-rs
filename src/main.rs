@@ -189,7 +189,7 @@ async fn main() {
     let cf_worker_domains = config.cf_worker_domains();
     if !cf_worker_domains.is_empty() {
         info!("  Cloudflare Worker domain(s):");
-        for domain in &cf_worker_domains {
+        for domain in cf_worker_domains {
             info!("    {}", domain);
         }
     }
@@ -262,9 +262,12 @@ async fn main() {
         Duration::from_secs(config.pool_max_age),
         Arc::clone(&runtime),
     ));
+    // Shared for the rest of the process: every connection reads the same
+    // settings, so they are behind one `Arc` instead of a per-connection clone.
+    let config = Arc::new(config);
     {
         let pool_clone = pool.clone();
-        let config_clone = config.clone();
+        let config_clone = Arc::clone(&config);
         tokio::spawn(async move {
             pool_clone.warmup(&config_clone).await;
         });
@@ -288,7 +291,7 @@ async fn main() {
 
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
-                let cfg = config.clone();
+                let cfg = Arc::clone(&config);
                 let pool = pool.clone();
                 let runtime = Arc::clone(&runtime);
                 tokio::spawn(async move {

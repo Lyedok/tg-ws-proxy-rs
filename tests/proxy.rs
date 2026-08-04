@@ -15,7 +15,8 @@ mod common;
 
 use common::{
     await_proxy_handler, await_proxy_request, await_proxy_requests, rejecting_http_proxy,
-    rejecting_http_proxy_requests, run_proxy_once, start_proxy_connection,
+    rejecting_http_proxy_requests, run_proxy_once, run_proxy_once_for_dc,
+    stalling_http_proxy_requests, start_proxy_connection,
 };
 
 const SECRET: &str = "00112233445566778899aabbccddeeff";
@@ -232,6 +233,93 @@ async fn cf_priority_tries_the_cf_proxy_before_the_direct_websocket() {
             // ...and finally the TCP fallback. CF is not tried a second time.
             "149.154.167.51:443",
         ]
+    );
+}
+
+#[tokio::test]
+async fn cf_priority_tries_the_cf_worker_before_the_direct_websocket() {
+    // Regression for #93: --cf-priority used to cover only --cf-domain, so a
+    // Worker-only setup still paid the full direct-WS timeout on every
+    // connection before reaching the one tier that worked.
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--cf-priority",
+            "--cf-worker-domain",
+            "worker-priority.example.dev",
+            "--dc-ip",
+            "2:149.154.167.221",
+            "--ws-connect-timeout",
+            "2",
+        ],
+    );
+
+    run_proxy_once(config).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(
+        connect_targets(&requests),
+        [
+            // The Worker comes first...
+            "worker-priority.example.dev:443",
+            // ...then the direct WS attempt on both Telegram hostnames...
+            "149.154.167.221:443",
+            "149.154.167.221:443",
+            // ...and finally TCP. The Worker is not tried a second time.
+            "149.154.167.51:443",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_dc_ip_that_timed_out_is_skipped_on_the_next_connection() {
+    // A DPI-blocked DC IP costs a full connect timeout per attempt. Paying
+    // that on every connection is what leaves Telegram sitting in
+    // "Connecting..." — so once an address times out, later connections go
+    // straight to the tiers that can still reach Telegram.
+    const DEAD_IP: &str = "149.154.175.101";
+    let (proxy_addr, proxy_task) = stalling_http_proxy_requests(DEAD_IP).await;
+    let make_config = || {
+        proxy_config(
+            &format!("http://{proxy_addr}"),
+            &[
+                "--cf-worker-domain",
+                "worker-ipfail.example.dev",
+                "--dc-ip",
+                &format!("3:{DEAD_IP}"),
+                "--ws-connect-timeout",
+                "1",
+                "--ws-fail-probe-timeout",
+                "1",
+                "--cf-fail-cooldown",
+                "0",
+            ],
+        )
+    };
+
+    run_proxy_once_for_dc(make_config(), 3).await;
+    run_proxy_once_for_dc(make_config(), 3).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(
+        connect_targets(&requests),
+        [
+            // First connection probes the DC IP on both Telegram hostnames...
+            DEAD_IP,
+            DEAD_IP,
+            // ...then falls back to the Worker and finally to TCP.
+            "worker-ipfail.example.dev:443",
+            "149.154.175.100:443",
+            // The second one skips the dead address entirely.
+            "worker-ipfail.example.dev:443",
+            "149.154.175.100:443",
+        ]
+        .map(|target| if target == DEAD_IP {
+            format!("{DEAD_IP}:443")
+        } else {
+            target.to_string()
+        })
     );
 }
 

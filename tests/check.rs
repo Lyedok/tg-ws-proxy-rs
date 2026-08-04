@@ -29,7 +29,8 @@ fn check_config(proxy_addr: &str, extra: &[&str]) -> Config {
     ];
     args.extend_from_slice(extra);
 
-    Config::try_parse_from(args).unwrap()
+    // Same normalization the binary applies before running a check.
+    Config::try_parse_from(args).unwrap().with_defaults()
 }
 
 #[tokio::test]

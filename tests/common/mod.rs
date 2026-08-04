@@ -30,6 +30,10 @@ pub const TASK_TIMEOUT: Duration = Duration::from_secs(5);
 /// connection before deciding the fallback chain is finished.
 const QUIET_PERIOD: Duration = Duration::from_millis(300);
 
+/// Same idea for [`stalling_http_proxy_requests`], but it has to outlast the
+/// connect timeout every stalled attempt burns before the next one arrives.
+const STALL_QUIET_PERIOD: Duration = Duration::from_millis(1500);
+
 /// Install the process-wide rustls crypto provider.
 ///
 /// Required by any test that performs a TLS handshake; safe to call from
@@ -78,6 +82,45 @@ pub async fn rejecting_http_proxy_requests() -> (SocketAddr, JoinHandle<Vec<Stri
             requests.push(read_http_connect_request(&mut inbound).await);
             reject(&mut inbound).await;
             budget = QUIET_PERIOD;
+        }
+
+        requests
+    });
+
+    (proxy_addr, proxy_task)
+}
+
+/// Like [`rejecting_http_proxy_requests`], but leaves every `CONNECT` whose
+/// target contains `stall_target` hanging with no answer at all, so the caller
+/// hits its connect *timeout* instead of a refusal.
+///
+/// The distinction matters to the routing code: a refusal says the address
+/// answered, a timeout says it is unreachable — only the latter is treated as
+/// a blocked IP.  Everything else is rejected immediately so the rest of the
+/// fallback chain still runs at full speed.
+pub async fn stalling_http_proxy_requests(
+    stall_target: &'static str,
+) -> (SocketAddr, JoinHandle<Vec<String>>) {
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let proxy_task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        // Held open (not dropped) for the whole run: closing a stalled socket
+        // would surface as a connection error rather than a timeout.
+        let mut stalled = Vec::new();
+        let mut budget = TASK_TIMEOUT;
+
+        while let Ok(Ok((mut inbound, _))) = tokio::time::timeout(budget, proxy.accept()).await {
+            let request = read_http_connect_request(&mut inbound).await;
+            if request.contains(stall_target) {
+                stalled.push(inbound);
+            } else {
+                reject(&mut inbound).await;
+            }
+            requests.push(request);
+            // Long enough to outlast the connect timeout a stalled attempt
+            // waits out before the next one starts.
+            budget = STALL_QUIET_PERIOD;
         }
 
         requests
@@ -247,7 +290,11 @@ pub async fn start_proxy_connection(config: Config) -> (TcpStream, JoinHandle<()
     let (server, peer) = accepted.unwrap();
 
     let handler = tokio::spawn(handle_client_with_runtime(
-        server, peer, config, pool, runtime,
+        server,
+        peer,
+        Arc::new(config),
+        pool,
+        runtime,
     ));
 
     (client.unwrap(), handler)

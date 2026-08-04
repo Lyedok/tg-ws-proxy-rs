@@ -312,6 +312,24 @@ pub struct Config {
     )]
     pub ws_redirect_cooldown: u64,
 
+    /// Seconds to skip the direct WebSocket path for a `--dc-ip` address whose
+    /// TCP connect timed out.
+    ///
+    /// A timeout (rather than a refusal or a redirect) is what a DPI-blocked
+    /// address looks like, and that does not lift within a connection's
+    /// lifetime — so the address is left alone for a long window and every
+    /// client goes straight to the Cloudflare/upstream-proxy tiers instead of
+    /// paying `--ws-connect-timeout` first.  Only honored when such a fallback
+    /// is configured; the cooldown is dropped as soon as a direct connect to
+    /// that address succeeds again.  Matches upstream tg-ws-proxy's
+    /// `IP_FAIL_COOLDOWN`.
+    #[arg(
+        long = "ip-fail-cooldown",
+        default_value = "3600",
+        env = "TG_IP_FAIL_COOLDOWN"
+    )]
+    pub ip_fail_cooldown: u64,
+
     /// Client MTProto handshake read timeout in seconds.
     #[arg(
         long = "handshake-timeout",
@@ -484,6 +502,15 @@ impl Config {
     /// argument list — tests, or anything embedding the library — goes through
     /// exactly the same normalization the binary does.
     pub fn with_defaults(mut self) -> Self {
+        // Normalize the Worker domains once, so the routing path can read them
+        // as a plain slice.  Entries that normalize to nothing (empty values,
+        // a bare scheme) are dropped rather than rejected — a stray comma in
+        // the list is not worth refusing to start over.
+        self.cf_worker_domains = std::mem::take(&mut self.cf_worker_domains)
+            .iter()
+            .filter_map(|domain| Self::normalize_cf_worker_domain(domain))
+            .collect();
+
         // Fill in a random secret if none was supplied.
         if self.secrets.is_empty() {
             let bytes: [u8; 16] = rand::random();
@@ -576,18 +603,19 @@ impl Config {
             .find_map(|(id, ip)| (*id == dc).then_some(ip.as_str()))
     }
 
-    /// Cloudflare Worker domains normalized for `Host` and TLS SNI use.
-    pub fn cf_worker_domains(&self) -> Vec<String> {
-        self.cf_worker_domains
-            .iter()
-            .filter_map(|domain| Self::normalize_cf_worker_domain(domain))
-            .collect()
+    /// Cloudflare Worker domains, normalized for `Host` and TLS SNI use.
+    ///
+    /// Normalization happens once in [`Self::with_defaults`] rather than here:
+    /// this is read on the routing path of every connection, and rebuilding the
+    /// list per call put an allocation per domain there.
+    pub fn cf_worker_domains(&self) -> &[String] {
+        &self.cf_worker_domains
     }
 
     /// First normalized Cloudflare Worker domain.
     /// Kept for compatibility with single-domain call sites.
-    pub fn cf_worker_domain(&self) -> Option<String> {
-        self.cf_worker_domains().into_iter().next()
+    pub fn cf_worker_domain(&self) -> Option<&str> {
+        self.cf_worker_domains.first().map(String::as_str)
     }
 
     /// Cloudflare Worker domain normalized for `Host` and TLS SNI use.

@@ -92,10 +92,47 @@ pub enum WsConnectResult {
     Redirect(u16),
     /// Any other non-101 status code or transport error.
     Failed(String),
-    /// The connection attempt did not complete within the given timeout.
-    /// Kept distinct from `Failed` so callers can trigger timeout-specific
-    /// fallbacks (e.g. domain fronting) without string-matching error text.
+    /// The TCP connect ran out the clock: nothing at `ip:443` answered.
+    ///
+    /// Distinct from [`Self::TimedOut`] because the two call for opposite
+    /// responses. Nothing answered here, so the address is treated as blocked
+    /// and skipped — swapping the SNI cannot conjure up a route to it.
+    ConnectTimedOut(String),
+    /// The TLS handshake or WebSocket upgrade ran out the clock.
+    ///
+    /// The address *did* answer and then the handshake stalled, which is what
+    /// SNI-based DPI looks like — so this is the one that triggers domain
+    /// fronting.
     TimedOut,
+}
+
+/// The outcome of walking one DC's WebSocket hostnames.
+///
+/// The three flags are what the routing ladder backs off on, and they are
+/// deliberately not collapsed into one "it failed" bit: each points at a
+/// different fallback (fronting, skipping the address, plain TCP).
+pub struct WsAttempt {
+    pub ws: Option<TgWsStream>,
+    /// Every hostname answered with a redirect — Telegram has taken the
+    /// WebSocket path away for this DC rather than the network blocking it.
+    pub all_redirects: bool,
+    /// A TLS/upgrade handshake stalled: the address answers, the handshake
+    /// does not finish.  The SNI-blocking signature that domain fronting is
+    /// for.
+    pub upgrade_timed_out: bool,
+    /// A TCP connect stalled: nothing at the address answered at all.
+    pub connect_timed_out: bool,
+}
+
+impl WsAttempt {
+    fn connected(ws: TgWsStream) -> Self {
+        Self {
+            ws: Some(ws),
+            all_redirects: false,
+            upgrade_timed_out: false,
+            connect_timed_out: false,
+        }
+    }
 }
 
 /// Try to establish a WebSocket connection to one Telegram DC domain.
@@ -170,9 +207,8 @@ async fn connect_ws_with_path(
     // ── TCP connection to the configured IP ──────────────────────────────
     let tcp = match outbound.connect(ip, 443, timeout).await {
         Ok(s) => s,
-        Err(e) => {
-            return WsConnectResult::Failed(e);
-        }
+        Err(e) if e.timed_out => return WsConnectResult::ConnectTimedOut(e.reason),
+        Err(e) => return WsConnectResult::Failed(e.reason),
     };
 
     // Disable Nagle algorithm for lower latency.
@@ -320,7 +356,7 @@ pub async fn connect_ws_for_dc(
     skip_tls_verify: bool,
     timeout: Duration,
 ) -> (Option<TgWsStream>, bool) {
-    let (ws, all_redirects, _timed_out) = connect_ws_for_dc_with_outbound(
+    let attempt = connect_ws_for_dc_with_outbound(
         ip,
         dc,
         is_media,
@@ -330,16 +366,17 @@ pub async fn connect_ws_for_dc(
         None,
     )
     .await;
-    (ws, all_redirects)
+
+    (attempt.ws, attempt.all_redirects)
 }
 
 /// Same as [`connect_ws_for_dc`], but routes each TCP connection through the
 /// supplied outbound connector.
 ///
 /// `sni_override` is forwarded to every domain attempt — see
-/// [`connect_ws_with_path`] for what it does. Returns
-/// `(stream, all_redirects, any_timed_out)`, where `any_timed_out` is `true`
-/// when at least one domain attempt hit the connect timeout (as opposed to a
+/// [`connect_ws_with_path`] for what it does. Returns a [`WsAttempt`] whose
+/// flags say *how* the attempt failed, which is what the caller's next step
+/// hangs on (as opposed to a
 /// redirect or other failure) — used to trigger the domain-fronting fallback.
 pub async fn connect_ws_for_dc_with_outbound(
     ip: &str,
@@ -349,11 +386,12 @@ pub async fn connect_ws_for_dc_with_outbound(
     timeout: Duration,
     outbound: &OutboundConnector,
     sni_override: Option<&str>,
-) -> (Option<TgWsStream>, bool, bool) {
+) -> WsAttempt {
     let domains = ws_domains(dc, is_media);
     let media = media_tag(is_media);
     let mut all_redirects = true;
-    let mut any_timed_out = false;
+    let mut any_upgrade_timed_out = false;
+    let mut any_connect_timed_out = false;
 
     for domain in &domains {
         debug!("WS trying DC{}{} → {} via {}", dc, media, domain, ip);
@@ -362,7 +400,7 @@ pub async fn connect_ws_for_dc_with_outbound(
             .await
         {
             WsConnectResult::Connected(ws) => {
-                return (Some(ws), false, false);
+                return WsAttempt::connected(ws);
             }
             WsConnectResult::Redirect(code) => {
                 warn!(
@@ -380,12 +418,23 @@ pub async fn connect_ws_for_dc_with_outbound(
                 warn!("WS DC{}{} timed out on {}", dc, media, domain);
 
                 all_redirects = false;
-                any_timed_out = true;
+                any_upgrade_timed_out = true;
+            }
+            WsConnectResult::ConnectTimedOut(reason) => {
+                warn!("WS DC{}{} failed on {}: {}", dc, media, domain, reason);
+
+                all_redirects = false;
+                any_connect_timed_out = true;
             }
         }
     }
 
-    (None, all_redirects, any_timed_out)
+    WsAttempt {
+        ws: None,
+        all_redirects,
+        upgrade_timed_out: any_upgrade_timed_out,
+        connect_timed_out: any_connect_timed_out,
+    }
 }
 
 /// WebSocket domains for a given DC when routing through one or more
@@ -526,15 +575,17 @@ impl CfAttempts {
 /// proxy transparently retries the same DC using `kws{N}` — the user only needs
 /// to configure the base record in Cloudflare.
 ///
-/// Returns `(Some(stream), all_redirects)` with the same semantics as
-/// [`connect_ws_for_dc`].
+/// Returns `(Some(stream), record, all_redirects)`, where `record` is the
+/// expanded `kws{N}` hostname that answered — the caller can reconnect straight
+/// to it with [`connect_cf_record_with_outbound`] instead of walking the list
+/// again.  `all_redirects` has the same semantics as [`connect_ws_for_dc`].
 pub async fn connect_cf_ws_for_dc(
     dc: u32,
     cf_domains: &[String],
     is_media: bool,
     skip_tls_verify: bool,
     timeout: Duration,
-) -> (Option<TgWsStream>, bool) {
+) -> (Option<TgWsStream>, Option<String>, bool) {
     connect_cf_ws_for_dc_with_outbound(
         dc,
         cf_domains,
@@ -555,7 +606,7 @@ pub async fn connect_cf_ws_for_dc_with_outbound(
     skip_tls_verify: bool,
     timeout: Duration,
     outbound: &OutboundConnector,
-) -> (Option<TgWsStream>, bool) {
+) -> (Option<TgWsStream>, Option<String>, bool) {
     let media = media_tag(is_media);
     let mut all_redirects = true;
     let mut attempts = CfAttempts::new(cf_ws_domains(dc, cf_domains, is_media));
@@ -569,7 +620,7 @@ pub async fn connect_cf_ws_for_dc_with_outbound(
             .await
         {
             WsConnectResult::Connected(ws) => {
-                return (Some(ws), false);
+                return (Some(ws), Some(domain), false);
             }
             WsConnectResult::Redirect(code) => {
                 warn!(
@@ -595,7 +646,7 @@ pub async fn connect_cf_ws_for_dc_with_outbound(
                 warn!("CF WS DC{}{} failed on {}: {}", dc, media, domain, reason);
                 all_redirects = false;
             }
-            WsConnectResult::TimedOut => {
+            WsConnectResult::TimedOut | WsConnectResult::ConnectTimedOut(_) => {
                 warn!("CF WS DC{}{} timed out on {}", dc, media, domain);
                 attempts.note_timed_out(&domain);
                 all_redirects = false;
@@ -603,7 +654,24 @@ pub async fn connect_cf_ws_for_dc_with_outbound(
         }
     }
 
-    (None, all_redirects)
+    (None, None, all_redirects)
+}
+
+/// Reconnect to a single already-expanded `kws{N}` Cloudflare record.
+///
+/// Used by the pool to re-open the exact route that just served a client,
+/// skipping the per-DC record expansion and the `-1`/base fallback dance that
+/// [`connect_cf_ws_for_dc_with_outbound`] performs on a cold connect.
+pub async fn connect_cf_record_with_outbound(
+    record: &str,
+    skip_tls_verify: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+) -> Option<TgWsStream> {
+    match connect_ws_with_outbound(record, record, skip_tls_verify, timeout, outbound, None).await {
+        WsConnectResult::Connected(ws) => Some(ws),
+        _ => None,
+    }
 }
 
 /// Connect through a Cloudflare Worker TCP tunnel.
@@ -677,7 +745,7 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound(
             );
             None
         }
-        WsConnectResult::TimedOut => {
+        WsConnectResult::TimedOut | WsConnectResult::ConnectTimedOut(_) => {
             warn!("CF Worker DC{}{} timed out on {}", dc, media, worker_domain);
             None
         }

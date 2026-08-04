@@ -37,7 +37,10 @@ async fn https_get_with_tls_config(
 ) -> Result<String, String> {
     let connector = TlsConnector::from(tls_config);
 
-    let tcp = outbound.connect(host, 443, FETCH_TIMEOUT).await?;
+    let tcp = outbound
+        .connect(host, 443, FETCH_TIMEOUT)
+        .await
+        .map_err(|e| e.reason)?;
     let _ = tcp.set_nodelay(true);
 
     let server_name =

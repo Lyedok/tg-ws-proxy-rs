@@ -114,7 +114,7 @@ async fn telegram_ws_dc_connector_uses_outbound_proxy() {
     let outbound =
         OutboundConnector::from_config(Some(&format!("http://{proxy_addr}")), None, false).unwrap();
 
-    let (ws, all_redirects, timed_out) = connect_ws_for_dc_with_outbound(
+    let attempt = connect_ws_for_dc_with_outbound(
         "203.0.113.10",
         2,
         false,
@@ -125,11 +125,12 @@ async fn telegram_ws_dc_connector_uses_outbound_proxy() {
     )
     .await;
 
-    assert!(ws.is_none());
+    assert!(attempt.ws.is_none());
     // A rejected CONNECT is a hard failure, not a redirect and not a timeout —
     // the distinction drives which fallback the proxy reaches for next.
-    assert!(!all_redirects);
-    assert!(!timed_out);
+    assert!(!attempt.all_redirects);
+    assert!(!attempt.upgrade_timed_out);
+    assert!(!attempt.connect_timed_out);
     let request = await_proxy_request(proxy_task).await;
     assert!(request.starts_with("CONNECT 203.0.113.10:443 HTTP/1.1"));
 }
@@ -140,7 +141,7 @@ async fn cloudflare_ws_connector_uses_outbound_proxy() {
     let outbound =
         OutboundConnector::from_config(Some(&format!("http://{proxy_addr}")), None, false).unwrap();
 
-    let (ws, all_redirects) = connect_cf_ws_for_dc_with_outbound(
+    let (ws, _record, all_redirects) = connect_cf_ws_for_dc_with_outbound(
         2,
         &["example.net".to_string()],
         false,
@@ -164,7 +165,7 @@ async fn cloudflare_ws_connector_tries_every_record_of_every_domain() {
     let outbound =
         OutboundConnector::from_config(Some(&format!("http://{proxy_addr}")), None, false).unwrap();
 
-    let (ws, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
+    let (ws, _record, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
         2,
         &["a.example".to_string(), "b.example".to_string()],
         false,

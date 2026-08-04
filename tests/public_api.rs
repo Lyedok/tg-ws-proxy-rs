@@ -60,7 +60,7 @@ async fn old_handle_client_public_signature_still_compiles() {
     let _client = client.unwrap();
     let (server, peer) = accepted.unwrap();
 
-    let _future = handle_client(server, peer, config, pool);
+    let _future = handle_client(server, peer, std::sync::Arc::new(config), pool);
 }
 
 #[test]

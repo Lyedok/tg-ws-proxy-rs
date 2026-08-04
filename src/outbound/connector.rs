@@ -8,6 +8,43 @@ use tokio_socks::tcp::Socks5Stream;
 
 use super::config::{OutboundConfig, ProxyConfig, ProxyKind, authority, http_host, target_url};
 
+/// Why an outbound connect failed.
+///
+/// The distinction is load-bearing: a refusal or reset means the address
+/// answered, while a timeout means nothing did — the signature of a
+/// DPI-blocked address, which the routing ladder treats very differently from
+/// an address that merely said no.  Carried as a flag rather than parsed back
+/// out of the message, whose wording varies by platform and proxy kind.
+#[derive(Debug, Clone)]
+pub struct OutboundError {
+    pub reason: String,
+    pub timed_out: bool,
+}
+
+impl OutboundError {
+    fn failed(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            timed_out: false,
+        }
+    }
+
+    fn timed_out(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            timed_out: true,
+        }
+    }
+}
+
+impl std::fmt::Display for OutboundError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for OutboundError {}
+
 pub struct OutboundConnector {
     config: OutboundConfig,
 }
@@ -41,7 +78,7 @@ impl OutboundConnector {
         target_host: &str,
         target_port: u16,
         timeout: Duration,
-    ) -> Result<TcpStream, String> {
+    ) -> Result<TcpStream, OutboundError> {
         let Some(proxy) = &self.config.proxy else {
             return connect_direct(target_host, target_port, timeout).await;
         };
@@ -50,9 +87,15 @@ impl OutboundConnector {
             return connect_direct(target_host, target_port, timeout).await;
         }
 
-        tokio::time::timeout(timeout, connect_via_proxy(proxy, target_host, target_port))
+        match tokio::time::timeout(timeout, connect_via_proxy(proxy, target_host, target_port))
             .await
-            .map_err(|_| format!("proxy {} handshake timed out", proxy.summary()))?
+        {
+            Ok(result) => result.map_err(OutboundError::failed),
+            Err(_) => Err(OutboundError::timed_out(format!(
+                "proxy {} handshake timed out",
+                proxy.summary()
+            ))),
+        }
     }
 
     fn should_bypass(&self, target_host: &str, target_port: u16) -> bool {
@@ -63,10 +106,15 @@ impl OutboundConnector {
     }
 }
 
-async fn connect_direct(host: &str, port: u16, timeout: Duration) -> Result<TcpStream, String> {
-    tokio::time::timeout(timeout, connect_tcp(host, port))
-        .await
-        .map_err(|_| "TCP connect timed out".to_string())?
+async fn connect_direct(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<TcpStream, OutboundError> {
+    match tokio::time::timeout(timeout, connect_tcp(host, port)).await {
+        Ok(result) => result.map_err(OutboundError::failed),
+        Err(_) => Err(OutboundError::timed_out("TCP connect timed out")),
+    }
 }
 
 async fn connect_via_proxy(

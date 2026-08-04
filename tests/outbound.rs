@@ -251,7 +251,7 @@ async fn http_connect_rejects_bad_status() {
         .await
         .unwrap_err();
 
-    assert!(err.contains("HTTP code is not equal 200: 407"));
+    assert!(err.reason.contains("HTTP code is not equal 200: 407"));
     await_task(proxy_task).await;
 }
 
@@ -410,7 +410,7 @@ async fn no_proxy_host_port_does_not_bypass_different_port() {
         .connect("example.local", 443, Duration::from_secs(2))
         .await
         .unwrap_err();
-    assert!(err.contains("407"));
+    assert!(err.reason.contains("407"));
     await_task(proxy_task).await;
 }
 
@@ -439,7 +439,7 @@ async fn explicit_empty_no_proxy_overrides_env_bypass() {
         .await
         .unwrap_err();
 
-    assert!(err.contains("407"));
+    assert!(err.reason.contains("407"));
     await_task(proxy_task).await;
 }
 
@@ -460,7 +460,7 @@ async fn proxy_handshake_uses_one_deadline() {
         .await
         .unwrap_err();
 
-    assert!(err.contains("handshake timed out"));
+    assert!(err.reason.contains("handshake timed out"));
     assert!(start.elapsed() < Duration::from_secs(1));
     proxy_task.abort();
     assert!(proxy_task.await.unwrap_err().is_cancelled());
