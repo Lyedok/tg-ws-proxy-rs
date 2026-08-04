@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use cipher::StreamCipher;
@@ -1552,26 +1552,31 @@ impl ClosedBy {
 /// task's return value is gone. Accumulating inside the task meant every
 /// session logged exactly one direction as zero — 136 of 137 sessions in one
 /// tester's log — which made the counts useless for diagnosing anything.
+///
+/// Deliberately a `Mutex<u64>` per direction rather than an atomic: 32-bit
+/// MIPS — one of this project's release targets — has no 64-bit atomics at
+/// all, and `AtomicUsize` there would silently wrap a direction at 4 GiB,
+/// which is exactly the "the numbers lie" problem this type exists to fix.
+/// Each counter has a single writer and is read once the session is over, so
+/// the lock is always uncontended: a few tens of nanoseconds per 16 KiB
+/// chunk, against the AES pass over those same bytes.
 #[derive(Default)]
 struct BridgeCounters {
-    up: AtomicU64,
-    down: AtomicU64,
+    up: StdMutex<u64>,
+    down: StdMutex<u64>,
 }
 
 impl BridgeCounters {
     fn add_up(&self, n: usize) {
-        self.up.fetch_add(n as u64, Ordering::Relaxed);
+        *self.up.lock().unwrap() += n as u64;
     }
 
     fn add_down(&self, n: usize) {
-        self.down.fetch_add(n as u64, Ordering::Relaxed);
+        *self.down.lock().unwrap() += n as u64;
     }
 
     fn totals(&self) -> (u64, u64) {
-        (
-            self.up.load(Ordering::Relaxed),
-            self.down.load(Ordering::Relaxed),
-        )
+        (*self.up.lock().unwrap(), *self.down.lock().unwrap())
     }
 }
 
