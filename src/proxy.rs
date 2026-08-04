@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use cipher::StreamCipher;
@@ -1045,74 +1045,80 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
     let (mut ws_sink, mut ws_source) = ws.split();
 
     let start = Instant::now();
+    let counters = Arc::new(BridgeCounters::default());
 
-    let upload = tokio::spawn(async move {
-        let mut reader = reader;
-        let mut buf = vec![0u8; CLIENT_READ_BUF_SIZE];
-        let mut total = 0u64;
+    let upload = tokio::spawn({
+        let counters = Arc::clone(&counters);
 
-        loop {
-            let n = match reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            let chunk = &mut buf[..n];
+        async move {
+            let mut reader = reader;
+            let mut buf = vec![0u8; CLIENT_READ_BUF_SIZE];
 
-            // Decrypt from client, then re-encrypt for Telegram.
-            clt_dec.apply_keystream(chunk);
-            tg_enc.apply_keystream(chunk);
+            loop {
+                let n = match reader.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                let chunk = &mut buf[..n];
 
-            // Split into MTProto packets and send as separate WS frames.
-            for part in splitter.split(chunk) {
-                if ws_sink.send(Message::Binary(part)).await.is_err() {
-                    return total;
+                // Decrypt from client, then re-encrypt for Telegram.
+                clt_dec.apply_keystream(chunk);
+                tg_enc.apply_keystream(chunk);
+
+                // Split into MTProto packets and send as separate WS frames.
+                for part in splitter.split(chunk) {
+                    if ws_sink.send(Message::Binary(part)).await.is_err() {
+                        return;
+                    }
                 }
+
+                counters.add_up(n);
             }
 
-            total += n as u64;
-        }
-
-        // Flush any partial last packet.
-        for part in splitter.flush() {
-            let _ = ws_sink.send(Message::Binary(part)).await;
-        }
-
-        // Close the WS sink so Telegram knows we are done and the download
-        // direction (ws_source) receives the close frame and terminates
-        // promptly instead of waiting indefinitely.
-        let _ = ws_sink.close().await;
-        total
-    });
-
-    let download = tokio::spawn(async move {
-        let mut writer = writer;
-        let mut total = 0u64;
-
-        loop {
-            // Use the source half of the split WS stream.
-            let data = match ws_source.next().await {
-                Some(Ok(Message::Binary(b))) => b,
-                Some(Ok(Message::Text(t))) => t.into_bytes(),
-                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
-                _ => break,
-            };
-            let mut data = data;
-
-            // Decrypt from Telegram, then re-encrypt for client.
-            tg_dec.apply_keystream(&mut data);
-            clt_enc.apply_keystream(&mut data);
-
-            if writer.write_all(&data).await.is_err() {
-                break;
+            // Flush any partial last packet.
+            for part in splitter.flush() {
+                let _ = ws_sink.send(Message::Binary(part)).await;
             }
 
-            total += data.len() as u64;
+            // Close the WS sink so Telegram knows we are done and the download
+            // direction (ws_source) receives the close frame and terminates
+            // promptly instead of waiting indefinitely.
+            let _ = ws_sink.close().await;
         }
-
-        total
     });
 
-    let (bytes_up, bytes_down) = join_bridge(upload, download).await;
+    let download = tokio::spawn({
+        let counters = Arc::clone(&counters);
+
+        async move {
+            let mut writer = writer;
+
+            loop {
+                // Use the source half of the split WS stream.
+                let data = match ws_source.next().await {
+                    Some(Ok(Message::Binary(b))) => b,
+                    Some(Ok(Message::Text(t))) => t.into_bytes(),
+                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
+                    _ => break,
+                };
+                let mut data = data;
+
+                // Decrypt from Telegram, then re-encrypt for client.
+                tg_dec.apply_keystream(&mut data);
+                clt_enc.apply_keystream(&mut data);
+
+                if writer.write_all(&data).await.is_err() {
+                    break;
+                }
+
+                counters.add_down(data.len());
+            }
+        }
+    });
+
+    join_bridge(upload, download).await;
+
+    let (bytes_up, bytes_down) = counters.totals();
 
     log_session_closed(label, dc, is_media, "WS", bytes_up, bytes_down, start);
 }
@@ -1275,83 +1281,88 @@ async fn bridge_relay(reader: ClientReader, writer: ClientWriter, params: RelayP
     } = ciphers;
 
     let start = Instant::now();
+    let counters = Arc::new(BridgeCounters::default());
 
     // ── Upload: client → upstream ────────────────────────────────────────
-    let upload = tokio::spawn(async move {
-        let mut reader = reader;
-        let mut rem_writer = rem_writer;
-        // Sized for the client side; `write_tls_appdata` re-chunks to the TLS
-        // record limit on its way out, so a larger read is safe.
-        let mut buf = vec![0u8; CLIENT_READ_BUF_SIZE];
-        let mut total = 0u64;
+    let upload = tokio::spawn({
+        let counters = Arc::clone(&counters);
 
-        loop {
-            let n = match reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            let chunk = &mut buf[..n];
-            clt_dec.apply_keystream(chunk);
-            tg_enc.apply_keystream(chunk);
+        async move {
+            let mut reader = reader;
+            let mut rem_writer = rem_writer;
+            // Sized for the client side; `write_tls_appdata` re-chunks to the TLS
+            // record limit on its way out, so a larger read is safe.
+            let mut buf = vec![0u8; CLIENT_READ_BUF_SIZE];
 
-            let written = if faketls {
-                write_tls_appdata(&mut rem_writer, chunk).await
-            } else {
-                rem_writer.write_all(chunk).await
-            };
-            if written.is_err() {
-                break;
+            loop {
+                let n = match reader.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                let chunk = &mut buf[..n];
+                clt_dec.apply_keystream(chunk);
+                tg_enc.apply_keystream(chunk);
+
+                let written = if faketls {
+                    write_tls_appdata(&mut rem_writer, chunk).await
+                } else {
+                    rem_writer.write_all(chunk).await
+                };
+                if written.is_err() {
+                    break;
+                }
+
+                counters.add_up(n);
             }
-
-            total += n as u64;
         }
-
-        total
     });
 
     // ── Download: upstream → client ──────────────────────────────────────
-    let download = tokio::spawn(async move {
-        let mut rem_reader = rem_reader;
-        let mut writer = writer;
-        // In FakeTLS mode this must fit a whole record: `read_tls_appdata`
-        // reports one that does not as `Ok(0)`, which the loop below cannot
-        // tell from a clean EOF.
-        let mut buf = vec![
-            0u8;
-            if faketls {
-                TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM
-            } else {
-                RELAY_BUF_SIZE
+    let download = tokio::spawn({
+        let counters = Arc::clone(&counters);
+
+        async move {
+            let mut rem_reader = rem_reader;
+            let mut writer = writer;
+            // In FakeTLS mode this must fit a whole record: `read_tls_appdata`
+            // reports one that does not as `Ok(0)`, which the loop below cannot
+            // tell from a clean EOF.
+            let mut buf = vec![
+                0u8;
+                if faketls {
+                    TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM
+                } else {
+                    RELAY_BUF_SIZE
+                }
+            ];
+
+            loop {
+                let read = if faketls {
+                    read_tls_appdata(&mut rem_reader, &mut buf).await
+                } else {
+                    rem_reader.read(&mut buf).await
+                };
+                let n = match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+
+                let chunk = &mut buf[..n];
+                tg_dec.apply_keystream(chunk);
+                clt_enc.apply_keystream(chunk);
+
+                if writer.write_all(chunk).await.is_err() {
+                    break;
+                }
+
+                counters.add_down(n);
             }
-        ];
-        let mut total = 0u64;
-
-        loop {
-            let read = if faketls {
-                read_tls_appdata(&mut rem_reader, &mut buf).await
-            } else {
-                rem_reader.read(&mut buf).await
-            };
-            let n = match read {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-
-            let chunk = &mut buf[..n];
-            tg_dec.apply_keystream(chunk);
-            clt_enc.apply_keystream(chunk);
-
-            if writer.write_all(chunk).await.is_err() {
-                break;
-            }
-
-            total += n as u64;
         }
-
-        total
     });
 
-    let (bytes_up, bytes_down) = join_bridge(upload, download).await;
+    join_bridge(upload, download).await;
+
+    let (bytes_up, bytes_down) = counters.totals();
 
     let kind = if faketls {
         "upstream FakeTLS"
@@ -1418,56 +1429,61 @@ async fn bridge_tcp(
     } = ciphers;
 
     let start = Instant::now();
+    let counters = Arc::new(BridgeCounters::default());
 
-    let upload = tokio::spawn(async move {
-        let mut buf = vec![0u8; CLIENT_READ_BUF_SIZE];
-        let mut total = 0u64;
+    let upload = tokio::spawn({
+        let counters = Arc::clone(&counters);
 
-        loop {
-            let n = match reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            let chunk = &mut buf[..n];
+        async move {
+            let mut buf = vec![0u8; CLIENT_READ_BUF_SIZE];
 
-            clt_dec.apply_keystream(chunk);
-            tg_enc.apply_keystream(chunk);
+            loop {
+                let n = match reader.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                let chunk = &mut buf[..n];
 
-            if rem_writer.write_all(chunk).await.is_err() {
-                break;
+                clt_dec.apply_keystream(chunk);
+                tg_enc.apply_keystream(chunk);
+
+                if rem_writer.write_all(chunk).await.is_err() {
+                    break;
+                }
+
+                counters.add_up(n);
             }
-
-            total += n as u64;
         }
-
-        total
     });
 
-    let download = tokio::spawn(async move {
-        let mut buf = vec![0u8; RELAY_BUF_SIZE];
-        let mut total = 0u64;
+    let download = tokio::spawn({
+        let counters = Arc::clone(&counters);
 
-        loop {
-            let n = match rem_reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            let chunk = &mut buf[..n];
+        async move {
+            let mut buf = vec![0u8; RELAY_BUF_SIZE];
 
-            tg_dec.apply_keystream(chunk);
-            clt_enc.apply_keystream(chunk);
+            loop {
+                let n = match rem_reader.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                let chunk = &mut buf[..n];
 
-            if writer.write_all(chunk).await.is_err() {
-                break;
+                tg_dec.apply_keystream(chunk);
+                clt_enc.apply_keystream(chunk);
+
+                if writer.write_all(chunk).await.is_err() {
+                    break;
+                }
+
+                counters.add_down(n);
             }
-
-            total += n as u64;
         }
-
-        total
     });
 
-    let (bytes_up, bytes_down) = join_bridge(upload, download).await;
+    join_bridge(upload, download).await;
+
+    let (bytes_up, bytes_down) = counters.totals();
 
     log_session_closed(label, dc, is_media, "TCP", bytes_up, bytes_down, start);
 }
@@ -1482,21 +1498,46 @@ async fn bridge_tcp(
 /// connection times out.  Joining both halves instead left zombie connections
 /// behind that exhausted the process file-descriptor limit.
 ///
-/// Returns `(bytes_up, bytes_down)`.
-async fn join_bridge(mut upload: JoinHandle<u64>, mut download: JoinHandle<u64>) -> (u64, u64) {
+async fn join_bridge(mut upload: JoinHandle<()>, mut download: JoinHandle<()>) {
     tokio::select! {
-        result = &mut upload => {
-            let up = result.unwrap_or(0);
+        _ = &mut upload => {
             download.abort();
-
-            (up, download.await.unwrap_or(0))
+            let _ = download.await;
         }
-        result = &mut download => {
-            let down = result.unwrap_or(0);
+        _ = &mut download => {
             upload.abort();
-
-            (upload.await.unwrap_or(0), down)
+            let _ = upload.await;
         }
+    }
+}
+
+/// Byte counters shared with both bridge directions.
+///
+/// The directions report as they go rather than returning a total, because
+/// [`join_bridge`] cancels whichever one is still running and a cancelled
+/// task's return value is gone. Accumulating inside the task meant every
+/// session logged exactly one direction as zero — 136 of 137 sessions in one
+/// tester's log — which made the counts useless for diagnosing anything.
+#[derive(Default)]
+struct BridgeCounters {
+    up: AtomicU64,
+    down: AtomicU64,
+}
+
+impl BridgeCounters {
+    fn add_up(&self, n: usize) {
+        self.up.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    fn add_down(&self, n: usize) {
+        self.down.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    fn totals(&self) -> (u64, u64) {
+        (
+            self.up.load(Ordering::Relaxed),
+            self.down.load(Ordering::Relaxed),
+        )
     }
 }
 

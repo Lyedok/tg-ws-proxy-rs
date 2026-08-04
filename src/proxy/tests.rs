@@ -100,3 +100,46 @@ fn human_bytes_scales_through_the_units() {
     assert_eq!(human_bytes(1024 * 1024), "1.0MB");
     assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0GB");
 }
+
+#[tokio::test]
+async fn an_aborted_direction_still_reports_the_bytes_it_moved() {
+    // Regression test: the directions used to return their total, and
+    // `join_bridge` cancels whichever one is still running — so the cancelled
+    // side's count was lost and every session logged one direction as zero.
+    let counters = Arc::new(BridgeCounters::default());
+
+    let upload = tokio::spawn({
+        let counters = Arc::clone(&counters);
+        async move {
+            counters.add_up(4096);
+            // Finishes first, which is what triggers the abort below.
+        }
+    });
+
+    let download = tokio::spawn({
+        let counters = Arc::clone(&counters);
+        async move {
+            counters.add_down(1024);
+            // Still running when the peer finishes, so this task is aborted
+            // partway — exactly the case that used to lose the count.
+            std::future::pending::<()>().await;
+            counters.add_down(999_999);
+        }
+    });
+
+    join_bridge(upload, download).await;
+
+    assert_eq!(counters.totals(), (4096, 1024));
+}
+
+#[test]
+fn bridge_counters_accumulate_across_many_chunks() {
+    let counters = BridgeCounters::default();
+
+    for _ in 0..10 {
+        counters.add_up(100);
+        counters.add_down(250);
+    }
+
+    assert_eq!(counters.totals(), (1000, 2500));
+}
