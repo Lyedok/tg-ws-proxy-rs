@@ -242,18 +242,21 @@ async fn cf_priority_tries_the_cf_worker_before_the_direct_websocket() {
     // Worker-only setup still paid the full direct-WS timeout on every
     // connection before reaching the one tier that worked.
     let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    // The domain is given in URL form on purpose: normalization happens once
+    // at startup now, so this is what keeps the routing path covered by it.
     let config = proxy_config(
         &format!("http://{proxy_addr}"),
         &[
             "--cf-priority",
             "--cf-worker-domain",
-            "worker-priority.example.dev",
+            "https://worker-priority.example.dev/apiws",
             "--dc-ip",
             "2:149.154.167.221",
             "--ws-connect-timeout",
             "2",
         ],
-    );
+    )
+    .with_defaults();
 
     run_proxy_once(config).await;
 
@@ -278,6 +281,11 @@ async fn a_dc_ip_that_timed_out_is_skipped_on_the_next_connection() {
     // that on every connection is what leaves Telegram sitting in
     // "Connecting..." — so once an address times out, later connections go
     // straight to the tiers that can still reach Telegram.
+    //
+    // Here every tier is dead, which is the case that must not turn into a
+    // one-hour lockout: with nothing else left the address is re-probed, so a
+    // cooldown set by a passing glitch can still be cleared by a connection
+    // that works.
     const DEAD_IP: &str = "149.154.175.101";
     let (proxy_addr, proxy_task) = stalling_http_proxy_requests(DEAD_IP).await;
     let make_config = || {
@@ -311,8 +319,12 @@ async fn a_dc_ip_that_timed_out_is_skipped_on_the_next_connection() {
             // ...then falls back to the Worker and finally to TCP.
             "worker-ipfail.example.dev:443",
             "149.154.175.100:443",
-            // The second one skips the dead address entirely.
+            // The second one goes to the Worker first, skipping the address...
             "worker-ipfail.example.dev:443",
+            // ...and only re-probes it because nothing else was left, on the
+            // short cooldown clock rather than the full connect timeout.
+            DEAD_IP,
+            DEAD_IP,
             "149.154.175.100:443",
         ]
         .map(|target| if target == DEAD_IP {

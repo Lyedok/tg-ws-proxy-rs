@@ -644,25 +644,36 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<String>) -> Option
         return Some(upstream);
     }
 
-    // ── An IP that just timed out is skipped entirely ────────────────────
+    // ── An IP that just timed out is stepped over ────────────────────────
     // A DPI-blocked DC IP does not come back within one connection's
     // lifetime, so re-probing it per connection only adds the connect
     // timeout to every single client — the delay that makes Telegram sit in
     // "Connecting..." forever.  Only worth skipping when there is somewhere
     // else to go; without a fallback the doomed attempt is still the only
     // path we have.
-    if IP_FAIL.active(target_ip.as_str()) && route.has_fallback() {
+    let ip_cooling = IP_FAIL.active(target_ip.as_str()) && route.has_fallback();
+    if ip_cooling {
         let reason = "IP in cooldown";
         info!(
             "[{}] DC{}{} {} → skipping direct WS to {}",
             route.label, route.dc, route.media, reason, target_ip
         );
 
-        return Some(
-            route
-                .fallback_chain(&target_ip, reason, false)
-                .await
-                .unwrap_or_else(|| route.tcp_last_resort(target_ip, reason)),
+        // Stepped over, not written off: if every fallback is also gone the
+        // address gets its chance back rather than leaving the client on the
+        // raw-TCP path for the rest of the cooldown.  That is what makes the
+        // cooldown self-healing — a direct connect is the only thing that
+        // clears it, so something has to keep asking.
+        if let Some(upstream) = route
+            .fallback_chain(&target_ip, reason, route.config.cf_priority)
+            .await
+        {
+            return Some(upstream);
+        }
+
+        info!(
+            "[{}] DC{}{} every fallback failed → re-probing {}",
+            route.label, route.dc, route.media, target_ip
         );
     }
 
@@ -674,6 +685,7 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<String>) -> Option
             route.is_media,
             target_ip.clone(),
             route.config.skip_tls_verify,
+            !IP_FAIL.active(target_ip.as_str()),
         )
         .await;
     if let Some(ws) = pooled {
@@ -697,6 +709,13 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<String>) -> Option
     // WS failed (and is now in cooldown) — walk the rest of the ladder.
     // `--cf-priority` already tried both CF tiers above, so skip them here.
     let reason = "WS failed";
+    if ip_cooling {
+        // The re-probe above was the last thing left to try: every other tier
+        // already failed on the way in, and nothing since then can have
+        // revived them.
+        return Some(route.tcp_last_resort(target_ip, reason));
+    }
+
     Some(
         route
             .fallback_chain(&target_ip, reason, route.config.cf_priority)
@@ -743,20 +762,42 @@ impl Route<'_> {
     /// Describe the connection the pool should re-open, off the one that just
     /// worked.
     ///
-    /// Only the domain that actually answered is carried over, not the whole
-    /// candidate list: the spare is opened through the same route rather than
-    /// re-walking the ladder in the background, and a domain that stops working
-    /// simply stops refilling — the inline path still tries every candidate.
+    /// Only one domain is carried over, not the whole candidate list: the
+    /// spare is opened through a known-good route rather than re-walking the
+    /// ladder in the background, and a domain that stops working simply stops
+    /// refilling — the inline path still tries every candidate.
+    ///
+    /// Which one depends on `--cf-balance`.  Off, it is the domain that just
+    /// answered, so the pool inherits the same preference order the inline
+    /// path has.  On, pinning the pool to one domain would quietly undo the
+    /// balancing — roughly every other connection is a pool hit — so the spare
+    /// is opened through the next domain in the rotation instead.
     ///
     /// `dst` is only meaningful for [`CfTier::Worker`] — the DC IP its tunnel
     /// opens onto.
-    fn cf_target(&self, tier: CfTier, dst: &str, domain: &str) -> CfTarget {
+    fn cf_target(
+        &self,
+        tier: CfTier,
+        dst: &str,
+        domain: &str,
+        rotation: &[String],
+        counter: &AtomicUsize,
+    ) -> CfTarget {
+        let domain = if self.config.cf_balance {
+            balanced(rotation, counter)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| domain.to_string())
+        } else {
+            domain.to_string()
+        };
+
         CfTarget {
             tier,
             dc: self.dc,
             is_media: self.is_media,
             dst: dst.to_string(),
-            domain: domain.to_string(),
+            domain,
             skip_tls_verify: self.config.skip_tls_verify,
             connect_timeout: self.timeouts.cf_connect,
         }
@@ -775,6 +816,13 @@ impl Route<'_> {
         if worker_domains.is_empty() {
             return None;
         }
+
+        // `--dc-ip` says which address *this host* should dial; the Worker
+        // dials from Cloudflare's network, where that choice carries no
+        // weight and a stale override would just send the tunnel somewhere
+        // dead. Upstream tg-ws-proxy likewise always tunnels to the built-in
+        // DC address.
+        let dst = self.runtime.fallback_ip(self.dc).unwrap_or(dst);
 
         if let Some((ws, domain)) = self
             .pool
@@ -832,8 +880,13 @@ impl Route<'_> {
                     // opens a new one per media transfer, and each pays the
                     // handshake to Cloudflare *and* Cloudflare's own connect
                     // to the DC.
-                    self.pool
-                        .cf_prefetch(self.cf_target(CfTier::Worker, dst, worker_domain));
+                    self.pool.cf_prefetch(self.cf_target(
+                        CfTier::Worker,
+                        dst,
+                        worker_domain,
+                        worker_domains,
+                        &CF_WORKER_BALANCE_COUNTER,
+                    ));
 
                     return Some(ws);
                 }
@@ -908,8 +961,13 @@ impl Route<'_> {
                 self.label, self.dc, self.media, reason
             );
             if let Some(domain) = domain {
-                self.pool
-                    .cf_prefetch(self.cf_target(CfTier::Proxy, "", &domain));
+                self.pool.cf_prefetch(self.cf_target(
+                    CfTier::Proxy,
+                    "",
+                    &domain,
+                    &self.config.cf_domains,
+                    &CF_BALANCE_COUNTER,
+                ));
             }
         } else {
             warn!(
@@ -984,6 +1042,10 @@ impl Route<'_> {
             .then(|| self.runtime.fronting_domain())
             .flatten();
 
+        // A DC inside its own cooldown is probed on a much shorter clock, so
+        // a timeout there says far less about the address than a full-budget
+        // one does — see `cool_down_ip`.
+        let probing = WS_FAIL.active(&(self.dc, self.is_media));
         let attempt = self.connect_ws(target_ip, sticky_fronting).await;
 
         if let Some(domain) = sticky_fronting {
@@ -1026,7 +1088,7 @@ impl Route<'_> {
         // unreachable.  A redirect, a refusal, or a handshake that stalled all
         // came from a host that is very much there, and taking it out of the
         // rotation for an hour on that basis would be wrong.
-        if attempt.connect_timed_out {
+        if attempt.connect_timed_out && !probing {
             self.cool_down_ip(target_ip);
         }
 
@@ -1143,13 +1205,12 @@ impl Route<'_> {
 
     /// Back off from a target IP whose TCP connect timed out.
     ///
-    /// Skipped when this is the only path available — see the `has_fallback`
-    /// check in [`select_upstream`], which is where the cooldown is honored.
+    /// Recorded even with no fallback tier configured, where nothing will skip
+    /// the address: the pool reads the same cooldown to stop pre-connecting
+    /// into a hole, which is worth doing either way.  [`select_upstream`] is
+    /// where the skipping decision — the part that does need a fallback — is
+    /// made.
     fn cool_down_ip(&self, target_ip: &str) {
-        if !self.has_fallback() {
-            return;
-        }
-
         IP_FAIL.set(target_ip.to_string(), self.timeouts.ip_fail_cooldown);
         info!(
             "[{}] DC{}{} TCP to {} timed out, cooldown {}s",

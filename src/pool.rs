@@ -161,12 +161,18 @@ impl WsPool {
     ///
     /// Returns `Some(ws)` on a pool hit, `None` if the bucket is empty or
     /// all entries were stale.  Schedules a background refill either way.
+    /// `allow_refill` is the caller's verdict on whether `target_ip` is worth
+    /// dialling in the background at all.  A pre-connect into an address that
+    /// is currently timing out costs a connect timeout per pooled slot and can
+    /// never succeed, so the routing layer — which owns that knowledge — gets
+    /// to veto it.
     pub async fn get(
         self: &Arc<Self>,
         dc: u32,
         is_media: bool,
         target_ip: String,
         skip_tls_verify: bool,
+        allow_refill: bool,
     ) -> Option<TgWsStream> {
         let now = Instant::now();
         let mut lock = self.idle.lock().await;
@@ -204,10 +210,12 @@ impl WsPool {
             );
 
             // Schedule a background task to refill the bucket.
-            let pool = Arc::clone(self);
-            tokio::spawn(async move {
-                pool.refill(dc, is_media, target_ip, skip_tls_verify).await;
-            });
+            if allow_refill {
+                let pool = Arc::clone(self);
+                tokio::spawn(async move {
+                    pool.refill(dc, is_media, target_ip, skip_tls_verify).await;
+                });
+            }
 
             return Some(entry.ws);
         }
@@ -215,10 +223,12 @@ impl WsPool {
         // Bucket is empty (or fully stale).
         drop(lock);
 
-        let pool = Arc::clone(self);
-        tokio::spawn(async move {
-            pool.refill(dc, is_media, target_ip, skip_tls_verify).await;
-        });
+        if allow_refill {
+            let pool = Arc::clone(self);
+            tokio::spawn(async move {
+                pool.refill(dc, is_media, target_ip, skip_tls_verify).await;
+            });
+        }
 
         None
     }

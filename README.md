@@ -352,12 +352,16 @@ The proxy will try the CF path as a fallback after direct WebSocket fails.
 With `--cf-priority`, the Cloudflare tiers — the Worker tunnel first, then the
 CF proxy — are tried **before** direct WebSocket for all DCs.
 
-A `--dc-ip` address whose TCP connect *times out* is dropped from the direct
-path for `--ip-fail-cooldown` seconds (default one hour) whenever a fallback
-tier is configured, instead of costing every later connection another connect
-timeout. A refused or redirected connection does not count — only a timeout,
-which is what a DPI-blocked address looks like. The cooldown is cleared the
-moment a direct connection to that address succeeds again.
+A `--dc-ip` address whose TCP connect *times out* is stepped over for
+`--ip-fail-cooldown` seconds (default one hour) whenever a fallback tier is
+configured, instead of costing every later connection another connect timeout.
+A refused or redirected connection does not count — only a timeout, which is
+what a DPI-blocked address looks like, and only at the full connect timeout
+(not the short probe a DC in cooldown gets).
+
+Stepped over, not written off: if every fallback tier is also failing, the
+address is re-probed rather than leaving the client on raw TCP for the rest of
+the window, and the first direct connect that succeeds clears the cooldown.
 
 Every connection retries every configured CF domain fresh — a failure isn't
 remembered across connections (matching upstream tg-ws-proxy), so one flaky

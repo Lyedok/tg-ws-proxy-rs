@@ -143,10 +143,15 @@ async fn probe_cf_worker(
         return ProbeStatus::Fail(format!("Worker tunnel closed on send: {}", e));
     }
 
+    // Everything the user cares about timing has happened by now; the settle
+    // wait below is a fixed cost of the probe, not latency of the tunnel, and
+    // reporting it would make every healthy Worker look three seconds slow.
+    let elapsed = start.elapsed();
+
     // Anything arriving here is the tunnel dying: either a close frame, or a
     // stray payload from something on `dst:443` that is not a Telegram DC.
     match tokio::time::timeout(WORKER_TUNNEL_SETTLE, ws_recv(&mut ws)).await {
-        Err(_) => ProbeStatus::Ok(start.elapsed()),
+        Err(_) => ProbeStatus::Ok(elapsed),
         Ok(None) => ProbeStatus::Fail(format!(
             "Worker tunnel to {} closed immediately — the Worker cannot reach Telegram \
              (check its live logs in the Cloudflare dashboard)",

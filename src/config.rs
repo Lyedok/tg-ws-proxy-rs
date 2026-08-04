@@ -258,11 +258,12 @@ pub struct Config {
     )]
     pub cf_worker_domains: Vec<String>,
 
-    /// Prioritise Cloudflare proxy over direct WebSocket connections for all
-    /// DCs (even those with `--dc-ip` configured).
+    /// Prioritise the Cloudflare tiers over direct WebSocket connections for
+    /// all DCs (even those with `--dc-ip` configured).
     ///
-    /// When set, the proxy tries the CF path first; if it fails, falls back to
-    /// the normal WS path, then upstream MTProto proxies, then direct TCP.
+    /// When set, the proxy tries the Cloudflare Worker tunnel and then the
+    /// Cloudflare proxy first; if both fail, it falls back to the normal WS
+    /// path, then upstream MTProto proxies, then direct TCP.
     #[arg(long = "cf-priority", env = "TG_CF_PRIORITY")]
     pub cf_priority: bool,
 
@@ -317,12 +318,17 @@ pub struct Config {
     ///
     /// A timeout (rather than a refusal or a redirect) is what a DPI-blocked
     /// address looks like, and that does not lift within a connection's
-    /// lifetime — so the address is left alone for a long window and every
+    /// lifetime — so the address is stepped over for a long window and every
     /// client goes straight to the Cloudflare/upstream-proxy tiers instead of
-    /// paying `--ws-connect-timeout` first.  Only honored when such a fallback
-    /// is configured; the cooldown is dropped as soon as a direct connect to
-    /// that address succeeds again.  Matches upstream tg-ws-proxy's
-    /// `IP_FAIL_COOLDOWN`.
+    /// paying `--ws-connect-timeout` first.
+    ///
+    /// Stepped over, not written off: a connection that finds every fallback
+    /// tier dead re-probes the address anyway, and the first direct connect
+    /// that succeeds clears the cooldown — so a window opened by a passing
+    /// glitch cannot strand anyone.  The skipping needs a fallback tier to be
+    /// configured; the record itself is always kept, since the pool reads it
+    /// to stop pre-connecting into the same hole.  Matches upstream
+    /// tg-ws-proxy's `IP_FAIL_COOLDOWN`.
     #[arg(
         long = "ip-fail-cooldown",
         default_value = "3600",
