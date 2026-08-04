@@ -1116,11 +1116,13 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
         }
     });
 
-    join_bridge(upload, download).await;
+    let closed_by = join_bridge(upload, download).await;
 
     let (bytes_up, bytes_down) = counters.totals();
 
-    log_session_closed(label, dc, is_media, "WS", bytes_up, bytes_down, start);
+    log_session_closed(
+        label, dc, is_media, "WS", closed_by, bytes_up, bytes_down, start,
+    );
 }
 
 // ─── Upstream MTProto proxy connection ───────────────────────────────────────
@@ -1360,7 +1362,7 @@ async fn bridge_relay(reader: ClientReader, writer: ClientWriter, params: RelayP
         }
     });
 
-    join_bridge(upload, download).await;
+    let closed_by = join_bridge(upload, download).await;
 
     let (bytes_up, bytes_down) = counters.totals();
 
@@ -1369,7 +1371,9 @@ async fn bridge_relay(reader: ClientReader, writer: ClientWriter, params: RelayP
     } else {
         "upstream"
     };
-    log_session_closed(label, dc, is_media, kind, bytes_up, bytes_down, start);
+    log_session_closed(
+        label, dc, is_media, kind, closed_by, bytes_up, bytes_down, start,
+    );
 }
 
 // ─── TCP fallback bridge ─────────────────────────────────────────────────────
@@ -1481,11 +1485,13 @@ async fn bridge_tcp(
         }
     });
 
-    join_bridge(upload, download).await;
+    let closed_by = join_bridge(upload, download).await;
 
     let (bytes_up, bytes_down) = counters.totals();
 
-    log_session_closed(label, dc, is_media, "TCP", bytes_up, bytes_down, start);
+    log_session_closed(
+        label, dc, is_media, "TCP", closed_by, bytes_up, bytes_down, start,
+    );
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -1498,15 +1504,43 @@ async fn bridge_tcp(
 /// connection times out.  Joining both halves instead left zombie connections
 /// behind that exhausted the process file-descriptor limit.
 ///
-async fn join_bridge(mut upload: JoinHandle<()>, mut download: JoinHandle<()>) {
+async fn join_bridge(mut upload: JoinHandle<()>, mut download: JoinHandle<()>) -> ClosedBy {
     tokio::select! {
         _ = &mut upload => {
             download.abort();
             let _ = download.await;
+
+            // The upload direction only ends when the client stops sending.
+            ClosedBy::Client
         }
         _ = &mut download => {
             upload.abort();
             let _ = upload.await;
+
+            ClosedBy::Upstream
+        }
+    }
+}
+
+/// Which side ended a bridged session.
+///
+/// Each direction runs until *its* source stops, so whichever task finishes
+/// first names the side that hung up. Worth logging: a session that closes
+/// with no bytes in either direction looks identical either way, and telling
+/// "the client walked away while we were still connecting" apart from
+/// "Telegram dropped us straight after the handshake" is the difference
+/// between a client-side timeout and a broken upstream.
+#[derive(Clone, Copy)]
+enum ClosedBy {
+    Client,
+    Upstream,
+}
+
+impl ClosedBy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Upstream => "upstream",
         }
     }
 }
@@ -1541,21 +1575,24 @@ impl BridgeCounters {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn log_session_closed(
     label: &str,
     dc: u32,
     is_media: bool,
     kind: &str,
+    closed_by: ClosedBy,
     bytes_up: u64,
     bytes_down: u64,
     start: Instant,
 ) {
     info!(
-        "[{}] DC{}{} {} session closed: ↑{}  ↓{}  {:.1}s",
+        "[{}] DC{}{} {} session closed by {}: ↑{}  ↓{}  {:.1}s",
         label,
         dc,
         media_tag(is_media),
         kind,
+        closed_by.as_str(),
         human_bytes(bytes_up),
         human_bytes(bytes_down),
         start.elapsed().as_secs_f32()

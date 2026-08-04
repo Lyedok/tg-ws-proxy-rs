@@ -127,9 +127,31 @@ async fn an_aborted_direction_still_reports_the_bytes_it_moved() {
         }
     });
 
-    join_bridge(upload, download).await;
+    let closed_by = join_bridge(upload, download).await;
 
     assert_eq!(counters.totals(), (4096, 1024));
+    // The upload direction ran out first, which means the client stopped.
+    assert!(matches!(closed_by, ClosedBy::Client));
+}
+
+#[tokio::test]
+async fn the_side_that_stops_first_is_the_one_reported() {
+    // A session that transfers nothing looks identical whichever side hung
+    // up; this is what tells a client-side timeout apart from an upstream
+    // that dropped us right after the handshake.
+    let upload = tokio::spawn(std::future::pending::<()>());
+    let download = tokio::spawn(async {});
+    assert!(matches!(
+        join_bridge(upload, download).await,
+        ClosedBy::Upstream
+    ));
+
+    let upload = tokio::spawn(async {});
+    let download = tokio::spawn(std::future::pending::<()>());
+    assert!(matches!(
+        join_bridge(upload, download).await,
+        ClosedBy::Client
+    ));
 }
 
 #[test]
