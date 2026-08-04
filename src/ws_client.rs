@@ -725,17 +725,25 @@ pub async fn ws_recv(ws: &mut TgWsStream) -> Option<Vec<u8>> {
 static VERIFYING_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
 static NO_VERIFY_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
 
-/// How many TLS sessions to keep for resumption.
+/// How many TLS sessions to keep for resumption — `rustls`'s own default,
+/// stated explicitly because it is easy to assume it is oversized and shrink
+/// it. It is not: it is about right for the largest realistic config.
 ///
-/// `rustls` defaults to 256, which is far more than this proxy can use: it
-/// only ever dials `kws{1..5}[-1]` on `web.telegram.org` plus the same records
-/// under each configured CF domain, so a couple of dozen hostnames covers a
-/// realistic deployment. The cache is not free — a stored session holds the
-/// server's certificate chain, several KiB apiece — and it is held for the
-/// life of the process, which is memory a router does not get back. 64 keeps
-/// resumption working for every normal config while bounding the cache to a
-/// fraction of the default.
-const TLS_SESSION_CACHE_SIZE: usize = 64;
+/// The cache holds one entry per *hostname*, and this proxy dials a lot of
+/// them. Each CF domain contributes `kws{N}` and `kws{N}-1` for every DC in
+/// play (media and non-media share those names, they only reorder them), plus
+/// `kws{1..5}[-1].web.telegram.org` for the direct path and one name per
+/// Worker. With `--default-domains` that is roughly:
+///
+/// ```text
+///   21 domains x 3 DCs x 2 records + 10 + 1  ~= 140 names
+///   21 domains x 6 DCs x 2 records + 10 + 1  ~= 260 names
+/// ```
+///
+/// and `--cf-balance` deliberately keeps every one of them hot. Undersizing
+/// the cache is the worst outcome available: the memory is still spent, and
+/// entries get evicted before they can be reused, so the handshakes come back.
+const TLS_SESSION_CACHE_SIZE: usize = 256;
 
 fn build_tls_connector(skip_verify: bool) -> Connector {
     let config = if skip_verify {
