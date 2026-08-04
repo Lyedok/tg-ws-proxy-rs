@@ -430,25 +430,37 @@ fn base_cf_record(domain: &str) -> Option<String> {
 /// Ordering policy for the Cloudflare connect loop.
 ///
 /// The configured records are attempted in order, skipping any already tried.
-/// A `kws{N}-1` record missing from DNS additionally queues its base record —
-/// and that queued retry is *not* subject to the skip, so a base record whose
-/// first attempt failed transiently gets a second chance.
+/// A `kws{N}-1` record missing from DNS additionally queues its base record as
+/// a *forced* attempt, which neither skips nor consumes the record's normal
+/// turn — so the base record is attempted twice.
 ///
-/// That second chance is load-bearing, not an accident. `kws{N}-1` records are
-/// optional and most zones omit them, so for a non-media DC the sequence is
-/// `kws{N}` then `kws{N}-1` (absent) then `kws{N}` again. Deduplicating that
-/// away measurably pushed more connections into the (often blocked) TCP
-/// fallback: on one tester's network the fallback share nearly doubled, from
-/// 5.9% to 11.4% of connections, and each of those costs a full
-/// `--tcp-fallback-timeout` before the client gives up.
+/// That second attempt is load-bearing, not an accident. `kws{N}-1` records
+/// are optional and most zones omit them, so a missing one is the normal case
+/// and its fallback is what gives a transiently-failing base record another
+/// chance. Deduplicating it away measurably pushed connections into the (often
+/// blocked) TCP fallback: on one tester's network the fallback share nearly
+/// doubled, 5.9% -> 11.4%, each costing a full `--tcp-fallback-timeout`.
+///
+/// Forcing rather than merely queueing matters because the two orderings would
+/// otherwise get different numbers of attempts. Media DCs try `-1` first, so
+/// its fallback *is* the base record's first attempt; without the force, the
+/// base record's own turn would then be skipped as already-tried and media
+/// would get one attempt where everything else got two. The same tester's log
+/// showed exactly that asymmetry — 61 base attempts against 61 `-1` attempts
+/// on media, versus 99 against 11 elsewhere — while video was the thing that
+/// kept failing to load first time.
 struct CfAttempts {
     queue: VecDeque<CfAttempt>,
     tried: HashSet<String>,
+    /// Records whose attempt ran out the clock. Retrying one of these just
+    /// buys another full connect timeout, so the forced retry skips them.
+    timed_out: HashSet<String>,
 }
 
 struct CfAttempt {
     domain: String,
-    /// Queued by the `-1` fallback, so it runs even if already attempted.
+    /// Queued by the `-1` fallback: runs even if already tried, and does not
+    /// use up the record's own turn later in the list.
     forced: bool,
 }
 
@@ -463,6 +475,7 @@ impl CfAttempts {
                 })
                 .collect(),
             tried: HashSet::new(),
+            timed_out: HashSet::new(),
         }
     }
 
@@ -470,8 +483,10 @@ impl CfAttempts {
     /// were queued as a forced retry.
     fn next_domain(&mut self) -> Option<String> {
         while let Some(attempt) = self.queue.pop_front() {
-            let first_time = self.tried.insert(attempt.domain.clone());
-            if first_time || attempt.forced {
+            if attempt.forced {
+                return Some(attempt.domain);
+            }
+            if self.tried.insert(attempt.domain.clone()) {
                 return Some(attempt.domain);
             }
         }
@@ -479,10 +494,19 @@ impl CfAttempts {
         None
     }
 
+    /// Record that `domain`'s attempt hit the connect timeout.
+    fn note_timed_out(&mut self, domain: &str) {
+        self.timed_out.insert(domain.to_string());
+    }
+
     /// Queue the base record for `domain` as a forced retry, if `domain` is a
-    /// `-1` record. Returns the queued record.
+    /// `-1` record whose base is worth attempting again. Returns the queued
+    /// record.
     fn retry_base_of(&mut self, domain: &str) -> Option<String> {
         let base = base_cf_record(domain)?;
+        if self.timed_out.contains(&base) {
+            return None;
+        }
         self.queue.push_front(CfAttempt {
             domain: base.clone(),
             forced: true,
@@ -573,6 +597,7 @@ pub async fn connect_cf_ws_for_dc_with_outbound(
             }
             WsConnectResult::TimedOut => {
                 warn!("CF WS DC{}{} timed out on {}", dc, media, domain);
+                attempts.note_timed_out(&domain);
                 all_redirects = false;
             }
         }

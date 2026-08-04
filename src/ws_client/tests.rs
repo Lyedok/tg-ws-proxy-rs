@@ -325,15 +325,50 @@ fn a_missing_dash_one_record_buys_the_base_record_a_second_attempt() {
 }
 
 #[test]
-fn a_media_dc_still_attempts_the_base_record_once() {
-    // Media DCs try the `-1` variant first, so its fallback *is* the base
-    // record's only attempt — it must not be inflated to two.
+fn a_media_dc_gets_the_same_two_attempts_as_everything_else() {
+    // Media DCs try the `-1` variant first, so its fallback is the base
+    // record's *first* attempt rather than its second. Without forcing, the
+    // base record's own turn would then be skipped as already-tried and media
+    // would get half the attempts — which is what made video the thing that
+    // kept failing to load first time.
     let mut attempts = CfAttempts::new(cf_ws_domains(2, &["example.net".to_string()], true));
 
     assert_eq!(
         drain(&mut attempts, true),
-        ["kws2-1.example.net", "kws2.example.net"]
+        ["kws2-1.example.net", "kws2.example.net", "kws2.example.net",]
     );
+}
+
+#[test]
+fn both_orderings_attempt_the_base_record_the_same_number_of_times() {
+    let domains = ["example.net".to_string()];
+    let count = |is_media| {
+        let mut attempts = CfAttempts::new(cf_ws_domains(2, &domains, is_media));
+        drain(&mut attempts, true)
+            .into_iter()
+            .filter(|d| d == "kws2.example.net")
+            .count()
+    };
+
+    assert_eq!(count(false), 2);
+    assert_eq!(count(true), count(false));
+}
+
+#[test]
+fn a_record_that_timed_out_is_not_retried() {
+    // Retrying a record that ran out the clock just buys another full connect
+    // timeout before the fallback chain can move on.
+    let mut attempts = CfAttempts::new(cf_ws_domains(2, &["example.net".to_string()], false));
+
+    assert_eq!(attempts.next_domain().as_deref(), Some("kws2.example.net"));
+    attempts.note_timed_out("kws2.example.net");
+    assert_eq!(
+        attempts.next_domain().as_deref(),
+        Some("kws2-1.example.net")
+    );
+
+    assert_eq!(attempts.retry_base_of("kws2-1.example.net"), None);
+    assert_eq!(attempts.next_domain(), None);
 }
 
 #[test]
