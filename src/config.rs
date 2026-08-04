@@ -9,29 +9,57 @@ use std::net::UdpSocket;
 
 use clap::Parser;
 
+use crate::crypto;
 use crate::outbound::OutboundConnector;
 
 // ─── Telegram DC default IPs ─────────────────────────────────────────────────
 // These are the "fallback" addresses used when a DC is not listed in
 // `--dc-ip` or when WebSocket routing fails and we must fall back to TCP.
-pub fn default_dc_ips() -> HashMap<u32, String> {
-    [
-        (1, "149.154.175.50"),
-        (2, "149.154.167.51"),
-        (3, "149.154.175.100"),
-        (4, "149.154.167.91"),
-        (5, "149.154.171.5"),
-        (203, "91.105.192.100"),
-    ]
-    .iter()
-    .map(|(k, v)| (*k, v.to_string()))
-    .collect()
-}
+const DEFAULT_DC_IPS: &[(u32, &str)] = &[
+    (1, "149.154.175.50"),
+    (2, "149.154.167.51"),
+    (3, "149.154.175.100"),
+    (4, "149.154.167.91"),
+    (5, "149.154.171.5"),
+    (203, "91.105.192.100"),
+];
 
 // DC numbers that are remapped to another DC for WebSocket domain selection.
 // DC 203 (the "test" DC) is treated as DC 2 for websocket connections.
+const DC_OVERRIDES: &[(u32, u32)] = &[(203, 2)];
+
+// Implicit `--dc-ip` targets used when the user configured neither `--dc-ip`
+// nor any Cloudflare routing.
+const DEFAULT_DC_IP_TARGETS: &[(u32, &str)] = &[(2, "149.154.167.220"), (4, "149.154.167.220")];
+
+pub fn default_dc_ips() -> HashMap<u32, String> {
+    DEFAULT_DC_IPS
+        .iter()
+        .map(|(dc, ip)| (*dc, ip.to_string()))
+        .collect()
+}
+
+/// The built-in fallback IP for `dc`, without building the whole map.
+pub fn default_dc_ip(dc: u32) -> Option<&'static str> {
+    DEFAULT_DC_IPS
+        .iter()
+        .find_map(|(id, ip)| (*id == dc).then_some(*ip))
+}
+
 pub fn default_dc_overrides() -> HashMap<u32, u32> {
-    [(203, 2)].iter().copied().collect()
+    DC_OVERRIDES.iter().copied().collect()
+}
+
+/// The DC whose WebSocket hostname should be used for `dc`.
+///
+/// A direct lookup over the (single-entry) override table, so the per-connect
+/// path doesn't build and throw away a whole `HashMap` — see
+/// [`default_dc_overrides`] for the mapping itself.
+pub fn websocket_dc(dc: u32) -> u32 {
+    DC_OVERRIDES
+        .iter()
+        .find_map(|(from, to)| (*from == dc).then_some(*to))
+        .unwrap_or(dc)
 }
 
 // ─── Upstream MTProto proxy config ───────────────────────────────────────────
@@ -129,6 +157,11 @@ pub struct Config {
     pub dc_ip: Vec<(u32, String)>,
 
     /// Socket send/recv buffer size in KiB.
+    ///
+    /// Currently has no effect — accepted for backwards compatibility with
+    /// existing command lines and `TG_BUF_KB` deployments. The relay buffers
+    /// are a fixed size chosen to keep the per-connection footprint small on
+    /// low-memory devices.
     #[arg(long = "buf-kb", default_value = "256", env = "TG_BUF_KB")]
     pub buf_kb: usize,
 
@@ -442,26 +475,33 @@ pub struct Config {
 impl Config {
     /// Parse configuration from CLI arguments.
     pub fn from_args() -> Self {
-        let mut cfg = Self::parse();
+        Self::parse().with_defaults()
+    }
 
+    /// Fill in the values that can only be defaulted after parsing.
+    ///
+    /// Split out of [`Self::from_args`] so a `Config` built from an explicit
+    /// argument list — tests, or anything embedding the library — goes through
+    /// exactly the same normalization the binary does.
+    pub fn with_defaults(mut self) -> Self {
         // Fill in a random secret if none was supplied.
-        if cfg.secrets.is_empty() {
+        if self.secrets.is_empty() {
             let bytes: [u8; 16] = rand::random();
-            cfg.secrets.push(hex::encode(bytes));
+            self.secrets.push(hex::encode(bytes));
         }
 
         // If no --dc-ip was given, use the built-in defaults — unless a CF
         // domain is configured or --default-domains was requested (in which
         // case CF proxy becomes the primary path for all DCs without explicit
         // IPs, and the default dc_ip list would be misleading).
-        if cfg.dc_ip.is_empty() && cfg.cf_domains.is_empty() && !cfg.default_domains {
-            cfg.dc_ip = vec![
-                (2, "149.154.167.220".to_string()),
-                (4, "149.154.167.220".to_string()),
-            ];
+        if self.dc_ip.is_empty() && self.cf_domains.is_empty() && !self.default_domains {
+            self.dc_ip = DEFAULT_DC_IP_TARGETS
+                .iter()
+                .map(|(dc, ip)| (*dc, ip.to_string()))
+                .collect();
         }
 
-        cfg
+        self
     }
 
     /// Primary proxy secret (the first configured value).
@@ -469,28 +509,16 @@ impl Config {
         self.secrets.first().map(String::as_str).unwrap_or("")
     }
 
-    fn normalize_secret_bytes(raw: Vec<u8>) -> Vec<u8> {
-        if raw.len() >= 17 && matches!(raw[0], 0xdd | 0xee) {
-            raw[1..17].to_vec()
-        } else {
-            raw
-        }
-    }
-
     /// The proxy secret as raw bytes (decoded from hex).
     pub fn secret_bytes(&self) -> Vec<u8> {
-        let raw = hex::decode(self.primary_secret()).expect("secret must be valid hex");
-        Self::normalize_secret_bytes(raw)
+        decode_secret_key(self.primary_secret())
     }
 
     /// All configured proxy secrets as raw bytes.
     pub fn secret_bytes_list(&self) -> Vec<Vec<u8>> {
         self.secrets
             .iter()
-            .map(|s| {
-                let raw = hex::decode(s).expect("secret must be valid hex");
-                Self::normalize_secret_bytes(raw)
-            })
+            .map(|secret| decode_secret_key(secret))
             .collect()
     }
 
@@ -502,11 +530,9 @@ impl Config {
         }
 
         let raw = hex::decode(self.primary_secret()).ok()?;
-        if raw.len() > 17 && raw[0] == 0xee {
-            return std::str::from_utf8(&raw[17..]).ok().map(ToOwned::to_owned);
-        }
+        let hostname = crypto::faketls_hostname(&raw)?;
 
-        None
+        std::str::from_utf8(hostname).ok().map(ToOwned::to_owned)
     }
 
     /// Full secret value for the generated Telegram link.
@@ -517,12 +543,7 @@ impl Config {
     /// Full secret value for the generated Telegram link for any configured secret.
     pub fn link_secret_for(&self, secret: &str) -> String {
         if let Some(domain) = self.listen_faketls_domain() {
-            let raw = hex::decode(secret).expect("secret must be valid hex");
-            let key = if raw.len() >= 17 && matches!(raw[0], 0xdd | 0xee) {
-                &raw[1..17]
-            } else {
-                &raw[..]
-            };
+            let key = decode_secret_key(secret);
             return format!("ee{}{}", hex::encode(key), hex::encode(domain.as_bytes()));
         }
 
@@ -536,6 +557,23 @@ impl Config {
     /// Map of DC ID → target IP from `--dc-ip` flags.
     pub fn dc_redirects(&self) -> HashMap<u32, String> {
         self.dc_ip.iter().cloned().collect()
+    }
+
+    /// The `--dc-ip` override for a single DC.
+    ///
+    /// A scan of the (tiny) flag list rather than [`Self::dc_redirects`], so
+    /// the per-connection routing path doesn't build and drop a `HashMap` for
+    /// one lookup.
+    ///
+    /// Scanned in reverse so a DC listed twice resolves to the last `--dc-ip`
+    /// given, matching what collecting into [`Self::dc_redirects`] does. The
+    /// two must agree: the pool warms itself from the map while the routing
+    /// path uses this lookup.
+    pub fn dc_target_ip(&self, dc: u32) -> Option<&str> {
+        self.dc_ip
+            .iter()
+            .rev()
+            .find_map(|(id, ip)| (*id == dc).then_some(ip.as_str()))
     }
 
     /// Cloudflare Worker domains normalized for `Host` and TLS SNI use.
@@ -635,6 +673,14 @@ impl Config {
     pub fn buf_bytes(&self) -> usize {
         self.buf_kb * 1024
     }
+}
+
+/// Decode a hex secret and strip its optional `dd`/`ee` mode prefix, leaving
+/// the raw key used for MTProto key derivation.
+fn decode_secret_key(secret: &str) -> Vec<u8> {
+    let raw = hex::decode(secret).expect("secret must be valid hex");
+
+    crypto::secret_key(&raw).to_vec()
 }
 
 // ─── LAN IP auto-detection ────────────────────────────────────────────────────

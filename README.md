@@ -98,7 +98,7 @@ tg-ws-proxy [OPTIONS]
 | `--secret <HEX>` | random | 32 hex-char MTProto secret (repeatable / comma-separated for per-user secrets) |
 | `--listen-faketls-domain <DOMAIN>` | — | Accept inbound clients with `ee` FakeTLS and advertise this SNI domain in the link |
 | `--dc-ip <DC:IP>` | DC2 + DC4 | Target IP per DC (repeatable); omit when using `--cf-domain` to let CF proxy handle all DCs |
-| `--buf-kb <KB>` | `256` | Socket buffer size |
+| `--buf-kb <KB>` | `256` | Socket buffer size (accepted but currently unused) |
 | `--pool-size <N>` | `4` | Pre-warmed WS connections per DC |
 | `--cf-domain <DOMAIN>` | — | Cloudflare-proxied domain(s) for alternative WS routing, comma-separated (see [CF Proxy](#cloudflare-proxy)) |
 | `--cf-worker-domain <DOMAIN>` | — | Cloudflare Worker domain(s) for TCP-tunnel fallback, comma-separated/repeatable (see [Cloudflare Worker](#cloudflare-worker)) |
