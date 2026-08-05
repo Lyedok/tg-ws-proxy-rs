@@ -13,6 +13,12 @@
 //! means Cloudflare is correctly routing the WebSocket traffic to Telegram's
 //! DC 2 server and the domain is usable by the proxy.
 //!
+//! **CF Worker** — The Worker's WebSocket tunnel to DC 2 is opened *and* a
+//! 64-byte MTProto init is pushed through it.  The upgrade on its own says
+//! nothing: the Worker returns `101` before its TCP `connect()` to Telegram is
+//! known to have worked, so only the init — and the silence that should follow
+//! it — proves the far end is really a DC.
+//!
 //! **MTProto proxy (plain / 0xdd)** — A TCP connection is made and the
 //! 64-byte MTProto obfuscation handshake is sent.  A successful send verifies
 //! the proxy is reachable at the network level.
@@ -31,7 +37,7 @@ use crate::crypto::{self, ProtoTag, generate_client_handshake};
 use crate::faketls;
 use crate::outbound::OutboundConnector;
 use crate::ws_client::{
-    connect_cf_worker_ws_for_dc_with_outbound, connect_cf_ws_for_dc_with_outbound,
+    connect_cf_worker_ws_for_dc_with_outbound, connect_cf_ws_for_dc_with_outbound, ws_recv, ws_send,
 };
 
 // ─── Probe result ─────────────────────────────────────────────────────────────
@@ -75,7 +81,7 @@ async fn probe_cf_domain(
     outbound: &OutboundConnector,
 ) -> ProbeStatus {
     let start = Instant::now();
-    let (ws, _) = connect_cf_ws_for_dc_with_outbound(
+    let (ws, _record, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
         2,
         &[domain.to_string()],
         false,
@@ -93,7 +99,24 @@ async fn probe_cf_domain(
     }
 }
 
-/// Probe a Cloudflare Worker by opening its WebSocket tunnel to DC 2.
+/// How long the Worker probe waits for its tunnel to be torn down before
+/// calling it healthy.
+///
+/// Telegram answers the 64-byte init with silence — it only speaks once the
+/// client sends a request — so silence *is* the success signal here and the
+/// probe can only wait it out.  Long enough to cover a Worker round trip plus
+/// the DC handshake, short enough that `--check` stays interactive.
+const WORKER_TUNNEL_SETTLE: Duration = Duration::from_secs(3);
+
+/// Probe a Cloudflare Worker by opening its WebSocket tunnel to DC 2 and
+/// pushing a real MTProto init through it.
+///
+/// The WebSocket upgrade alone proves nothing about the tunnel: Cloudflare
+/// answers `101` from the Worker script itself, before — and regardless of
+/// whether — its `connect()` to the Telegram DC ever succeeds.  A Worker that
+/// cannot reach Telegram therefore passed this check while every real client
+/// through it died instantly (#93).  Sending the init and watching for a
+/// close is what tells the two apart.
 async fn probe_cf_worker(
     domain: &str,
     skip_tls: bool,
@@ -109,12 +132,37 @@ async fn probe_cf_worker(
         domain, dst, 2, false, skip_tls, timeout, outbound,
     )
     .await;
-    if ws.is_some() {
-        ProbeStatus::Ok(start.elapsed())
-    } else {
-        ProbeStatus::Fail(
+    let Some(mut ws) = ws else {
+        return ProbeStatus::Fail(
             "Worker WebSocket tunnel failed — check Worker code and domain".to_string(),
-        )
+        );
+    };
+
+    let relay_init = crypto::generate_relay_init(ProtoTag::Intermediate, 2);
+    if let Err(e) = ws_send(&mut ws, relay_init.to_vec()).await {
+        return ProbeStatus::Fail(format!("Worker tunnel closed on send: {}", e));
+    }
+
+    // Everything the user cares about timing has happened by now; the settle
+    // wait below is a fixed cost of the probe, not latency of the tunnel, and
+    // reporting it would make every healthy Worker look three seconds slow.
+    let elapsed = start.elapsed();
+
+    // Anything arriving here is the tunnel dying: either a close frame, or a
+    // stray payload from something on `dst:443` that is not a Telegram DC.
+    match tokio::time::timeout(WORKER_TUNNEL_SETTLE, ws_recv(&mut ws)).await {
+        Err(_) => ProbeStatus::Ok(elapsed),
+        Ok(None) => ProbeStatus::Fail(format!(
+            "Worker tunnel to {} closed immediately — the Worker cannot reach Telegram \
+             (check its live logs in the Cloudflare dashboard)",
+            dst
+        )),
+        Ok(Some(data)) => ProbeStatus::Fail(format!(
+            "Worker tunnel to {} answered the MTProto init with {} unexpected bytes — \
+             the far end is not a Telegram DC",
+            dst,
+            data.len()
+        )),
     }
 }
 
@@ -269,7 +317,7 @@ pub async fn run_check_with_outbound(config: &Config, outbound: &OutboundConnect
     if !cf_worker_domains.is_empty() {
         println!();
         println!("Cloudflare Worker domains (DC2 TCP tunnel probe):");
-        for domain in &cf_worker_domains {
+        for domain in cf_worker_domains {
             print!("  {:40}  ... ", domain);
             let _ = std::io::Write::flush(&mut std::io::stdout());
 

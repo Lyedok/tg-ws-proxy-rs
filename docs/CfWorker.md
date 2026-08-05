@@ -47,6 +47,12 @@ TG_CF_WORKER_DOMAIN=random-symbols-1234.username.workers.dev
 tg-ws-proxy --cf-worker-domain random-symbols-1234.username.workers.dev --check
 ```
 
+Проверка не ограничивается WebSocket-апгрейдом: через туннель отправляется
+настоящий MTProto init, и если Worker не может достучаться до Telegram, туннель
+закроется сразу — `--check` покажет `FAIL`. Cloudflare отвечает `101` из самого
+кода Worker'а, ещё до того как его `connect()` до датацентра отработает, поэтому
+успешный апгрейд сам по себе ничего не доказывает.
+
 ### Код Worker'а
 ```javascript
 import { connect } from "cloudflare:sockets";

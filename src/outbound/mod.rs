@@ -8,4 +8,4 @@
 mod config;
 mod connector;
 
-pub use connector::OutboundConnector;
+pub use connector::{OutboundConnector, OutboundError};

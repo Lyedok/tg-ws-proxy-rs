@@ -103,8 +103,9 @@ tg-ws-proxy [OPTIONS]
 | `--cf-domain <DOMAIN>` | — | Cloudflare-proxied domain(s) for alternative WS routing, comma-separated (see [CF Proxy](#cloudflare-proxy)) |
 | `--cf-worker-domain <DOMAIN>` | — | Cloudflare Worker domain(s) for TCP-tunnel fallback, comma-separated/repeatable (see [Cloudflare Worker](#cloudflare-worker)) |
 | `--default-domains` | off | Fetch and use the built-in CF proxy domain list from GitHub (no Cloudflare setup needed, see [Default domains](#default-domains)) |
-| `--cf-priority` | off | Try CF proxy **before** direct WS for all DCs (see [CF Proxy](#cloudflare-proxy)) |
+| `--cf-priority` | off | Try the CF tiers (Worker, then CF proxy) **before** direct WS for all DCs (see [CF Proxy](#cloudflare-proxy)) |
 | `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` and `--cf-worker-domain` values (see [CF Proxy](#cloudflare-proxy)) |
+| `--ip-fail-cooldown <SECS>` | `3600` | How long to skip the direct WS path for a `--dc-ip` address whose TCP connect timed out, when a Cloudflare/upstream fallback is configured |
 | `--fronting-domain <DOMAIN>` | off | Domain-fronting fallback SNI, e.g. `sprinthost.ru` (see [Domain fronting](#domain-fronting)) |
 | `--fronting-cooldown <SECS>` | `1800` | How long the fronting fallback stays active after it last succeeded |
 | `--fronting-fail-cooldown <SECS>` | `60` | How long to stop retrying fronting after it fails for a DC (protects against networks that block Telegram's DC IPs outright, where fronting can never succeed) |
@@ -340,7 +341,7 @@ tg-ws-proxy --cf-domain primary.net,backup.com --cf-balance
 # CF-only mode: omit --dc-ip so CF proxy handles all DCs
 tg-ws-proxy --cf-domain yourdomain.com
 
-# CF priority: try CF proxy before direct WS, with WS as fallback
+# CF priority: try the CF tiers before direct WS, with WS as fallback
 tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com --cf-priority
 
 # Or via environment variable
@@ -348,8 +349,19 @@ TG_CF_DOMAIN=yourdomain.com tg-ws-proxy
 ```
 
 The proxy will try the CF path as a fallback after direct WebSocket fails.
-With `--cf-priority`, the CF proxy is tried **before** direct WebSocket for all
-DCs.
+With `--cf-priority`, the Cloudflare tiers — the Worker tunnel first, then the
+CF proxy — are tried **before** direct WebSocket for all DCs.
+
+A `--dc-ip` address whose TCP connect *times out* is stepped over for
+`--ip-fail-cooldown` seconds (default one hour) whenever a fallback tier is
+configured, instead of costing every later connection another connect timeout.
+A refused or redirected connection does not count — only a timeout, which is
+what a DPI-blocked address looks like, and only at the full connect timeout
+(not the short probe a DC in cooldown gets).
+
+Stepped over, not written off: if every fallback tier is also failing, the
+address is re-probed rather than leaving the client on raw TCP for the rest of
+the window, and the first direct connect that succeeds clears the cooldown.
 
 Every connection retries every configured CF domain fresh — a failure isn't
 remembered across connections (matching upstream tg-ws-proxy), so one flaky

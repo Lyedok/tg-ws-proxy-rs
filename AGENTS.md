@@ -91,7 +91,11 @@ the PR otherwise.
 
 - The MTProto transport and the WebSocket transport have different framing guarantees — see
   `splitter.rs`. Never assume one WebSocket message == one MTProto packet without going through
-  the splitter.
+  the splitter. The one exception is the Cloudflare **Worker** tunnel: its far end is a raw TCP
+  socket, so message boundaries mean nothing there and packet-aligning is actively harmful —
+  Cloudflare drops WebSocket messages over 1 MiB, which a media upload's MTProto packets exceed.
+  `proxy.rs`'s `WsFraming` is what keeps the two apart; add a new WebSocket upstream to the wrong
+  arm and uploads break only for large files.
 - `--host` auto-detection (`Config::bind_host`/`Config::link_host` in `config.rs`) intentionally
   keeps the bind address and the advertised `tg://` link address consistent. If you touch this
   logic, verify both by actually starting the binary (`cargo run -- --port <N>`) and reading the

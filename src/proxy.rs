@@ -48,12 +48,12 @@ use crate::faketls::{
     read_tls_appdata, read_tls_record, sign_faketls_client_hello, write_tls_appdata,
 };
 use crate::outbound::OutboundConnector;
-use crate::pool::WsPool;
+use crate::pool::{CfTarget, CfTier, WsPool};
 use crate::runtime::Runtime;
 use crate::splitter::MsgSplitter;
 use crate::ws_client::{
-    TgWsStream, connect_cf_worker_ws_for_dc_with_outbound, connect_cf_ws_for_dc_with_outbound,
-    connect_ws_for_dc_with_outbound, media_tag, ws_send,
+    TgWsStream, WsAttempt, connect_cf_worker_ws_for_dc_with_outbound,
+    connect_cf_ws_for_dc_with_outbound, connect_ws_for_dc_with_outbound, media_tag, ws_send,
 };
 
 type TcpReader = ReadHalf<TcpStream>;
@@ -143,6 +143,14 @@ impl<K: Eq + Hash> CooldownMap<K> {
 /// Per-DC cooldown for the direct WebSocket path, keyed by `(dc, is_media)`.
 /// Also carries the longer "all domains redirected" cooldown.
 static WS_FAIL: CooldownMap<(u32, bool)> = CooldownMap::new();
+/// Per-target-IP cooldown, keyed by the `--dc-ip` address that timed out.
+///
+/// Coarser than `WS_FAIL` on purpose.  `WS_FAIL` says "this DC's WebSocket is
+/// unhappy, probe it with a short timeout"; this one says "TCP to this address
+/// does not complete at all", which is what a DPI-blocked IP looks like and
+/// does not change for hours.  Every DC sharing that address then skips the
+/// direct path outright instead of each paying a connect timeout.
+static IP_FAIL: CooldownMap<String> = CooldownMap::new();
 /// Per-upstream cooldown for MTProto proxies, keyed by `host:port`.
 static UPSTREAM_FAIL: CooldownMap<String> = CooldownMap::new();
 /// Per-Worker cooldown for the Cloudflare Worker path.
@@ -324,6 +332,7 @@ struct Timeouts {
     ws_fail_probe: Duration,
     ws_fail_cooldown: Duration,
     ws_redirect_cooldown: Duration,
+    ip_fail_cooldown: Duration,
     handshake: Duration,
     tcp_fallback: Duration,
     upstream_connect: Duration,
@@ -340,6 +349,7 @@ impl Timeouts {
             ws_fail_probe: Duration::from_secs(config.ws_fail_probe_timeout),
             ws_fail_cooldown: Duration::from_secs(config.ws_fail_cooldown),
             ws_redirect_cooldown: Duration::from_secs(config.ws_redirect_cooldown),
+            ip_fail_cooldown: Duration::from_secs(config.ip_fail_cooldown),
             handshake: Duration::from_secs(config.handshake_timeout),
             tcp_fallback: Duration::from_secs(config.tcp_fallback_timeout),
             upstream_connect: Duration::from_secs(config.upstream_connect_timeout),
@@ -352,10 +362,15 @@ impl Timeouts {
 }
 
 /// Handle one inbound client connection end-to-end.
+///
+/// `config` is shared rather than owned: it is read-only for the whole life of
+/// the process, and cloning it per connection meant copying every secret and
+/// domain list — with `--default-domains` that is a few dozen `String`s on the
+/// accept path.
 pub async fn handle_client(
     stream: TcpStream,
     peer: std::net::SocketAddr,
-    config: Config,
+    config: Arc<Config>,
     pool: Arc<WsPool>,
 ) {
     handle_client_with_runtime(
@@ -373,7 +388,7 @@ pub async fn handle_client(
 pub async fn handle_client_with_runtime(
     stream: TcpStream,
     peer: std::net::SocketAddr,
-    config: Config,
+    config: Arc<Config>,
     pool: Arc<WsPool>,
     runtime: Arc<Runtime>,
 ) {
@@ -465,6 +480,7 @@ pub async fn handle_client_with_runtime(
         label: &label,
         config: &config,
         runtime: &runtime,
+        pool: &pool,
         timeouts,
         dc: dc_id,
         is_media,
@@ -475,14 +491,15 @@ pub async fn handle_client_with_runtime(
     let target_ip = config.dc_target_ip(dc_id).map(str::to_string);
 
     // ── Step 6: bridge whatever we ended up connected to ─────────────────
-    match select_upstream(&route, &pool, target_ip).await {
-        Some(Upstream::Ws(ws)) => {
+    match select_upstream(&route, target_ip).await {
+        Some(Upstream::Ws { ws, framing }) => {
             bridge_ws(
                 reader,
                 writer,
                 WsBridgeParams {
                     label: &label,
                     ws,
+                    framing,
                     relay_init,
                     ciphers,
                     proto,
@@ -547,12 +564,35 @@ pub async fn handle_client_with_runtime(
 #[allow(clippy::large_enum_variant)]
 enum Upstream {
     /// A WebSocket to Telegram — direct, via the Cloudflare proxy, or through
-    /// a Cloudflare Worker tunnel.
-    Ws(TgWsStream),
+    /// a Cloudflare Worker tunnel.  See [`WsFraming`] for why the two are not
+    /// interchangeable once bridged.
+    Ws { ws: TgWsStream, framing: WsFraming },
     /// An upstream MTProto proxy, plain or FakeTLS-wrapped.
     Mtproto(UpstreamConnection),
     /// Last resort: a direct TCP connection to this Telegram DC IP.
     Tcp(String),
+}
+
+/// How the client's byte stream has to be cut into WebSocket messages.
+///
+/// The two upstream kinds want opposite things, and getting it wrong only
+/// shows up under load:
+///
+/// * Telegram's own `/apiws` endpoint (direct or fronted by the Cloudflare
+///   proxy) treats every WebSocket message as exactly one MTProto packet, so
+///   the stream must go through [`MsgSplitter`].
+/// * A Cloudflare Worker is a raw TCP tunnel — it writes each message's
+///   payload straight into the socket, so boundaries carry no meaning there.
+///   Packet-aligning for it is not just pointless but harmful: Cloudflare
+///   caps a WebSocket message at 1 MiB, and a media upload produces MTProto
+///   packets well past that, which killed the connection mid-transfer
+///   (Flowseal/tg-ws-proxy#1161, fixed upstream in v1.9.1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WsFraming {
+    /// One WebSocket message per MTProto packet.
+    Packets,
+    /// Opaque byte stream, chunked at whatever size reads off the client.
+    Tunnel,
 }
 
 /// Everything the fallback ladder needs to route one client connection.
@@ -560,6 +600,7 @@ struct Route<'a> {
     label: &'a str,
     config: &'a Config,
     runtime: &'a Runtime,
+    pool: &'a Arc<WsPool>,
     timeouts: Timeouts,
     dc: u32,
     is_media: bool,
@@ -575,11 +616,7 @@ struct Route<'a> {
 /// `target_ip` is the DC's `--dc-ip` override, if the user configured one.
 /// Without it the direct WebSocket path is skipped entirely and the Python
 /// reference's order is used (Worker, CF proxy, upstream proxies, then TCP).
-async fn select_upstream(
-    route: &Route<'_>,
-    pool: &Arc<WsPool>,
-    target_ip: Option<String>,
-) -> Option<Upstream> {
+async fn select_upstream(route: &Route<'_>, target_ip: Option<String>) -> Option<Upstream> {
     let Some(target_ip) = target_ip else {
         // Every log line already carries the DC, so the reason only has to say
         // what is missing.
@@ -600,20 +637,55 @@ async fn select_upstream(
         );
     };
 
-    // ── CF priority — try the CF proxy before direct WS if enabled ───────
+    // ── CF priority — try both CF tiers before direct WS if enabled ──────
     if route.config.cf_priority
-        && let Some(ws) = route.cf_proxy("cf-priority").await
+        && let Some(upstream) = route.cf_tiers(&target_ip, "cf-priority").await
     {
-        return Some(Upstream::Ws(ws));
+        return Some(upstream);
+    }
+
+    // ── An IP that just timed out is stepped over ────────────────────────
+    // A DPI-blocked DC IP does not come back within one connection's
+    // lifetime, so re-probing it per connection only adds the connect
+    // timeout to every single client — the delay that makes Telegram sit in
+    // "Connecting..." forever.  Only worth skipping when there is somewhere
+    // else to go; without a fallback the doomed attempt is still the only
+    // path we have.
+    let ip_cooling = IP_FAIL.active(target_ip.as_str()) && route.has_fallback();
+    if ip_cooling {
+        let reason = "IP in cooldown";
+        info!(
+            "[{}] DC{}{} {} → skipping direct WS to {}",
+            route.label, route.dc, route.media, reason, target_ip
+        );
+
+        // Stepped over, not written off: if every fallback is also gone the
+        // address gets its chance back rather than leaving the client on the
+        // raw-TCP path for the rest of the cooldown.  That is what makes the
+        // cooldown self-healing — a direct connect is the only thing that
+        // clears it, so something has to keep asking.
+        if let Some(upstream) = route
+            .fallback_chain(&target_ip, reason, route.config.cf_priority)
+            .await
+        {
+            return Some(upstream);
+        }
+
+        info!(
+            "[{}] DC{}{} every fallback failed → re-probing {}",
+            route.label, route.dc, route.media, target_ip
+        );
     }
 
     // ── Pool first, then a fresh WebSocket connect ───────────────────────
-    let pooled = pool
+    let pooled = route
+        .pool
         .get(
             route.dc,
             route.is_media,
             target_ip.clone(),
             route.config.skip_tls_verify,
+            !IP_FAIL.active(target_ip.as_str()),
         )
         .await;
     if let Some(ws) = pooled {
@@ -621,28 +693,34 @@ async fn select_upstream(
             "[{}] DC{}{} → pool hit via {}",
             route.label, route.dc, route.media, target_ip
         );
-        return Some(Upstream::Ws(ws));
+        return Some(Upstream::Ws {
+            ws,
+            framing: WsFraming::Packets,
+        });
     }
 
     if let Some(ws) = route.direct_ws(&target_ip).await {
-        return Some(Upstream::Ws(ws));
+        return Some(Upstream::Ws {
+            ws,
+            framing: WsFraming::Packets,
+        });
     }
 
     // WS failed (and is now in cooldown) — walk the rest of the ladder.
-    // `--cf-priority` already tried the CF proxy above, so skip it here.
+    // `--cf-priority` already tried both CF tiers above, so skip them here.
     let reason = "WS failed";
+    if ip_cooling {
+        // The re-probe above was the last thing left to try: every other tier
+        // already failed on the way in, and nothing since then can have
+        // revived them.
+        return Some(route.tcp_last_resort(target_ip, reason));
+    }
+
     Some(
         route
             .fallback_chain(&target_ip, reason, route.config.cf_priority)
             .await
-            .unwrap_or_else(|| {
-                let fallback = route
-                    .runtime
-                    .fallback_ip(route.dc)
-                    .map_or(target_ip, str::to_string);
-
-                route.tcp_fallback(fallback, reason)
-            }),
+            .unwrap_or_else(|| route.tcp_last_resort(target_ip, reason)),
     )
 }
 
@@ -652,28 +730,115 @@ impl Route<'_> {
     ///
     /// `dst` is the Telegram DC IP the Worker should open its TCP tunnel to.
     /// Returns `None` when every configured tier failed or was skipped.
-    async fn fallback_chain(
-        &self,
-        dst: &str,
-        reason: &str,
-        skip_cf_proxy: bool,
-    ) -> Option<Upstream> {
-        if let Some(ws) = self.cf_worker(dst, reason).await {
-            return Some(Upstream::Ws(ws));
-        }
-
-        if !skip_cf_proxy && let Some(ws) = self.cf_proxy(reason).await {
-            return Some(Upstream::Ws(ws));
+    async fn fallback_chain(&self, dst: &str, reason: &str, skip_cf: bool) -> Option<Upstream> {
+        if !skip_cf && let Some(upstream) = self.cf_tiers(dst, reason).await {
+            return Some(upstream);
         }
 
         self.upstream_proxies(reason).await.map(Upstream::Mtproto)
     }
 
+    /// Both Cloudflare tiers in upstream's order: Worker tunnel first, then
+    /// the Cloudflare proxy.
+    ///
+    /// Kept as one step so `--cf-priority` and the post-failure fallback walk
+    /// the identical ladder — a Worker-only setup used to sit out
+    /// `--cf-priority` entirely and pay the full direct-WS timeout on every
+    /// connection before reaching its only working path.
+    async fn cf_tiers(&self, dst: &str, reason: &str) -> Option<Upstream> {
+        if let Some(ws) = self.cf_worker(dst, reason).await {
+            return Some(Upstream::Ws {
+                ws,
+                framing: WsFraming::Tunnel,
+            });
+        }
+
+        self.cf_proxy(reason).await.map(|ws| Upstream::Ws {
+            ws,
+            framing: WsFraming::Packets,
+        })
+    }
+
+    /// Describe the connection the pool should re-open, off the one that just
+    /// worked.
+    ///
+    /// Only one domain is carried over, not the whole candidate list: the
+    /// spare is opened through a known-good route rather than re-walking the
+    /// ladder in the background, and a domain that stops working simply stops
+    /// refilling — the inline path still tries every candidate.
+    ///
+    /// Which one depends on `--cf-balance`.  Off, it is the domain that just
+    /// answered, so the pool inherits the same preference order the inline
+    /// path has.  On, pinning the pool to one domain would quietly undo the
+    /// balancing — roughly every other connection is a pool hit — so the spare
+    /// is opened through the next domain in the rotation instead.
+    ///
+    /// `dst` is only meaningful for [`CfTier::Worker`] — the DC IP its tunnel
+    /// opens onto.
+    fn cf_target(
+        &self,
+        tier: CfTier,
+        dst: &str,
+        domain: &str,
+        rotation: &[String],
+        counter: &AtomicUsize,
+    ) -> CfTarget {
+        let domain = if self.config.cf_balance {
+            balanced(rotation, counter)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| domain.to_string())
+        } else {
+            domain.to_string()
+        };
+
+        CfTarget {
+            tier,
+            dc: self.dc,
+            is_media: self.is_media,
+            dst: dst.to_string(),
+            domain,
+            skip_tls_verify: self.config.skip_tls_verify,
+            connect_timeout: self.timeouts.cf_connect,
+        }
+    }
+
+    /// Whether anything other than the direct WebSocket path is configured.
+    fn has_fallback(&self) -> bool {
+        !self.config.cf_worker_domains().is_empty()
+            || !self.config.cf_domains.is_empty()
+            || !self.config.mtproto_proxies.is_empty()
+    }
+
     /// Try every configured Cloudflare Worker tunnel in `--cf-balance` order.
     async fn cf_worker(&self, dst: &str, reason: &str) -> Option<TgWsStream> {
         let worker_domains = self.config.cf_worker_domains();
+        if worker_domains.is_empty() {
+            return None;
+        }
+
+        // `--dc-ip` says which address *this host* should dial; the Worker
+        // dials from Cloudflare's network, where that choice carries no
+        // weight and a stale override would just send the tunnel somewhere
+        // dead. Upstream tg-ws-proxy likewise always tunnels to the built-in
+        // DC address.
+        let dst = self.runtime.fallback_ip(self.dc).unwrap_or(dst);
+
+        if let Some((ws, domain)) = self
+            .pool
+            .cf_get(CfTier::Worker, self.dc, self.is_media)
+            .await
+        {
+            info!(
+                "[{}] DC{}{} {} → CF Worker pool hit ({})",
+                self.label, self.dc, self.media, reason, domain
+            );
+
+            return Some(ws);
+        }
+
         let workers = balance_order(
-            &worker_domains,
+            worker_domains,
             self.config.cf_balance,
             &CF_WORKER_BALANCE_COUNTER,
         );
@@ -710,6 +875,19 @@ impl Route<'_> {
                         "[{}] DC{}{} {} → CF Worker connected ({})",
                         self.label, self.dc, self.media, reason, worker_domain
                     );
+                    // This Worker answers, so it is worth holding a spare
+                    // tunnel open for the client's next connection — Telegram
+                    // opens a new one per media transfer, and each pays the
+                    // handshake to Cloudflare *and* Cloudflare's own connect
+                    // to the DC.
+                    self.pool.cf_prefetch(self.cf_target(
+                        CfTier::Worker,
+                        dst,
+                        worker_domain,
+                        worker_domains,
+                        &CF_WORKER_BALANCE_COUNTER,
+                    ));
+
                     return Some(ws);
                 }
                 None => {
@@ -748,12 +926,26 @@ impl Route<'_> {
             self.config.cf_balance,
             &CF_BALANCE_COUNTER,
         );
+
+        if let Some((ws, domain)) = self
+            .pool
+            .cf_get(CfTier::Proxy, self.dc, self.is_media)
+            .await
+        {
+            info!(
+                "[{}] DC{}{} {} → CF proxy pool hit ({})",
+                self.label, self.dc, self.media, reason, domain
+            );
+
+            return Some(ws);
+        }
+
         debug!(
             "[{}] DC{}{} {} → trying CF proxy via {:?}",
             self.label, self.dc, self.media, reason, cf_domains
         );
 
-        let (ws, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
+        let (ws, domain, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
             self.dc,
             &cf_domains,
             self.is_media,
@@ -768,6 +960,15 @@ impl Route<'_> {
                 "[{}] DC{}{} {} → CF proxy connected",
                 self.label, self.dc, self.media, reason
             );
+            if let Some(domain) = domain {
+                self.pool.cf_prefetch(self.cf_target(
+                    CfTier::Proxy,
+                    "",
+                    &domain,
+                    &self.config.cf_domains,
+                    &CF_BALANCE_COUNTER,
+                ));
+            }
         } else {
             warn!(
                 "[{}] DC{}{} CF proxy failed (all configured domains)",
@@ -841,12 +1042,16 @@ impl Route<'_> {
             .then(|| self.runtime.fronting_domain())
             .flatten();
 
-        let (ws, all_redirects, timed_out) = self.connect_ws(target_ip, sticky_fronting).await;
+        // A DC inside its own cooldown is probed on a much shorter clock, so
+        // a timeout there says far less about the address than a full-budget
+        // one does — see `cool_down_ip`.
+        let probing = WS_FAIL.active(&(self.dc, self.is_media));
+        let attempt = self.connect_ws(target_ip, sticky_fronting).await;
 
         if let Some(domain) = sticky_fronting {
-            if ws.is_some() {
+            if attempt.ws.is_some() {
                 self.on_fronting_success(domain);
-                return ws;
+                return attempt.ws;
             }
 
             self.runtime.deactivate_fronting();
@@ -861,33 +1066,50 @@ impl Route<'_> {
                 self.media,
                 self.timeouts.fronting_fail_cooldown.as_secs()
             );
-        } else if ws.is_some() {
+        } else if attempt.ws.is_some() {
             WS_FAIL.clear(&(self.dc, self.is_media));
+            IP_FAIL.clear(target_ip);
             info!(
                 "[{}] DC{}{} → WS connected via {}",
                 self.label, self.dc, self.media, target_ip
             );
 
-            return ws;
-        } else if let Some(ws) = self.reactive_fronting(target_ip, timed_out).await {
+            return attempt.ws;
+        } else if let Some(ws) = self
+            .reactive_fronting(target_ip, attempt.upgrade_timed_out)
+            .await
+        {
             return Some(ws);
         }
 
-        self.cool_down_ws(all_redirects);
+        self.cool_down_ws(attempt.all_redirects);
+
+        // Only a TCP connect that ran out the clock says the address itself is
+        // unreachable.  A redirect, a refusal, or a handshake that stalled all
+        // came from a host that is very much there, and taking it out of the
+        // rotation for an hour on that basis would be wrong.
+        if attempt.connect_timed_out && !probing {
+            self.cool_down_ip(target_ip);
+        }
 
         None
     }
 
-    /// Retry a timed-out WebSocket connect once with a fronted SNI.
+    /// Retry a stalled WebSocket *handshake* once with a fronted SNI.
     ///
-    /// A timeout (as opposed to a redirect or connection error) is the signal
-    /// for SNI-based DPI blocking, which is exactly what fronting works
-    /// around.  Skipped while a previous fronting attempt is in its own
-    /// fail-cooldown: a network that blocks the DC IP outright would otherwise
-    /// pay for this doomed attempt on every single connection (see
-    /// `Config::fronting_fail_cooldown`).
-    async fn reactive_fronting(&self, target_ip: &str, timed_out: bool) -> Option<TgWsStream> {
-        if !timed_out || FRONTING_FAIL.active(&(self.dc, self.is_media)) {
+    /// Gated on the TLS/upgrade timeout specifically: that is the address
+    /// answering and then the handshake going nowhere, which is what SNI-based
+    /// DPI looks like and what fronting works around.  A TCP connect that never
+    /// completed is a different problem — nothing is listening as far as this
+    /// host can tell, and a different SNI on a connection that cannot be opened
+    /// changes nothing.  Also skipped while a previous fronting attempt is in
+    /// its own fail-cooldown (see `Config::fronting_fail_cooldown`).
+    async fn reactive_fronting(
+        &self,
+        target_ip: &str,
+        upgrade_timed_out: bool,
+    ) -> Option<TgWsStream> {
+        if !upgrade_timed_out || FRONTING_FAIL.active(&(self.dc, self.is_media)) {
             return None;
         }
         let domain = self.runtime.fronting_domain()?;
@@ -897,9 +1119,7 @@ impl Route<'_> {
             self.label, self.dc, self.media, domain
         );
 
-        let (ws, _all_redirects, _timed_out) = self.connect_ws(target_ip, Some(domain)).await;
-
-        match ws {
+        match self.connect_ws(target_ip, Some(domain)).await.ws {
             Some(ws) => {
                 self.on_fronting_success(domain);
                 Some(ws)
@@ -921,11 +1141,7 @@ impl Route<'_> {
         }
     }
 
-    async fn connect_ws(
-        &self,
-        target_ip: &str,
-        sni_override: Option<&str>,
-    ) -> (Option<TgWsStream>, bool, bool) {
+    async fn connect_ws(&self, target_ip: &str, sni_override: Option<&str>) -> WsAttempt {
         // A DC still inside its failure cooldown is probed with a much shorter
         // timeout so a doomed attempt does not delay the fallback chain.
         let timeout = if WS_FAIL.active(&(self.dc, self.is_media)) {
@@ -987,6 +1203,40 @@ impl Route<'_> {
         }
     }
 
+    /// Back off from a target IP whose TCP connect timed out.
+    ///
+    /// Recorded even with no fallback tier configured, where nothing will skip
+    /// the address: the pool reads the same cooldown to stop pre-connecting
+    /// into a hole, which is worth doing either way.  [`select_upstream`] is
+    /// where the skipping decision — the part that does need a fallback — is
+    /// made.
+    fn cool_down_ip(&self, target_ip: &str) {
+        IP_FAIL.set(target_ip.to_string(), self.timeouts.ip_fail_cooldown);
+        info!(
+            "[{}] DC{}{} TCP to {} timed out, cooldown {}s",
+            self.label,
+            self.dc,
+            self.media,
+            target_ip,
+            self.timeouts.ip_fail_cooldown.as_secs()
+        );
+    }
+
+    /// Raw TCP to the DC, once every tunnelled tier is out.
+    ///
+    /// Prefers the built-in DC address over the `--dc-ip` override: this is
+    /// only reached after that override failed, and on the paths that get here
+    /// it failed by timing out — the one signal that says the address itself
+    /// is unreachable.
+    fn tcp_last_resort(&self, target_ip: String, reason: &str) -> Upstream {
+        let dst = self
+            .runtime
+            .fallback_ip(self.dc)
+            .map_or(target_ip, str::to_string);
+
+        self.tcp_fallback(dst, reason)
+    }
+
     fn tcp_fallback(&self, dst: String, reason: &str) -> Upstream {
         info!(
             "[{}] DC{}{} {} → TCP fallback {}:443",
@@ -1009,6 +1259,7 @@ impl Route<'_> {
 struct WsBridgeParams<'a> {
     label: &'a str,
     ws: TgWsStream,
+    framing: WsFraming,
     relay_init: [u8; 64],
     ciphers: ConnectionCiphers,
     proto: ProtoTag,
@@ -1020,6 +1271,7 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
     let WsBridgeParams {
         label,
         mut ws,
+        framing,
         relay_init,
         ciphers,
         proto,
@@ -1039,7 +1291,8 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
         mut tg_enc,
         mut tg_dec,
     } = ciphers;
-    let mut splitter = MsgSplitter::new(&relay_init, proto);
+    let mut splitter =
+        (framing == WsFraming::Packets).then(|| MsgSplitter::new(&relay_init, proto));
 
     // Split the WebSocket stream into sink (send) and source (recv).
     let (mut ws_sink, mut ws_source) = ws.split();
@@ -1065,18 +1318,38 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
                 clt_dec.apply_keystream(chunk);
                 tg_enc.apply_keystream(chunk);
 
-                // Split into MTProto packets and send as separate WS frames.
-                for part in splitter.split(chunk) {
-                    if ws_sink.send(Message::Binary(part)).await.is_err() {
-                        return;
+                let sent = match splitter.as_mut() {
+                    // Split into MTProto packets and send as separate WS frames.
+                    Some(splitter) => {
+                        let mut sent = true;
+                        for part in splitter.split(chunk) {
+                            if ws_sink.send(Message::Binary(part)).await.is_err() {
+                                sent = false;
+                                break;
+                            }
+                        }
+                        sent
                     }
+                    // Tunnel: forward the read as one frame.  A client read is
+                    // bounded by `CLIENT_READ_BUF_SIZE`, far under Cloudflare's
+                    // 1 MiB message cap, so it needs no further chunking — and
+                    // no intermediate `Vec` of parts either.
+                    None => ws_sink.send(Message::Binary(chunk.to_vec())).await.is_ok(),
+                };
+
+                if !sent {
+                    return;
                 }
 
                 counters.add_up(n);
             }
 
             // Flush any partial last packet.
-            for part in splitter.flush() {
+            for part in splitter
+                .as_mut()
+                .map(MsgSplitter::flush)
+                .unwrap_or_default()
+            {
                 let _ = ws_sink.send(Message::Binary(part)).await;
             }
 
