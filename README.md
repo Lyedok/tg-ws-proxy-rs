@@ -28,61 +28,43 @@ Telegram Desktop → MTProto (TCP 1443) → tg-ws-proxy-rs → WS (TLS 443) → 
 
 ### Pre-built binaries
 
-Download from the [Releases](../../releases) page.
+Download from the [Releases](../../releases) page. Linux musl targets also ship
+a `-upx` variant that is ~70% smaller on disk, for routers where flash is
+tight — see [docs/Building.md](docs/Building.md#shrinking-the-binary-for-flash-constrained-devices)
+for the RAM trade-off that comes with it.
+
+### Docker
+
+Published to Docker Hub as
+[`valnesfjord/tg-ws-proxy-rs`](https://hub.docker.com/r/valnesfjord/tg-ws-proxy-rs)
+(`linux/amd64` + `linux/arm64`):
+
+```bash
+docker run -d --name tg-ws-proxy -p 1443:1443 valnesfjord/tg-ws-proxy-rs
+```
+
+Set `TG_SECRET` so the secret survives restarts, and `--link-ip` so the printed
+`tg://` link points at a reachable address — see
+[docs/Deployment.md](docs/Deployment.md#docker).
 
 ### Build from source
 
 ```bash
-# Debug build
-cargo build
-
-# Optimised release build
 cargo build --release
-
-# Static binary for Linux x86_64 (e.g. for Docker scratch images)
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-The release binary is at `target/release/tg-ws-proxy` (or
-`target/<target>/release/tg-ws-proxy` for cross-compiled targets).
+The binary lands in `target/release/tg-ws-proxy`. Cross-compiling for OpenWrt
+(MIPS/ARM/ARM64) is covered in [docs/Building.md](docs/Building.md).
 
-## Cross-platform builds with `cargo-zigbuild`
+### Telegram Desktop setup
 
-[`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) uses the Zig
-compiler as a drop-in C cross-linker so you can build for every platform from
-a single Linux or macOS host without installing any platform SDKs.
+1. **Settings → Advanced → Connection type → Use custom proxy**
+2. Add MTProto proxy:
+   - **Server:** `127.0.0.1`
+   - **Port:** `1443` (or your `--port`)
+   - **Secret:** shown in the proxy startup log
 
-```bash
-# Install cargo-zigbuild and Zig
-pip install ziglang        # or: brew install zig
-cargo install cargo-zigbuild
-
-# Add all required Rust targets in one shot
-rustup target add \
-  x86_64-unknown-linux-musl \
-  aarch64-unknown-linux-musl \
-  armv7-unknown-linux-musleabihf \
-  mipsel-unknown-linux-musl \
-  x86_64-apple-darwin \
-  aarch64-apple-darwin \
-  x86_64-pc-windows-gnu
-
-# Build for all platforms
-cargo zigbuild --release --target x86_64-unknown-linux-musl       # Linux x86-64 (musl static)
-cargo zigbuild --release --target aarch64-unknown-linux-musl      # Linux / OpenWrt ARM64
-cargo zigbuild --release --target armv7-unknown-linux-musleabihf  # OpenWrt ARMv7
-cargo zigbuild --release --target mipsel-unknown-linux-musl       # OpenWrt MIPS LE
-cargo zigbuild --release --target x86_64-apple-darwin             # macOS Intel
-cargo zigbuild --release --target aarch64-apple-darwin            # macOS Apple Silicon
-cargo zigbuild --release --target x86_64-pc-windows-gnu           # Windows x86-64
-```
-
-> **Note:** Building macOS targets (`*-apple-darwin`) requires the macOS SDK
-> (XCode Command Line Tools). On Linux you can use
-> [`osxcross`](https://github.com/tpoechtrager/osxcross) to supply the SDK
-> and then set `SDKROOT` / `MACOSX_DEPLOYMENT_TARGET` appropriately before
-> running `cargo zigbuild`.
+Or use the `tg://proxy?...` link that is printed on startup.
 
 ## Usage
 
@@ -94,19 +76,19 @@ tg-ws-proxy [OPTIONS]
 |---|---|---|
 | `--port <PORT>` | `1443` | Listen port |
 | `--host <HOST>` | auto-detected | Listen address. Binds `0.0.0.0` if a LAN IP is detected (so it matches the auto-detected link IP below), otherwise `127.0.0.1` |
-| `--link-ip <IP>` | auto-detected | IP shown in the `tg://` link (see [Router deployment](#router-deployment)) |
+| `--link-ip <IP>` | auto-detected | IP shown in the `tg://` link (see [Router deployment](docs/Deployment.md#router-deployment)) |
 | `--secret <HEX>` | random | 32 hex-char MTProto secret (repeatable / comma-separated for per-user secrets) |
 | `--listen-faketls-domain <DOMAIN>` | — | Accept inbound clients with `ee` FakeTLS and advertise this SNI domain in the link |
 | `--dc-ip <DC:IP>` | DC2 + DC4 | Target IP per DC (repeatable); omit when using `--cf-domain` to let CF proxy handle all DCs |
 | `--buf-kb <KB>` | `256` | Socket buffer size (accepted but currently unused) |
 | `--pool-size <N>` | `4` | Pre-warmed WS connections per DC |
-| `--cf-domain <DOMAIN>` | — | Cloudflare-proxied domain(s) for alternative WS routing, comma-separated (see [CF Proxy](#cloudflare-proxy)) |
-| `--cf-worker-domain <DOMAIN>` | — | Cloudflare Worker domain(s) for TCP-tunnel fallback, comma-separated/repeatable (see [Cloudflare Worker](#cloudflare-worker)) |
-| `--default-domains` | off | Fetch and use the built-in CF proxy domain list from GitHub (no Cloudflare setup needed, see [Default domains](#default-domains)) |
-| `--cf-priority` | off | Try the CF tiers (Worker, then CF proxy) **before** direct WS for all DCs (see [CF Proxy](#cloudflare-proxy)) |
-| `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` and `--cf-worker-domain` values (see [CF Proxy](#cloudflare-proxy)) |
+| `--cf-domain <DOMAIN>` | — | Cloudflare-proxied domain(s) for alternative WS routing, comma-separated |
+| `--cf-worker-domain <DOMAIN>` | — | Cloudflare Worker domain(s) for TCP-tunnel fallback, comma-separated/repeatable |
+| `--default-domains` | off | Fetch and use the built-in CF proxy domain list from GitHub (no Cloudflare setup needed) |
+| `--cf-priority` | off | Try the CF tiers (Worker, then CF proxy) **before** direct WS for all DCs |
+| `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` and `--cf-worker-domain` values |
 | `--ip-fail-cooldown <SECS>` | `3600` | How long to skip the direct WS path for a `--dc-ip` address whose TCP connect timed out, when a Cloudflare/upstream fallback is configured |
-| `--fronting-domain <DOMAIN>` | off | Domain-fronting fallback SNI, e.g. `sprinthost.ru` (see [Domain fronting](#domain-fronting)) |
+| `--fronting-domain <DOMAIN>` | off | Domain-fronting fallback SNI, e.g. `sprinthost.ru` |
 | `--fronting-cooldown <SECS>` | `1800` | How long the fronting fallback stays active after it last succeeded |
 | `--fronting-fail-cooldown <SECS>` | `60` | How long to stop retrying fronting after it fails for a DC (protects against networks that block Telegram's DC IPs outright, where fronting can never succeed) |
 | `--max-connections <N>` | auto | Max concurrent client connections (auto-computed from `ulimit -n`) |
@@ -114,21 +96,29 @@ tg-ws-proxy [OPTIONS]
 | `--outbound-proxy <URL>` | — | Proxy for all outgoing connections: `http://`, `socks5://`, or `socks5h://`; `https://` proxy URLs are not supported |
 | `--no-outbound-proxy` | off | Ignore standard outbound proxy environment variables |
 | `--no-proxy <LIST>` | — | Comma-separated host bypass list for `--outbound-proxy` |
+| `--check` | off | Test every configured CF domain and MTProto proxy, print OK/FAIL with latency, then exit `0` if all pass and `1` otherwise |
 | `--log-file <PATH>` | — | Write logs to a file instead of stderr (no ANSI color codes) |
 | `-q / --quiet` | off | Suppress all log output |
 | `-v / --verbose` | off | Debug logging |
 | `--danger-accept-invalid-certs` | off | Skip TLS verification |
 
-Every flag has a matching environment variable (`TG_PORT`, `TG_HOST`,
-`TG_SECRET`, `TG_BUF_KB`, `TG_POOL_SIZE`, `TG_MAX_CONNECTIONS`, `TG_QUIET`,
-`TG_VERBOSE`, `TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_LISTEN_FAKETLS_DOMAIN`, `TG_MTPROTO_PROXY`,
-`TG_LOG_FILE`, `TG_CF_DOMAIN`, `TG_CF_WORKER_DOMAIN`, `TG_CF_PRIORITY`,
-`TG_CF_BALANCE`, `TG_DEFAULT_DOMAINS`, `TG_OUTBOUND_PROXY`, `TG_NO_OUTBOUND_PROXY`, `TG_NO_PROXY`,
-`TG_FRONTING_DOMAIN`, `TG_FRONTING_COOLDOWN`, `TG_FRONTING_FAIL_COOLDOWN`).
-When `TG_OUTBOUND_PROXY` is not set, standard `HTTPS_PROXY`, `ALL_PROXY`,
-`HTTP_PROXY` and `NO_PROXY` environment variables are also honored. `https://`
-proxy URLs are skipped when discovered from the standard environment if a later
-supported `http://`, `socks5://`, or `socks5h://` fallback is present.
+Every flag has a matching `TG_*` environment variable (`TG_PORT`, `TG_HOST`,
+`TG_SECRET`, …) — the full list is in
+[docs/Deployment.md](docs/Deployment.md#configuration-via-environment).
+
+On startup the proxy prints a `tg://proxy?...` link you can paste into
+Telegram Desktop to configure it automatically. With `--listen-faketls-domain`,
+the printed link uses `secret=ee<key><domain_hex>`; otherwise it uses the
+classic `dd<key>` padded MTProto secret.
+
+To issue separate credentials per user, pass multiple `--secret` values — the
+proxy accepts all of them and prints an individual `tg://` link for each:
+
+```bash
+tg-ws-proxy --host 0.0.0.0 --port 443 \
+  --secret 11111111111111111111111111111111 \
+  --secret 22222222222222222222222222222222
+```
 
 ### Examples
 
@@ -139,46 +129,23 @@ tg-ws-proxy
 # Custom port and extra DCs
 tg-ws-proxy --port 9050 --dc-ip 1:149.154.175.205 --dc-ip 2:149.154.167.220
 
-# With upstream MTProto proxy fallback
-tg-ws-proxy --mtproto-proxy proxy.example.com:443:ddabcdef1234567890abcdef1234567890
-
-# With Cloudflare proxy domain (WS fallback via Cloudflare CDN)
-tg-ws-proxy --cf-domain yourdomain.com
-
-# With Cloudflare Worker (free workers.dev TCP tunnel fallback)
-tg-ws-proxy --cf-worker-domain random-symbols-1234.username.workers.dev
-
-# CF proxy only: omit --dc-ip so CF proxy handles all DCs
-tg-ws-proxy --cf-domain yourdomain.com --cf-priority
-
 # Use default CF domains from GitHub — no Cloudflare setup required
 tg-ws-proxy --default-domains
 
 # Default domains + CF priority (try CF first, fall back to direct WS)
 tg-ws-proxy --default-domains --cf-priority
 
-# Default domains + your own domain (yours goes first)
-tg-ws-proxy --cf-domain yourdomain.com --default-domains
-
-# Multiple CF domains (tried in order) with CF priority over direct WS
-tg-ws-proxy --cf-domain proxy.net,example.com --cf-priority
+# Your own Cloudflare-proxied domain
+tg-ws-proxy --cf-domain yourdomain.com
 
 # Multiple CF domains with round-robin load balancing
 tg-ws-proxy --cf-domain proxy.net,example.com --cf-balance
 
-# CF balance + priority: round-robin across CF domains, tried before direct WS
-tg-ws-proxy --cf-domain proxy.net,example.com --cf-balance --cf-priority
+# Free workers.dev TCP tunnel fallback
+tg-ws-proxy --cf-worker-domain random-symbols-1234.username.workers.dev
 
-# CF priority: CF proxy is tried first, falls back to direct WS on failure
-tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com --cf-priority
-
-# Multiple upstream proxies (tried in order until one succeeds)
-tg-ws-proxy \
-  --mtproto-proxy proxy.example.com:443:ddabcdef1234567890abcdef1234567890 \
-  --mtproto-proxy other.example.net:8888:dddeadbeef01234567deadbeef01234567
-
-# Route all outbound connections through an HTTP CONNECT proxy
-tg-ws-proxy --outbound-proxy http://user:pass@192.168.1.1:3128
+# Upstream MTProto proxy fallback
+tg-ws-proxy --mtproto-proxy proxy.example.com:443:ddabcdef1234567890abcdef1234567890
 
 # Route all outbound connections through a SOCKS5 proxy with remote DNS
 tg-ws-proxy --outbound-proxy socks5h://user:pass@192.168.1.1:1080
@@ -189,453 +156,11 @@ tg-ws-proxy --host 0.0.0.0
 # Public home server: inbound ee FakeTLS, backend still WSS to Telegram Web
 tg-ws-proxy --host 0.0.0.0 --port 443 --listen-faketls-domain www.yandex.ru
 
-# Equivalent: pass a full ee secret directly
-tg-ws-proxy --host 0.0.0.0 --port 443 --secret ee<32-hex-key><hex-encoded-domain>
-
-# Verbose logging
-tg-ws-proxy -v
-
 # Log to a file instead of stderr (no garbled ANSI codes — useful on Windows)
 tg-ws-proxy --log-file proxy.log
 
 # All options via environment variables (useful for Docker / systemd)
 TG_PORT=1443 TG_SECRET=deadbeef... tg-ws-proxy
-```
-
-On startup the proxy prints a `tg://proxy?...` link you can paste into
-Telegram Desktop to configure it automatically. With `--listen-faketls-domain`,
-the printed link uses `secret=ee<key><domain_hex>`; otherwise it uses the
-classic `dd<key>` padded MTProto secret.
-
-To issue separate credentials per user, pass multiple `--secret` values:
-
-```bash
-tg-ws-proxy --host 0.0.0.0 --port 443 \
-  --secret 11111111111111111111111111111111 \
-  --secret 22222222222222222222222222222222
-```
-
-The proxy will accept all configured secrets and print an individual `tg://`
-link for each additional secret.
-
-### Inbound FakeTLS listener
-
-For public home servers where DPI blocks raw inbound MTProto, enable inbound
-FakeTLS:
-
-```bash
-tg-ws-proxy --host 0.0.0.0 --port 443 --listen-faketls-domain www.yandex.ru
-```
-
-This changes only the client-facing transport:
-
-```
-Telegram client → ee FakeTLS → tg-ws-proxy-rs → WSS/TLS → kws*.web.telegram.org
-```
-
-The proxy accepts the TLS ClientHello, validates the FakeTLS HMAC, sends a
-synthetic TLS ServerHello, unwraps TLS Application Data records, and then
-passes the recovered MTProto init into the existing WebSocket backend path.
-
-### Upstream MTProto proxy fallback
-
-When WebSocket connections to Telegram are blocked, the proxy can route
-traffic through an external MTProto proxy before falling back to direct TCP:
-
-```
-WS (preferred) → upstream MTProto proxy → direct TCP (last resort)
-```
-
-Pass one or more `--mtproto-proxy HOST:PORT:SECRET` flags (or a
-comma-separated list in `TG_MTPROTO_PROXY`).  Proxies are tried in the order
-given; if one fails it enters a 60-second cooldown so subsequent connections
-skip it without delay.
-
-```bash
-# Padded-intermediate proxy (dd prefix)
-tg-ws-proxy --mtproto-proxy proxy.example.com:443:ddabcdef1234567890abcdef1234567890
-
-# FakeTLS proxy (ee prefix — domain-fronting transport)
-tg-ws-proxy --mtproto-proxy proxy.example.com:443:ee<32-hex-key><hex-encoded-hostname>
-
-# Multiple proxies (tried in order until one succeeds)
-tg-ws-proxy \
-  --mtproto-proxy proxy.example.com:443:ddabcdef1234567890abcdef1234567890 \
-  --mtproto-proxy other.example.net:8888:dddeadbeef01234567deadbeef01234567
-
-# Or via environment variable (comma-separated)
-TG_MTPROTO_PROXY="proxy.example.com:443:ddabcdef1234...,other.example.net:8888:dddeadbeef..." tg-ws-proxy
-```
-
-> **ℹ️ Secret format — pass the secret exactly as shown in the `tg://proxy` link**
->
-> Public MTProto proxies advertise secrets with a 1-byte prefix that tells the
-> proxy which transport mode to use.  **Copy the full secret as-is — prefix included:**
->
-> | Prefix | Meaning | Example |
-> |--------|---------|---------|
-> | `dd` | Padded-intermediate transport | `ddabcdef1234567890abcdef1234567890` |
-> | `ee` | FakeTLS (domain-fronting) transport | `ee` + 32 hex key chars + hex-encoded hostname |
-> | *(none)* | Plain transport (legacy, 32 hex chars) | `abcdef1234567890abcdef1234567890` |
->
-> In the `tg://proxy?server=...&secret=` link the `secret=` value already
-> contains the correct prefix.  Copy everything after `secret=` and pass it
-> directly to `--mtproto-proxy`.
-
-### Outbound proxy
-
-If the host running tg-ws-proxy-rs can reach the internet only through another
-proxy, route all outgoing connections through `--outbound-proxy`:
-
-```bash
-tg-ws-proxy --outbound-proxy http://user:pass@192.168.1.1:3128
-tg-ws-proxy --outbound-proxy socks5://user:pass@192.168.1.1:1080
-tg-ws-proxy --outbound-proxy socks5h://user:pass@192.168.1.1:1080
-```
-
-`socks5://` resolves hostnames locally before sending the CONNECT request.
-`socks5h://` sends the hostname to the SOCKS proxy and lets it resolve DNS
-remotely.  The setting applies to direct Telegram WS, Cloudflare proxy,
-Cloudflare Worker, upstream MTProto proxies, direct TCP fallback, `--check`,
-and the `--default-domains` fetch.
-
-The same setting can be supplied through `TG_OUTBOUND_PROXY`.  If it is not
-set, standard `HTTPS_PROXY`, `ALL_PROXY`, `HTTP_PROXY` variables are used in
-that order.  `https://` proxy URLs from those standard environment variables
-are ignored when a later supported fallback exists; an explicit
-`--outbound-proxy https://...` remains an error.
-
-Use `TG_OUTBOUND_PROXY=direct` (also accepts `none` or `off`) or
-`--no-outbound-proxy` to disable environment proxy discovery explicitly. Use
-`--no-proxy` / `TG_NO_PROXY` / `NO_PROXY` to bypass the proxy for specific
-hosts. The bypass list follows standard `NO_PROXY` domain semantics: bare
-domain entries such as `example.com` may match both `example.com` and
-subdomains such as `api.example.com`. It also accepts `*`, suffix entries such
-as `.example.com` or `*.example.com`, IP/CIDR entries such as `127.0.0.0/8`,
-and bracketed IPv6 entries. Host and IP entries may include a port, for example
-`example.com:443` or `[2001:db8::1]:443`; when a port is present, only that
-target port bypasses the proxy.
-
-```bash
-TG_OUTBOUND_PROXY=socks5h://user:pass@192.168.1.1:1080 \
-TG_NO_PROXY=localhost,127.0.0.1,127.0.0.0/8,.lan,example.com:443 \
-tg-ws-proxy
-```
-
-### Cloudflare Proxy
-
-When Telegram's IP ranges are blocked by your ISP, you can route WebSocket
-traffic through Cloudflare using `--cf-domain`.  This requires only a domain
-name — no server-side component.
-
-```bash
-# Use your own Cloudflare-proxied domain
-tg-ws-proxy --cf-domain yourdomain.com
-
-# Multiple domains (tried in order, first has highest priority)
-tg-ws-proxy --cf-domain primary.net,backup.com
-
-# Multiple domains with round-robin load balancing
-tg-ws-proxy --cf-domain primary.net,backup.com --cf-balance
-
-# CF-only mode: omit --dc-ip so CF proxy handles all DCs
-tg-ws-proxy --cf-domain yourdomain.com
-
-# CF priority: try the CF tiers before direct WS, with WS as fallback
-tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com --cf-priority
-
-# Or via environment variable
-TG_CF_DOMAIN=yourdomain.com tg-ws-proxy
-```
-
-The proxy will try the CF path as a fallback after direct WebSocket fails.
-With `--cf-priority`, the Cloudflare tiers — the Worker tunnel first, then the
-CF proxy — are tried **before** direct WebSocket for all DCs.
-
-A `--dc-ip` address whose TCP connect *times out* is stepped over for
-`--ip-fail-cooldown` seconds (default one hour) whenever a fallback tier is
-configured, instead of costing every later connection another connect timeout.
-A refused or redirected connection does not count — only a timeout, which is
-what a DPI-blocked address looks like, and only at the full connect timeout
-(not the short probe a DC in cooldown gets).
-
-Stepped over, not written off: if every fallback tier is also failing, the
-address is re-probed rather than leaving the client on raw TCP for the rest of
-the window, and the first direct connect that succeeds clears the cooldown.
-
-Every connection retries every configured CF domain fresh — a failure isn't
-remembered across connections (matching upstream tg-ws-proxy), so one flaky
-domain can never block the others, or the whole DC, from being tried.
-
-#### `--cf-balance` — round-robin load balancing
-
-When multiple `--cf-domain` values are given, connections normally always start
-with the first domain.  Adding `--cf-balance` distributes connections evenly
-across all configured CF domains using round-robin selection:
-
-```bash
-tg-ws-proxy --cf-domain d1.example.com,d2.example.com,d3.example.com --cf-balance
-# connection 0 → tries d1, then d2, then d3
-# connection 1 → tries d2, then d3, then d1
-# connection 2 → tries d3, then d1, then d2
-```
-
-The remaining domains still serve as ordered fallbacks if the primary one
-fails, so resilience is unchanged.  Has no effect when only one CF domain is
-configured.  Can be combined with `--cf-priority`:
-
-```bash
-# Round-robin CF load balancing, tried before direct WS
-tg-ws-proxy --cf-domain d1.example.com,d2.example.com --cf-balance --cf-priority
-```
-
-**One-time domain setup** (do this in the Cloudflare dashboard):
-
-1. In **SSL/TLS → Overview** set mode to **Flexible**.
-2. In **DNS → Records** add these proxied (`🔶`) A records:
-
-   | Name      | IPv4 address      |
-   |-----------|-------------------|
-   | `kws1`    | `149.154.175.50`  |
-   | `kws1-1`  | `149.154.175.50`  |
-   | `kws2`    | `149.154.167.51`  |
-   | `kws2-1`  | `149.154.167.51`  |
-   | `kws3`    | `149.154.175.100` |
-   | `kws3-1`  | `149.154.175.100` |
-   | `kws4`    | `149.154.167.91`  |
-   | `kws4-1`  | `149.154.167.91`  |
-   | `kws5`    | `149.154.171.5`   |
-   | `kws5-1`  | `149.154.171.5`   |
-   | `kws203`  | `91.105.192.100`  |
-   | `kws203-1`| `91.105.192.100`  |
-
-See [docs/CfProxy.md](docs/CfProxy.md) for full instructions.
-
-### Cloudflare Worker
-
-Cloudflare Worker mode is an alternative to `--cf-domain` when you do not own
-a domain. Deploy the Worker script from [docs/CfWorker.md](docs/CfWorker.md),
-copy its `*.workers.dev` domain, and pass it to the proxy:
-
-```bash
-tg-ws-proxy --cf-worker-domain random-symbols-1234.username.workers.dev
-```
-
-Multiple Worker domains are supported (comma-separated or repeated flag).
-With `--cf-balance`, each new connection starts from a different Worker and
-falls back to the remaining Workers if the first one fails.
-
-```bash
-tg-ws-proxy --cf-worker-domain w1.user.workers.dev,w2.user.workers.dev --cf-balance
-```
-
-Or via environment variable:
-
-```bash
-TG_CF_WORKER_DOMAIN=random-symbols-1234.username.workers.dev tg-ws-proxy
-```
-
-The Worker accepts an outer WebSocket connection from `tg-ws-proxy-rs`, opens a
-raw TCP connection to the selected Telegram DC IP, and forwards WebSocket
-message payloads as TCP bytes:
-
-```
-tg-ws-proxy-rs → wss://<worker>/apiws?dst=<dc-ip>&dc=<dc>&media=<0|1>
-Cloudflare Worker → TCP <dc-ip>:443
-```
-
-For DCs with a configured direct WebSocket target, direct WS is tried first and
-the Worker is used only after that path fails. For DCs without a direct WS
-target, the Worker is tried before the regular Cloudflare proxy/default
-domains and the remaining fallbacks.
-
-### Domain fronting
-
-If direct WebSocket connections to Telegram keep timing out — a common sign
-of SNI-based DPI blocking — the proxy can fall back to **domain fronting**:
-presenting an unrelated, presumably-unblocked domain as the TLS SNI while
-still connecting to the real Telegram DC IP and using the real DC domain as
-the HTTP `Host`. DPI that filters by SNI sees the fronted name; the actual
-(TLS-encrypted) request still reaches Telegram normally.
-
-```bash
-tg-ws-proxy --dc-ip 2:149.154.167.220 --fronting-domain sprinthost.ru
-```
-
-**Only takes effect when `--dc-ip` is configured for a DC** — this matches
-upstream tg-ws-proxy exactly: fronting is purely a direct-connection
-technique and is never applied to CF proxy, CF Worker, or upstream MTProto
-proxy connections (see their respective sections below). If you rely solely
-on `--cf-domain`/`--default-domains` — the common way to route around a
-block, and what suppresses the built-in `--dc-ip` default (see the
-`--dc-ip` row above) — `--fronting-domain` has no effect, by design.
-Upstream's own guidance for a network that blocks Telegram's IPs outright
-(where fronting can't help either, since it still needs a real TCP
-connection to that IP) is to leave `--dc-ip` unset entirely.
-
-Disabled unless `--fronting-domain` is set. Once a fronted connection
-succeeds, the fallback stays active (including for background connection-pool
-refills) for `--fronting-cooldown` seconds (default 1800 = 30 min), so the
-proxy doesn't keep re-probing the likely-still-blocked direct path on every
-new connection. If a fronting attempt fails, `--fronting-fail-cooldown`
-seconds (default 60) pass before it's retried for that DC — otherwise a
-network where fronting can never succeed (e.g. the DC IP itself is blocked)
-would pay for a doomed attempt on every single connection.
-
-> **Note:** TLS certificate verification is unconditionally skipped on
-> connections using this fallback, regardless of
-> `--danger-accept-invalid-certs` — the real Telegram certificate can never
-> match a fronted SNI, so hostname verification would always fail. This is
-> inherent to the technique, not a bug, and only applies to the direct-WS
-> fallback path (not CF proxy/Worker connections).
-
-### Default domains
-
-Don't want to configure your own Cloudflare DNS zone?  Use `--default-domains`
-to automatically fetch a pre-configured, working list of CF proxy domains from
-the upstream repository:
-
-```bash
-# No Cloudflare account or DNS setup required
-tg-ws-proxy --default-domains
-
-# Enable CF priority so CF path is tried first
-tg-ws-proxy --default-domains --cf-priority
-
-# Combine with your own domain (yours gets highest priority)
-tg-ws-proxy --cf-domain yourdomain.com --default-domains
-
-# Test the fetched domains before starting the proxy
-tg-ws-proxy --default-domains --check
-```
-
-Or via environment variable:
-
-```bash
-TG_DEFAULT_DOMAINS=true tg-ws-proxy
-```
-
-At startup the proxy fetches an obfuscated domain list from
-[Flowseal/tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy/blob/main/.github/cfproxy-domains.txt),
-deobfuscates it, and appends the decoded domains after any explicit
-`--cf-domain` entries.  If the fetch fails (network not yet available,
-GitHub unreachable) the proxy falls back to a small built-in list and logs a
-warning — it will still start normally.
-
-> **Note:** These are community-maintained domains; availability may change
-> over time.  For maximum reliability, consider setting up your own
-> Cloudflare zone (see [docs/CfProxy.md](docs/CfProxy.md)).
-
-### Router deployment
-
-Run the proxy on your router without `--host` (or with `--host 0.0.0.0`) so
-it accepts connections from all LAN devices:
-
-```bash
-tg-ws-proxy --port 1443
-```
-
-When no `--host` is given and a LAN IP can be auto-detected, the proxy binds
-`0.0.0.0` (all interfaces) and uses the detected LAN IP in the generated
-`tg://` link, so the link is actually reachable and you can share it with
-every device on your network.
-
-If auto-detection picks the wrong interface, override it explicitly:
-
-```bash
-tg-ws-proxy --host 0.0.0.0 --link-ip 192.168.1.1
-```
-
-> **Note:** Passing `--host 127.0.0.1` explicitly restricts connections to the
-> machine running the proxy. Other devices on the network will not be able to
-> connect unless you use `0.0.0.0` (or omit `--host` entirely) so it binds to
-> the router's LAN IP.
-
-## Telegram Desktop Setup
-
-1. **Settings → Advanced → Connection type → Use custom proxy**
-2. Add MTProto proxy:
-   - **Server:** `127.0.0.1`
-   - **Port:** `1443` (or your `--port`)
-   - **Secret:** shown in the proxy startup log
-
-Or use the `tg://proxy?...` link that is printed on startup.
-
-## Cross-compilation for OpenWrt
-
-OpenWrt uses musl libc and runs on MIPS, ARM, and ARM64 CPUs.  Building a
-fully static Rust binary requires:
-
-1. A C cross-compiler for your target (used by `ring`/`aws-lc-sys`)
-2. The matching Rust target
-
-### ARM64 (aarch64) — e.g. GL.iNet MT6000, Banana Pi R4
-
-```bash
-# Install the cross toolchain (Ubuntu/Debian)
-apt-get install gcc-aarch64-linux-gnu
-
-# Add the Rust target
-rustup target add aarch64-unknown-linux-musl
-
-# Uncomment the [target.aarch64-unknown-linux-musl] section in .cargo/config.toml,
-# then build:
-cargo build --release --target aarch64-unknown-linux-musl
-```
-
-### ARM (armv7) — e.g. older GL.iNet routers, some TP-Link models
-
-```bash
-apt-get install gcc-arm-linux-gnueabihf
-rustup target add armv7-unknown-linux-musleabihf
-# Uncomment the armv7 section in .cargo/config.toml
-cargo build --release --target armv7-unknown-linux-musleabihf
-```
-
-### MIPS LE — e.g. TP-Link WR series
-
-```bash
-apt-get install gcc-mipsel-linux-gnu
-rustup target add mipsel-unknown-linux-musl
-# Uncomment the mipsel section in .cargo/config.toml
-cargo build --release --target mipsel-unknown-linux-musl
-```
-
-### Using `cross` (easier alternative)
-
-[`cross`](https://github.com/cross-rs/cross) uses Docker to manage toolchains:
-
-```bash
-cargo install cross
-cross build --release --target aarch64-unknown-linux-musl
-```
-
-### OpenWrt procd init script
-
-Create `/etc/init.d/tg-ws-proxy`:
-
-```sh
-#!/bin/sh /etc/rc.common
-USE_PROCD=1
-START=90
-STOP=10
-
-PROG=/usr/local/bin/tg-ws-proxy
-
-start_service() {
-    procd_open_instance
-    procd_set_param command "$PROG" --host 0.0.0.0 --port 1443
-    procd_set_param respawn
-    procd_set_param stdout 1
-    procd_set_param stderr 1
-    procd_close_instance
-}
-```
-
-```bash
-chmod +x /etc/init.d/tg-ws-proxy
-/etc/init.d/tg-ws-proxy enable
-/etc/init.d/tg-ws-proxy start
 ```
 
 ## How it works
@@ -648,77 +173,25 @@ chmod +x /etc/init.d/tg-ws-proxy
    IP).
 4. The relay init packet is sent to Telegram, and bidirectional bridging
    begins with AES-256-CTR re-encryption (client keys ↔ relay keys).
-5. If WebSocket is unavailable and Cloudflare Worker is configured, the proxy can open
-   `wss://<worker>/apiws?dst=<dc-ip>` and tunnel raw TCP traffic to the DC via
-   the Worker.
-6. If Worker is unavailable or not configured, the proxy tries the Cloudflare
-   proxy path (`wss://kwsN.{cf-domain}/apiws`) if `--cf-domain` is configured.
-7. If CF paths are unavailable or not configured, each upstream MTProto proxy
-   is tried in order (generating a fresh client handshake with the upstream's
-   secret so it can route to the correct DC).
-8. If no upstream proxy is configured or all fail, the proxy falls back to
-   direct TCP on port 443.
-9. A small pool of pre-connected WebSocket connections is maintained per DC to
+5. If that path fails, each configured fallback tier is tried in turn —
+   Cloudflare Worker, Cloudflare proxy, upstream MTProto proxy, then direct
+   TCP on port 443.
+6. A small pool of pre-connected WebSocket connections is maintained per DC to
    reduce connection latency for subsequent clients.
 
-## Project structure
+The tier order, how to configure each one, and when a failing tier goes into
+cooldown are all documented in [docs/Fallbacks.md](docs/Fallbacks.md).
 
-```
-src/
-  main.rs              — Entry point, CLI parsing, server startup, banner
-  config.rs            — ProxyConfig struct, argument parsing, env-var aliases
-  crypto.rs            — MTProto obfuscation: handshake parsing, relay init generation,
-                         AES-256-CTR key derivation and cipher construction
-  splitter.rs          — MTProto packet splitter for correct WebSocket framing
-  ws_client.rs         — WebSocket client for Telegram DC connections (IP routing + SNI)
-  pool.rs              — Pre-warmed WebSocket connection pool per DC
-  proxy.rs             — Client handler, re-encryption bridge, TCP fallback logic
-  default_domains.rs   — Fetches and deobfuscates the default CF proxy domain list
-docs/
-  CfProxy.md           — Cloudflare DNS proxy setup
-  CfWorker.md          — Cloudflare Worker TCP tunnel setup
-.cargo/
-  config.toml          — Cross-compilation target presets (commented out)
-```
+## Documentation
 
-## Configuration via environment
-
-```bash
-TG_HOST=0.0.0.0
-TG_PORT=1443
-TG_SECRET=0123456789abcdef0123456789abcdef
-TG_POOL_SIZE=4
-TG_BUF_KB=256
-TG_MAX_CONNECTIONS=64
-TG_QUIET=true
-TG_VERBOSE=false
-TG_CF_DOMAIN=yourdomain.com
-TG_CF_WORKER_DOMAIN=random-symbols-1234.username.workers.dev
-TG_CF_PRIORITY=false
-TG_CF_BALANCE=false
-TG_DEFAULT_DOMAINS=false
-TG_OUTBOUND_PROXY=socks5h://user:pass@192.168.1.1:1080
-TG_NO_OUTBOUND_PROXY=false
-TG_NO_PROXY=localhost,127.0.0.1
-TG_LOG_FILE=/var/log/tg-ws-proxy.log
-TG_MTPROTO_PROXY=proxy.example.com:443:ddabcdef1234567890abcdef1234567890
-```
-
-## Windows console — no garbled characters
-
-On Windows the console does not enable ANSI/VT colour codes by default, which
-caused log lines to show symbols like `←[32m` around the log level.  This is
-fixed: ANSI escape codes are automatically disabled when running on Windows or
-when stderr is not a terminal (e.g. output is piped or redirected).
-
-If you prefer completely clean logs or want to capture them to a file, use
-`--log-file`:
-
-```bash
-tg-ws-proxy --log-file proxy.log
-# or
-set TG_LOG_FILE=proxy.log && tg-ws-proxy
-```
+| Guide | Covers |
+|---|---|
+| [docs/Fallbacks.md](docs/Fallbacks.md) | Routing tiers: Cloudflare proxy/Worker, default domains, domain fronting, upstream MTProto proxies, inbound FakeTLS, outbound proxy |
+| [docs/Building.md](docs/Building.md) | Building, cross-compiling for OpenWrt, and shrinking the binary with UPX |
+| [docs/Deployment.md](docs/Deployment.md) | Docker, router deployment, OpenWrt init script, environment variables |
+| [docs/CfProxy.md](docs/CfProxy.md) | Cloudflare DNS proxy setup, step by step |
+| [docs/CfWorker.md](docs/CfWorker.md) | Cloudflare Worker TCP tunnel setup |
+| [AGENTS.md](AGENTS.md) | Repository layout and conventions for contributors |
 
 ## License
 

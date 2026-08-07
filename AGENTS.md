@@ -36,7 +36,9 @@ src/
 
 tests/                   Integration tests (one file per subsystem, mirrors src/ module names)
 tests/common/mod.rs      Shared integration fixtures (fake HTTP CONNECT proxy, proxy-connection driver)
-docs/                    CfProxy.md, CfWorker.md — setup guides for Cloudflare-based fallback routing
+docs/                    User-facing guides. README stays an overview and links here rather than growing:
+                         Fallbacks.md (routing tiers), Building.md (cross-compiling, UPX), Deployment.md
+                         (Docker, OpenWrt, env vars), CfProxy.md + CfWorker.md (Cloudflare setup)
 ```
 
 Modules whose *private* internals need testing keep a `#[cfg(test)] mod tests;` in a sibling
