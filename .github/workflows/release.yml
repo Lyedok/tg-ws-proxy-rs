@@ -93,3 +93,90 @@ jobs:
                   cp "target/${{ matrix.target }}/release/tg-ws-proxy" "${TMPDIR}/tg-ws-proxy"
                   tar -C "${TMPDIR}" -czf "${NAME}.tar.gz" tg-ws-proxy
                   gh release upload "$TAG" "${NAME}.tar.gz" --clobber
+
+    # Extra UPX-packed assets for flash-constrained devices (OpenWrt routers).
+    #
+    # These do not replace the plain assets: packing trades RAM for flash. A
+    # normal ELF maps its text from the file, so only the working set is
+    # resident and those pages can be evicted under pressure; the UPX stub
+    # decompresses the whole image into anonymous memory instead, which on a
+    # router with no swap stays resident for the life of the process. Good deal
+    # on a 128 MB device with 8 MB of flash, bad one on a 32 MB device — so the
+    # choice belongs to whoever is doing the flashing.
+    #
+    # Windows and macOS are deliberately excluded: UPX-packed PE files trip
+    # antivirus heuristics, which is unacceptable for a censorship-circumvention
+    # tool, and packing a Mach-O invalidates its signature so arm64 macOS
+    # refuses to run it at all.
+    compress-assets:
+        needs: upload-assets
+        # Not `success()`: upload-assets covers Windows and macOS too, and a
+        # hiccup there should not silently drop every `-upx` asset. Each leg
+        # below fails on its own if its plain asset never made it to the release.
+        if: ${{ !cancelled() }}
+        runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - target: mipsel-unknown-linux-musl
+                      qemu: qemu-mipsel-static
+                    - target: mips-unknown-linux-musl
+                      qemu: qemu-mips-static
+                    - target: armv7-unknown-linux-musleabihf
+                      qemu: qemu-arm-static
+                    - target: aarch64-unknown-linux-musl
+                      qemu: qemu-aarch64-static
+                    - target: x86_64-unknown-linux-musl
+                      qemu: qemu-x86_64-static
+        steps:
+            - name: Install UPX and qemu-user-static
+              env:
+                  UPX_VERSION: 5.2.0
+                  UPX_SHA256: 3db5d3294707439db97866feab8d75d800f028f48481a40547411824da4288a1
+              shell: bash
+              run: |
+                  set -euxo pipefail
+                  curl -fsSL -o upx.tar.xz \
+                      "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/upx-${UPX_VERSION}-amd64_linux.tar.xz"
+                  echo "${UPX_SHA256}  upx.tar.xz" | sha256sum -c -
+                  tar -xJf upx.tar.xz
+                  sudo install -m 0755 "upx-${UPX_VERSION}-amd64_linux/upx" /usr/local/bin/upx
+                  sudo apt-get update
+                  sudo apt-get install -y qemu-user-static
+
+            - name: Pack, verify and upload
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              shell: bash
+              run: |
+                  set -euxo pipefail
+                  TAG="${GITHUB_REF_NAME}"
+                  NAME="tg-ws-proxy-${{ matrix.target }}"
+                  WORK="$(mktemp -d)"
+
+                  gh release download "$TAG" --repo "${GITHUB_REPOSITORY}" \
+                      --pattern "${NAME}.tar.gz" --dir "$WORK"
+                  tar -C "$WORK" -xzf "${WORK}/${NAME}.tar.gz"
+                  test -f "${WORK}/tg-ws-proxy"
+
+                  # Smoke-test the stock binary first. If this fails the emulator
+                  # is the problem, not UPX, and the post-pack check below would
+                  # be measuring nothing.
+                  ${{ matrix.qemu }} "${WORK}/tg-ws-proxy" --help > "${WORK}/help-plain.txt"
+                  grep -q "Usage: tg-ws-proxy" "${WORK}/help-plain.txt"
+                  BEFORE="$(stat -c %s "${WORK}/tg-ws-proxy")"
+
+                  upx -9 --lzma "${WORK}/tg-ws-proxy"
+                  upx -t "${WORK}/tg-ws-proxy"
+
+                  # `upx -t` only proves the payload round-trips. The failure that
+                  # actually reaches users is a stub that packs clean and then dies
+                  # on the target ABI, so run the packed binary for real.
+                  ${{ matrix.qemu }} "${WORK}/tg-ws-proxy" --help > "${WORK}/help-packed.txt"
+                  grep -q "Usage: tg-ws-proxy" "${WORK}/help-packed.txt"
+                  AFTER="$(stat -c %s "${WORK}/tg-ws-proxy")"
+                  echo "${{ matrix.target }}: ${BEFORE} -> ${AFTER} bytes on flash"
+
+                  tar -C "$WORK" -czf "${NAME}-upx.tar.gz" tg-ws-proxy
+                  gh release upload "$TAG" "${NAME}-upx.tar.gz" --clobber

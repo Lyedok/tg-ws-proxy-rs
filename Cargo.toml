@@ -1,6 +1,6 @@
 [package]
 name = "tg-ws-proxy-rs"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 description = "Telegram MTProto WebSocket Bridge Proxy — Rust port of Flowseal/tg-ws-proxy"
 license = "MIT"
@@ -17,7 +17,18 @@ path = "src/main.rs"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+# Only the features actually reached from src/ and tests/. `full` additionally
+# pulls in fs/process/signal; LTO strips the unused code either way (~16 KB), so
+# this is about the dependency tree, not the binary — it drops parking_lot,
+# signal-hook-registry and six more transitive crates.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+] }
 
 # WebSocket protocol with TLS support
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
