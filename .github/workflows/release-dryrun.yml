@@ -66,6 +66,8 @@ jobs:
             # the same target ABI, which is what the packing check needs.
             - name: Build (build-std)
               if: matrix.build_std
+              env:
+                  RUSTFLAGS: -C target-feature=+crt-static -C link-self-contained=no
               run: cross +nightly build --release --bin tg-ws-proxy --target ${{ matrix.target }} -Z build-std=std,panic_abort
 
             - name: Build
@@ -93,17 +95,11 @@ jobs:
                   file "$BIN"
                   readelf -d "$BIN" | grep NEEDED || echo "no dynamic dependencies"
 
-            # Unlike release.yml, the dynamically linked mips targets are executed
-            # here too -- this is the place to carry the extra machinery, and it
-            # is what makes `qemu: none` in the release matrix acceptable.
             - name: Pack and verify
               run: |
                   set -euxo pipefail
-                  BIN="target/${{ matrix.target }}/release/tg-ws-proxy"
-                  PREFIX="$(.github/scripts/prepare-qemu-sysroot.sh "$BIN" \
-                      "ghcr.io/cross-rs/${{ matrix.target }}:main" "$PWD/qemu-sysroot")"
-                  QEMU_LD_PREFIX="$PREFIX" \
-                      .github/scripts/pack-verify.sh "$BIN" ${{ matrix.qemu }}
+                  .github/scripts/pack-verify.sh \
+                      "target/${{ matrix.target }}/release/tg-ws-proxy" ${{ matrix.qemu }}
 
             - uses: actions/upload-artifact@v4
               with:

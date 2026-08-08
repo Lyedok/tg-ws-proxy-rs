@@ -65,19 +65,28 @@ jobs:
               if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
               run: cargo install cross --locked
 
-            # These two do NOT come out statically linked: `crt-static` is not the
-            # default on the mips musl targets the way it is on every other musl
-            # target here, and it cannot simply be switched on -- the cross image's
-            # mipsel-linux-muslsf-gcc ships no static CRT objects, so the link dies
-            # on a missing crtn.o. The result needs /lib/ld-musl-mips*-sf.so.1 on
-            # the device, which OpenWrt has and some other firmwares do not. See
-            # release-dryrun.yml for a stand to try a fix on without cutting a tag.
+            # `crt-static` is not the default on the mips musl targets the way it
+            # is on every other musl target here, and switching it on alone fails:
+            # rustc then names crt1.o/crti.o/crtn.o out of the self-contained
+            # directory that ships with rust-std, which these tier-3 targets do not
+            # have and -Z build-std does not produce. `link-self-contained=no` hands
+            # that job back to gcc, which does have them, and leaves rustc asking
+            # for -lunwind -- the LLVM unwinder, where these images carry GCC's
+            # libgcc_eh.a. Cross.toml aliases the one to the other.
+            #
+            # Without this the binaries need /lib/ld-musl-mips*-sf.so.1 and
+            # libgcc_s.so.1 on the device. OpenWrt has both; other firmware does
+            # not, which is what made this proxy unrunnable there.
             - name: Build (mipsel, build-std)
               if: matrix.target == 'mipsel-unknown-linux-musl'
+              env:
+                  RUSTFLAGS: -C target-feature=+crt-static -C link-self-contained=no
               run: cross +nightly build --release --bin tg-ws-proxy --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
 
             - name: Build (mips, build-std)
               if: matrix.target == 'mips-unknown-linux-musl'
+              env:
+                  RUSTFLAGS: -C target-feature=+crt-static -C link-self-contained=no
               run: cross +nightly build --release --bin tg-ws-proxy --target mips-unknown-linux-musl -Z build-std=std,panic_abort
 
             - name: Inspect build output (mips variants)
@@ -87,7 +96,15 @@ jobs:
                   ls -lah "target/${{ matrix.target }}/release/" || true
                   test -f "$FILE"
                   file "$FILE"
-                  readelf -d "$FILE" | grep NEEDED || echo "no dynamic dependencies"
+
+                  # Nothing downstream would catch a regression here: a dynamic
+                  # build still runs fine on OpenWrt, which is exactly how this
+                  # shipped unnoticed for as long as it did.
+                  if readelf -d "$FILE" | grep -q NEEDED; then
+                      echo "::error::$FILE is dynamically linked; expected a static binary"
+                      readelf -d "$FILE" | grep NEEDED
+                      exit 1
+                  fi
 
             - name: Upload to GitHub Release (mips variants)
               if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
@@ -128,16 +145,10 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    # `none` = pack and `upx -t`, but no execution check. These
-                    # two are dynamically linked, so running them needs a sysroot
-                    # built from a container image, which is more moving parts
-                    # than belongs in the path of a public release.
-                    # release-dryrun.yml does execute them, on the same artifact
-                    # through the same UPX call, and is the gate for this.
                     - target: mipsel-unknown-linux-musl
-                      qemu: none
+                      qemu: qemu-mipsel-static
                     - target: mips-unknown-linux-musl
-                      qemu: none
+                      qemu: qemu-mips-static
                     - target: armv7-unknown-linux-musleabihf
                       qemu: qemu-arm-static
                     - target: aarch64-unknown-linux-musl
