@@ -100,6 +100,31 @@ builds them on nightly with `-Z build-std=std,panic_abort` under
 [`cross`](https://github.com/cross-rs/cross). Do the same locally if a plain
 `cargo build` complains about a missing `std` for the target.
 
+They also need two extra flags to come out static, because `crt-static` is not
+their default the way it is for every other musl target:
+
+```bash
+RUSTFLAGS="-C target-feature=+crt-static -C link-self-contained=no" \
+cross +nightly build --release --bin tg-ws-proxy \
+  --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
+```
+
+`link-self-contained=no` is the non-obvious half. Turning on `crt-static` alone
+makes rustc reach for `crt1.o`/`crti.o`/`crtn.o` from the `self-contained`
+directory that ships with `rust-std` — which tier-3 targets do not have and
+`-Z build-std` does not produce, so the link fails on missing files. Handing
+that job back to gcc fixes it, and then leaves rustc asking the linker for
+`-lunwind`: the LLVM unwinder, where these GCC toolchains carry `libgcc_eh.a`.
+`Cross.toml` in the repo root aliases one to the other in the container. A
+toolchain of your own needs the same alias somewhere on its library path.
+
+Verify the result rather than assuming it — `readelf -d` should print no
+`NEEDED` entries at all:
+
+```bash
+readelf -d target/mipsel-unknown-linux-musl/release/tg-ws-proxy | grep NEEDED
+```
+
 ### Using `cross` (easier alternative)
 
 [`cross`](https://github.com/cross-rs/cross) uses Docker to manage toolchains,
