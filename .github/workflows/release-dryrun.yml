@@ -93,13 +93,17 @@ jobs:
                   file "$BIN"
                   readelf -d "$BIN" | grep NEEDED || echo "no dynamic dependencies"
 
+            # Unlike release.yml, the dynamically linked mips targets are executed
+            # here too -- this is the place to carry the extra machinery, and it
+            # is what makes `qemu: none` in the release matrix acceptable.
             - name: Pack and verify
               run: |
                   set -euxo pipefail
                   BIN="target/${{ matrix.target }}/release/tg-ws-proxy"
-                  .github/scripts/install-musl-loader.sh "$BIN" \
-                      "ghcr.io/cross-rs/${{ matrix.target }}:main"
-                  .github/scripts/pack-verify.sh "$BIN" ${{ matrix.qemu }}
+                  PREFIX="$(.github/scripts/prepare-qemu-sysroot.sh "$BIN" \
+                      "ghcr.io/cross-rs/${{ matrix.target }}:main" "$PWD/qemu-sysroot")"
+                  QEMU_LD_PREFIX="$PREFIX" \
+                      .github/scripts/pack-verify.sh "$BIN" ${{ matrix.qemu }}
 
             - uses: actions/upload-artifact@v4
               with:

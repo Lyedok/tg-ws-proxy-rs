@@ -128,10 +128,16 @@ jobs:
             fail-fast: false
             matrix:
                 include:
+                    # `none` = pack and `upx -t`, but no execution check. These
+                    # two are dynamically linked, so running them needs a sysroot
+                    # built from a container image, which is more moving parts
+                    # than belongs in the path of a public release.
+                    # release-dryrun.yml does execute them, on the same artifact
+                    # through the same UPX call, and is the gate for this.
                     - target: mipsel-unknown-linux-musl
-                      qemu: qemu-mipsel-static
+                      qemu: none
                     - target: mips-unknown-linux-musl
-                      qemu: qemu-mips-static
+                      qemu: none
                     - target: armv7-unknown-linux-musleabihf
                       qemu: qemu-arm-static
                     - target: aarch64-unknown-linux-musl
@@ -173,10 +179,6 @@ jobs:
                       --pattern "${NAME}.tar.gz" --dir "$WORK"
                   tar -C "$WORK" -xzf "${WORK}/${NAME}.tar.gz"
                   test -f "${WORK}/tg-ws-proxy"
-
-                  # No-op for the statically linked targets.
-                  .github/scripts/install-musl-loader.sh "${WORK}/tg-ws-proxy" \
-                      "ghcr.io/cross-rs/${{ matrix.target }}:main"
 
                   .github/scripts/pack-verify.sh "${WORK}/tg-ws-proxy" ${{ matrix.qemu }}
 
