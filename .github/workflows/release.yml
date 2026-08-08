@@ -65,13 +65,26 @@ jobs:
               if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
               run: cargo install cross --locked
 
+            # `+crt-static` is not the default on the mips musl targets the way it
+            # is on every other musl target we ship, so without it these two come
+            # out dynamically linked against /lib/ld-musl-mips*-sf.so.1 — which
+            # contradicts the static binary the docs promise, and breaks outright
+            # if the device's musl variant does not match. Set through --config
+            # rather than RUSTFLAGS so it does not depend on `cross` forwarding
+            # env vars into the container, and applied to std as well via build-std.
             - name: Build (mipsel, build-std)
               if: matrix.target == 'mipsel-unknown-linux-musl'
-              run: cross +nightly build --release --bin tg-ws-proxy --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
+              run: |
+                  cross +nightly build --release --bin tg-ws-proxy \
+                      --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort \
+                      --config 'target.mipsel-unknown-linux-musl.rustflags=["-C","target-feature=+crt-static"]'
 
             - name: Build (mips, build-std)
               if: matrix.target == 'mips-unknown-linux-musl'
-              run: cross +nightly build --release --bin tg-ws-proxy --target mips-unknown-linux-musl -Z build-std=std,panic_abort
+              run: |
+                  cross +nightly build --release --bin tg-ws-proxy \
+                      --target mips-unknown-linux-musl -Z build-std=std,panic_abort \
+                      --config 'target.mips-unknown-linux-musl.rustflags=["-C","target-feature=+crt-static"]'
 
             - name: Inspect build output (mips variants)
               if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
@@ -79,6 +92,15 @@ jobs:
                   FILE="target/${{ matrix.target }}/release/tg-ws-proxy"
                   ls -lah "target/${{ matrix.target }}/release/" || true
                   test -f "$FILE"
+
+                  # Fail loudly rather than shipping a binary that needs a musl
+                  # loader on the device. A dynamic build still runs on OpenWrt,
+                  # so nothing downstream would have caught this.
+                  file "$FILE"
+                  if readelf -d "$FILE" | grep -q NEEDED; then
+                      echo "::error::$FILE is dynamically linked; expected a static binary"
+                      exit 1
+                  fi
 
             - name: Upload to GitHub Release (mips variants)
               if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
@@ -179,4 +201,5 @@ jobs:
                   echo "${{ matrix.target }}: ${BEFORE} -> ${AFTER} bytes on flash"
 
                   tar -C "$WORK" -czf "${NAME}-upx.tar.gz" tg-ws-proxy
-                  gh release upload "$TAG" "${NAME}-upx.tar.gz" --clobber
+                  gh release upload "$TAG" "${NAME}-upx.tar.gz" \
+                      --repo "${GITHUB_REPOSITORY}" --clobber
