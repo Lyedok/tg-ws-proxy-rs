@@ -65,26 +65,20 @@ jobs:
               if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
               run: cargo install cross --locked
 
-            # `+crt-static` is not the default on the mips musl targets the way it
-            # is on every other musl target we ship, so without it these two come
-            # out dynamically linked against /lib/ld-musl-mips*-sf.so.1 — which
-            # contradicts the static binary the docs promise, and breaks outright
-            # if the device's musl variant does not match. Set through --config
-            # rather than RUSTFLAGS so it does not depend on `cross` forwarding
-            # env vars into the container, and applied to std as well via build-std.
+            # These two do NOT come out statically linked: `crt-static` is not the
+            # default on the mips musl targets the way it is on every other musl
+            # target here, and it cannot simply be switched on -- the cross image's
+            # mipsel-linux-muslsf-gcc ships no static CRT objects, so the link dies
+            # on a missing crtn.o. The result needs /lib/ld-musl-mips*-sf.so.1 on
+            # the device, which OpenWrt has and some other firmwares do not. See
+            # release-dryrun.yml for a stand to try a fix on without cutting a tag.
             - name: Build (mipsel, build-std)
               if: matrix.target == 'mipsel-unknown-linux-musl'
-              run: |
-                  cross +nightly build --release --bin tg-ws-proxy \
-                      --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort \
-                      --config 'target.mipsel-unknown-linux-musl.rustflags=["-C","target-feature=+crt-static"]'
+              run: cross +nightly build --release --bin tg-ws-proxy --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
 
             - name: Build (mips, build-std)
               if: matrix.target == 'mips-unknown-linux-musl'
-              run: |
-                  cross +nightly build --release --bin tg-ws-proxy \
-                      --target mips-unknown-linux-musl -Z build-std=std,panic_abort \
-                      --config 'target.mips-unknown-linux-musl.rustflags=["-C","target-feature=+crt-static"]'
+              run: cross +nightly build --release --bin tg-ws-proxy --target mips-unknown-linux-musl -Z build-std=std,panic_abort
 
             - name: Inspect build output (mips variants)
               if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
@@ -92,15 +86,8 @@ jobs:
                   FILE="target/${{ matrix.target }}/release/tg-ws-proxy"
                   ls -lah "target/${{ matrix.target }}/release/" || true
                   test -f "$FILE"
-
-                  # Fail loudly rather than shipping a binary that needs a musl
-                  # loader on the device. A dynamic build still runs on OpenWrt,
-                  # so nothing downstream would have caught this.
                   file "$FILE"
-                  if readelf -d "$FILE" | grep -q NEEDED; then
-                      echo "::error::$FILE is dynamically linked; expected a static binary"
-                      exit 1
-                  fi
+                  readelf -d "$FILE" | grep NEEDED || echo "no dynamic dependencies"
 
             - name: Upload to GitHub Release (mips variants)
               if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
@@ -141,10 +128,16 @@ jobs:
             fail-fast: false
             matrix:
                 include:
+                    # `none` = pack and `upx -t`, but no execution check. These
+                    # two are dynamically linked, so running them needs a sysroot
+                    # built from a container image, which is more moving parts
+                    # than belongs in the path of a public release.
+                    # release-dryrun.yml does execute them, on the same artifact
+                    # through the same UPX call, and is the gate for this.
                     - target: mipsel-unknown-linux-musl
-                      qemu: qemu-mipsel-static
+                      qemu: none
                     - target: mips-unknown-linux-musl
-                      qemu: qemu-mips-static
+                      qemu: none
                     - target: armv7-unknown-linux-musleabihf
                       qemu: qemu-arm-static
                     - target: aarch64-unknown-linux-musl
@@ -152,6 +145,11 @@ jobs:
                     - target: x86_64-unknown-linux-musl
                       qemu: qemu-x86_64-static
         steps:
+            # Only the scripts are needed, not a full working tree -- but `gh`
+            # also refuses to infer the repository without one, hence --repo on
+            # every gh call below.
+            - uses: actions/checkout@v6
+
             - name: Install UPX and qemu-user-static
               env:
                   UPX_VERSION: 5.2.0
@@ -182,23 +180,7 @@ jobs:
                   tar -C "$WORK" -xzf "${WORK}/${NAME}.tar.gz"
                   test -f "${WORK}/tg-ws-proxy"
 
-                  # Smoke-test the stock binary first. If this fails the emulator
-                  # is the problem, not UPX, and the post-pack check below would
-                  # be measuring nothing.
-                  ${{ matrix.qemu }} "${WORK}/tg-ws-proxy" --help > "${WORK}/help-plain.txt"
-                  grep -q "Usage: tg-ws-proxy" "${WORK}/help-plain.txt"
-                  BEFORE="$(stat -c %s "${WORK}/tg-ws-proxy")"
-
-                  upx -9 --lzma "${WORK}/tg-ws-proxy"
-                  upx -t "${WORK}/tg-ws-proxy"
-
-                  # `upx -t` only proves the payload round-trips. The failure that
-                  # actually reaches users is a stub that packs clean and then dies
-                  # on the target ABI, so run the packed binary for real.
-                  ${{ matrix.qemu }} "${WORK}/tg-ws-proxy" --help > "${WORK}/help-packed.txt"
-                  grep -q "Usage: tg-ws-proxy" "${WORK}/help-packed.txt"
-                  AFTER="$(stat -c %s "${WORK}/tg-ws-proxy")"
-                  echo "${{ matrix.target }}: ${BEFORE} -> ${AFTER} bytes on flash"
+                  .github/scripts/pack-verify.sh "${WORK}/tg-ws-proxy" ${{ matrix.qemu }}
 
                   tar -C "$WORK" -czf "${NAME}-upx.tar.gz" tg-ws-proxy
                   gh release upload "$TAG" "${NAME}-upx.tar.gz" \
