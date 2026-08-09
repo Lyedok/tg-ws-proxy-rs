@@ -9,6 +9,16 @@ on:
             - v[0-9]+.*
 
 jobs:
+    # Created as a draft: the assets below take minutes to build, and a
+    # published release with no binaries under it is worse than no release yet.
+    # `publish-release` flips it once every asset has landed.
+    #
+    # The body comes from the notes committed alongside the version bump, so a
+    # release cannot ship with the previous version's text or none at all --
+    # `allow-missing-changelog` stays false, which fails the release instead.
+    # The heading in that file must be a bare `# vX.Y.Z`: parse-changelog does
+    # not recognise a version heading carrying the crate name, with or without
+    # `prefix-format`. The name lives in `title` instead.
     create-release:
         runs-on: ubuntu-latest
         steps:
@@ -16,6 +26,9 @@ jobs:
             - uses: taiki-e/create-gh-release-action@v1
               with:
                   token: ${{ secrets.GITHUB_TOKEN }}
+                  changelog: docs/release-notes/$version.md
+                  title: tg-ws-proxy-rs $tag
+                  draft: true
 
     upload-assets:
         needs: create-release
@@ -196,3 +209,18 @@ jobs:
                   tar -C "$WORK" -czf "${NAME}-upx.tar.gz" tg-ws-proxy
                   gh release upload "$TAG" "${NAME}-upx.tar.gz" \
                       --repo "${GITHUB_REPOSITORY}" --clobber
+
+    # Both `needs` must succeed, so a target that failed to build leaves the
+    # release a draft rather than publishing a half-populated one. Finish the
+    # job by hand (or re-run the failed leg) and the draft is still there.
+    publish-release:
+        needs: [upload-assets, compress-assets]
+        runs-on: ubuntu-latest
+        steps:
+            - name: Publish the draft now that every asset is uploaded
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  set -euxo pipefail
+                  gh release edit "${GITHUB_REF_NAME}" \
+                      --repo "${GITHUB_REPOSITORY}" --draft=false

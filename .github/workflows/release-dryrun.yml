@@ -139,6 +139,25 @@ jobs:
                       --json assets --jq '.assets[].name' | tee assets.txt
                   grep -q "tg-ws-proxy-dryrun-upx.tar.gz" assets.txt
 
+            # release.yml addresses a draft by tag name in two more places, and
+            # the REST endpoint gh resolves a tag through does not return drafts
+            # -- it relies on gh's fallback over the release list. Exercise both
+            # here so a change in that behaviour surfaces on a pull request and
+            # not on a tag: `compress-assets` downloads the plain asset out of
+            # the still-draft release, and `publish-release` edits it.
+            - name: Confirm a draft can be downloaded from and edited by tag
+              run: |
+                  set -euxo pipefail
+                  gh release download "$DRY_TAG" --repo "${GITHUB_REPOSITORY}" \
+                      --pattern "tg-ws-proxy-dryrun-upx.tar.gz" --dir downloaded
+                  test -s downloaded/tg-ws-proxy-dryrun-upx.tar.gz
+
+                  # Not --draft=false: publishing would create the git tag
+                  # dryrun-<id> in the repository. Any other edit proves the
+                  # same resolution path.
+                  gh release edit "$DRY_TAG" --repo "${GITHUB_REPOSITORY}" \
+                      --title "dry run ${{ github.run_id }} (edited)"
+
             - name: Delete the draft
               if: always()
               run: gh release delete "$DRY_TAG" --repo "${GITHUB_REPOSITORY}" --yes || true
