@@ -58,7 +58,7 @@ The binary lands in `target/release/tg-ws-proxy`. Cross-compiling for OpenWrt
 
 ### OpenWrt
 
-APK/IPK packages, LuCI and a one-line installer are available. See
+Raw release binaries, LuCI packages and a one-line installer are available. See
 [OpenWrt installation](#openwrt-installation) below.
 
 ### Telegram Desktop setup
@@ -77,17 +77,12 @@ Or use the `tg://proxy?...` link that is printed on startup.
 
 - **OpenWrt 25.12+ (APK)** or **ImmortalWrt 25.12+ (APK)**.
 - **OpenWrt 24.10 (opkg)** or **ImmortalWrt 24.10 (opkg)**.
-- A CPU ISA supported by
-  [`openwrt/release-architectures.tsv`](openwrt/release-architectures.tsv).
-  The installer maps `DISTRIB_ARCH` to `aarch64`, `armv7`, `mips`, `mipsel` or
-  `x86_64` and downloads that package directly.
-- Root SSH access to the router and enough overlay space for the core and LuCI
-  packages. Python is not required: the proxy is a static musl binary.
+- Root SSH access and a supported musl target: AArch64, ARMv7, MIPS, MIPSel or
+  x86_64. Python is not required.
 
-GitHub Releases contains one core APK and IPK for each of the five real CPU
-ISAs, one architecture-independent LuCI package per format and one
-`SHA256SUMS`. There are no duplicated per-microarchitecture packages or bundle
-archives, and adding a third-party feed is not required.
+The proxy itself is the existing static musl release binary, not an OpenWrt
+package. Only the architecture-independent LuCI/service integration is packaged:
+`luci-app-tg-ws-proxy` is published as APK (`noarch`) and IPK (`all`).
 
 ### Quick install (one-liner)
 
@@ -97,10 +92,17 @@ Run over SSH **on the router**:
 wget -qO- https://raw.githubusercontent.com/valnesfjord/tg-ws-proxy-rs/main/install.sh | sh
 ```
 
-The installer detects APK/opkg and `DISTRIB_ARCH`, downloads only the matching
-core and LuCI packages, verifies both against `SHA256SUMS`, migrates a known
-manual configuration and starts the procd service. Re-run the same command to
-upgrade; configuration backup and rollback are handled automatically.
+The installer detects APK/opkg and `DISTRIB_ARCH`, downloads the matching raw
+musl archive and LuCI package, verifies both against `SHA256SUMS`, migrates a
+known manual configuration and starts the procd service. Re-run it to upgrade.
+
+To trade higher runtime memory use for a smaller file on flash, explicitly
+select the existing UPX release asset:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/valnesfjord/tg-ws-proxy-rs/main/install.sh | \
+  sh -s -- --upx
+```
 
 If GitHub release downloads require a mirror, put the variable on `sh` (not on
 `wget`):
@@ -112,9 +114,8 @@ wget -qO- https://raw.githubusercontent.com/valnesfjord/tg-ws-proxy-rs/main/inst
 
 ### Beta releases
 
-Beta tags (`vX.Y.Z-beta.N`) are normal GitHub prereleases containing the same
-platform binaries and direct OpenWrt package set. Stable is the default; beta
-installation is explicit:
+Beta tags (`vX.Y.Z-beta.N`) are normal GitHub prereleases. Stable is the default;
+beta installation is explicit and can be combined with `--upx`:
 
 ```sh
 wget -qO- https://raw.githubusercontent.com/valnesfjord/tg-ws-proxy-rs/main/install.sh | \
@@ -123,13 +124,15 @@ wget -qO- https://raw.githubusercontent.com/valnesfjord/tg-ws-proxy-rs/main/inst
 
 Publishing a beta does not change the stable `releases/latest` channel.
 
-### Manual APK/IPK install
+### Local install
 
-Download the core package for the router's CPU ISA, the matching LuCI package
-and `SHA256SUMS` from [Releases](../../releases), place all three in one
-directory, then run the downloaded installer with `--package CORE_PATH`. A
-copy-over-SSH example is in the
-[OpenWrt package guide](docs/OpenWrtPackage.md#install-a-local-build).
+Put the matching `tg-ws-proxy-<target>[-upx].tar.gz`, LuCI APK/IPK and
+`SHA256SUMS` in one directory, then run:
+
+```sh
+sh install.sh --archive /tmp/tg-ws-proxy-<target>.tar.gz \
+  --luci-package /tmp/luci-app-tg-ws-proxy.<apk-or-ipk>
+```
 
 ### Configure and operate
 
@@ -139,8 +142,8 @@ then use **Save & Apply**. The page includes service controls and a filtered liv
 view of the bounded OpenWrt `logd` ring buffer. The package does not open a WAN
 firewall port automatically.
 
-For UCI examples, firewall guidance, package internals and rollback details, see
-the full [OpenWrt package guide](docs/OpenWrtPackage.md).
+For UCI examples, firewall guidance and rollback details, see the full
+[OpenWrt guide](docs/OpenWrtPackage.md).
 
 ## Usage
 

@@ -1,6 +1,5 @@
 #!/bin/sh
-# Standalone tg-ws-proxy installer for OpenWrt APK/opkg systems.
-# Installs matching local artifacts or resolves CI-published GitHub Release packages.
+# Installs a tg-ws-proxy release binary and LuCI integration on OpenWrt 24.10+.
 
 G='\033[0;32m'; R='\033[0;31m'; Y='\033[0;33m'; C='\033[0;36m'; N='\033[0m'
 ok()   { printf "${G}%s${N}\n" "$1"; }
@@ -10,23 +9,26 @@ die()  { printf "${R}error: %s${N}\n" "$1" >&2; exit 1; }
 
 REPOSITORY="${TG_WS_PROXY_REPOSITORY:-valnesfjord/tg-ws-proxy-rs}"
 CHANNEL="${TG_WS_PROXY_RELEASE_CHANNEL:-stable}"
-PACKAGE_FILE=""
-PACKAGE_URL=""
-LUCI_PACKAGE_FILE=""
-LUCI_PACKAGE_URL=""
-CHECKSUMS_FILE=""
-PACKAGE_ISA=""
+USE_UPX="${TG_WS_PROXY_UPX:-0}"
+ARCHIVE_FILE=''
+ARCHIVE_URL=''
+LUCI_PACKAGE_FILE=''
+LUCI_PACKAGE_URL=''
+CHECKSUMS_FILE=''
+ARCH_OVERRIDE=''
+PM_OVERRIDE=''
+ARCH=''
+TARGET=''
+PM=''
+EXT=''
 DRY_RUN=0
-ARCH_OVERRIDE=""
-PM_OVERRIDE=""
-PM=""
-EXT=""
-ARCH=""
-TMP_DIR=""
-BACKUP_DIR=""
+TMP_DIR=''
+STAGED_BINARY=''
+BACKUP_DIR=''
 OLD_CONFIG=0
-OLD_PACKAGE=0
+OLD_CORE_PACKAGE=0
 OLD_LUCI_PACKAGE=0
+LEGACY_PACKAGES_REMOVED=0
 OLD_RUNNING=0
 OLD_ENABLED=0
 
@@ -35,36 +37,43 @@ usage() {
 Usage: sh install.sh [options]
 
 Options:
-  --package PATH              Install a locally built .apk or .ipk
-  --luci-package PATH         Install the matching local LuCI companion package
-  --dry-run                   Resolve package manager/architecture only
-  --channel stable|beta       Select latest stable (default) or beta release
-  --arch ARCH                 Override detected package architecture
-  --package-manager apk|opkg  Override package manager (primarily for tests)
-  -h, --help                  Show this help
+  --archive PATH       Install a local release .tar.gz archive
+  --luci-package PATH  Install a local luci-app-tg-ws-proxy APK/IPK
+  --upx                Select the smaller UPX-packed release binary
+  --channel stable|beta
+                       Select latest stable (default) or beta release
+  --dry-run            Resolve architecture and assets without installing
+  --arch ARCH          Override detected OpenWrt architecture (tests/manual use)
+  --package-manager apk|opkg
+                       Override detected package manager (tests/manual use)
+  -h, --help           Show this help
 
-Without --package, the installer downloads the matching CPU-ISA package and the
-architecture-independent LuCI package directly from GitHub Releases.
-Set GH_MIRROR=https://mirror.example to retry GitHub downloads through a mirror.
-TG_WS_PROXY_RELEASE_CHANNEL may also select stable or beta. Both apk (OpenWrt
-25.12+) and opkg/IPK are supported.
+Without --archive, both assets are downloaded from GitHub Releases. The regular
+binary is selected by default; --upx selects the matching *-upx.tar.gz asset.
+OpenWrt 25.12+ uses the LuCI APK; OpenWrt 24.10 uses the LuCI IPK. APK install
+uses --allow-untrusted explicitly after SHA-256 verification.
+
+Set GH_MIRROR=https://mirror.example to retry release-asset downloads through a
+mirror. TG_WS_PROXY_RELEASE_CHANNEL and TG_WS_PROXY_UPX provide env equivalents.
 EOF
 }
 
 while [ "$#" -gt 0 ]; do
 	case "$1" in
-		--package) [ "$#" -ge 2 ] || die "--package requires a path"; PACKAGE_FILE="$2"; shift 2 ;;
+		--archive) [ "$#" -ge 2 ] || die "--archive requires a path"; ARCHIVE_FILE="$2"; shift 2 ;;
 		--luci-package) [ "$#" -ge 2 ] || die "--luci-package requires a path"; LUCI_PACKAGE_FILE="$2"; shift 2 ;;
-		--dry-run) DRY_RUN=1; shift ;;
+		--upx) USE_UPX=1; shift ;;
 		--channel) [ "$#" -ge 2 ] || die "--channel requires stable or beta"; CHANNEL="$2"; shift 2 ;;
+		--dry-run) DRY_RUN=1; shift ;;
 		--arch) [ "$#" -ge 2 ] || die "--arch requires a value"; ARCH_OVERRIDE="$2"; shift 2 ;;
-		--package-manager) [ "$#" -ge 2 ] || die "--package-manager requires a value"; PM_OVERRIDE="$2"; shift 2 ;;
+		--package-manager) [ "$#" -ge 2 ] || die "--package-manager requires apk or opkg"; PM_OVERRIDE="$2"; shift 2 ;;
 		-h|--help) usage; exit 0 ;;
 		*) die "unknown argument: $1" ;;
 	esac
 done
 
-case "$CHANNEL" in stable|beta) ;; *) die "unsupported release channel: $CHANNEL";; esac
+case "$CHANNEL" in stable|beta) ;; *) die "unsupported release channel: $CHANNEL" ;; esac
+case "$USE_UPX" in 0|false|no|off|'') USE_UPX=0 ;; 1|true|yes|on) USE_UPX=1 ;; *) die "TG_WS_PROXY_UPX must be 0 or 1" ;; esac
 
 cleanup() {
 	[ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"
@@ -77,31 +86,42 @@ load_openwrt_release() {
 	[ -r /etc/openwrt_release ] || return 1
 	# shellcheck disable=SC1091
 	. /etc/openwrt_release 2>/dev/null
-	return 0
+}
+
+binary_target() {
+	case "$1" in
+		aarch64|aarch64_*) printf '%s' aarch64-unknown-linux-musl ;;
+		armv7|arm_cortex-a5_vfpv4|arm_cortex-a7_vfpv4|arm_cortex-a7_neon-vfpv4|\
+		arm_cortex-a8_vfpv3|arm_cortex-a9_vfpv3-d16|arm_cortex-a9_neon|\
+		arm_cortex-a15_neon-vfpv4) printf '%s' armv7-unknown-linux-musleabihf ;;
+		mipsel|mipsel_24kc|mipsel_74kc) printf '%s' mipsel-unknown-linux-musl ;;
+		mips|mips_24kc) printf '%s' mips-unknown-linux-musl ;;
+		x86_64) printf '%s' x86_64-unknown-linux-musl ;;
+		*) return 1 ;;
+	esac
+}
+
+binary_archive_name() {
+	upx_suffix=''
+	[ "$USE_UPX" -eq 0 ] || upx_suffix=-upx
+	printf 'tg-ws-proxy-%s%s.tar.gz' "$TARGET" "$upx_suffix"
 }
 
 resolve_environment() {
-	if [ -n "$PM_OVERRIDE" ]; then
-		PM="$PM_OVERRIDE"
-	elif command -v apk >/dev/null 2>&1; then
-		PM=apk
-	elif command -v opkg >/dev/null 2>&1; then
-		PM=opkg
-	else
-		die "supported package manager not found (apk/opkg)"
-	fi
-	case "$PM" in apk) EXT=apk;; opkg) EXT=ipk;; *) die "unsupported package manager: $PM";; esac
+	if [ -n "$PM_OVERRIDE" ]; then PM="$PM_OVERRIDE"
+	elif command -v apk >/dev/null 2>&1; then PM=apk
+	elif command -v opkg >/dev/null 2>&1; then PM=opkg
+	else die "supported package manager not found (apk/opkg)"; fi
+	case "$PM" in apk) EXT=apk ;; opkg) EXT=ipk ;; *) die "unsupported package manager: $PM" ;; esac
 
 	if [ -n "$ARCH_OVERRIDE" ]; then
 		ARCH="$ARCH_OVERRIDE"
 	elif load_openwrt_release && [ -n "${DISTRIB_ARCH:-}" ]; then
 		ARCH="$DISTRIB_ARCH"
-	elif [ "$PM" = apk ]; then
-		ARCH="$(apk --print-arch 2>/dev/null || apk print-arch 2>/dev/null)"
 	else
-		die "cannot read package architecture from /etc/openwrt_release"
+		die "cannot read OpenWrt DISTRIB_ARCH"
 	fi
-	[ -n "$ARCH" ] || die "cannot determine package architecture"
+	TARGET="$(binary_target "$ARCH")" || die "unsupported OpenWrt architecture: $ARCH"
 }
 
 dl() {
@@ -109,22 +129,15 @@ dl() {
 	out="$2"
 	wget -qO "$out" --timeout=30 "$url" 2>/dev/null && [ -s "$out" ] && return 0
 	if [ -n "${GH_MIRROR:-}" ]; then
-		mirror_url="$(printf '%s' "$url" | sed "s#https://github.com#${GH_MIRROR}#")"
+		mirror="${GH_MIRROR%/}"
+		mirror_url="$mirror${url#https://github.com}"
 		wget -qO "$out" --timeout=30 "$mirror_url" 2>/dev/null && [ -s "$out" ] && return 0
 	fi
 	return 1
 }
 
 release_asset_urls() {
-	json_file="$1"
-	if command -v jsonfilter >/dev/null 2>&1; then
-		jsonfilter -i "$json_file" -e '@.assets[*].browser_download_url'
-	else
-		# GitHub may compact the whole response onto one line. Split JSON fields
-		# before sed so a greedy match cannot retain only the final asset URL.
-		tr ',' '\n' < "$json_file" | \
-			sed -n 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
-	fi
+	jsonfilter -i "$1" -e '@.assets[*].browser_download_url'
 }
 
 find_release_asset() {
@@ -133,48 +146,18 @@ find_release_asset() {
 	suffix="$3"
 	release_asset_urls "$json_file" | while IFS= read -r url; do
 		name="${url##*/}"
-		if [ -z "$suffix" ]; then
-			[ "$name" = "$prefix" ] && { printf '%s\n' "$url"; break; }
-		else
-			case "$name" in
-				"$prefix"*"$suffix") printf '%s\n' "$url"; break ;;
-			esac
-		fi
+		case "$name" in "$prefix"*"$suffix") printf '%s\n' "$url"; break ;; esac
 	done
-}
-
-release_tags() {
-	json_file="$1"
-	if command -v jsonfilter >/dev/null 2>&1; then
-		jsonfilter -i "$json_file" -e '@[*].tag_name'
-	else
-		tr '{' '\n' < "$json_file" | \
-			sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
-	fi
 }
 
 latest_beta_tag() {
-	release_tags "$1" | while IFS= read -r tag; do
-		case "$tag" in
-			v*-beta.[1-9]* ) printf '%s\n' "$tag"; break ;;
-		esac
+	jsonfilter -i "$1" -e '@[*].tag_name' | while IFS= read -r tag; do
+		case "$tag" in v*-beta.[1-9]*) printf '%s\n' "$tag"; break ;; esac
 	done
 }
 
-package_isa() {
-	case "$1" in
-		aarch64|aarch64_*) printf '%s' aarch64 ;;
-		armv7|arm_cortex-a5_vfpv4|arm_cortex-a7_vfpv4|arm_cortex-a7_neon-vfpv4|\
-		arm_cortex-a8_vfpv3|arm_cortex-a9_vfpv3-d16|arm_cortex-a9_neon|\
-		arm_cortex-a15_neon-vfpv4) printf '%s' armv7 ;;
-		mipsel|mipsel_24kc|mipsel_74kc) printf '%s' mipsel ;;
-		mips|mips_24kc) printf '%s' mips ;;
-		x86_64) printf '%s' x86_64 ;;
-		*) return 1 ;;
-	esac
-}
-
-resolve_remote_package() {
+resolve_remote_assets() {
+	command -v jsonfilter >/dev/null 2>&1 || die "jsonfilter is required"
 	TMP_DIR="$(mktemp -d /tmp/tg-ws-proxy-install.XXXXXX)" || die "cannot create temporary directory"
 	api_file="$TMP_DIR/release.json"
 	if [ "$CHANNEL" = beta ]; then
@@ -189,43 +172,31 @@ resolve_remote_package() {
 		api_url="https://api.github.com/repos/$REPOSITORY/releases/latest"
 	fi
 	wget -qO "$api_file" --timeout=30 "$api_url" 2>/dev/null || die "cannot query GitHub release API"
-	PACKAGE_ISA="$(package_isa "$ARCH")" || die "unsupported package architecture: $ARCH"
-	PACKAGE_URL="$(find_release_asset "$api_file" 'tg-ws-proxy_' "_${PACKAGE_ISA}.${EXT}")"
-	[ -n "$PACKAGE_URL" ] || die "no ${EXT} package found for CPU ISA $PACKAGE_ISA"
 
-	luci_arch=all
-	[ "$PM" = apk ] && luci_arch=noarch
-	LUCI_PACKAGE_URL="$(find_release_asset "$api_file" 'luci-app-tg-ws-proxy_' "_${luci_arch}.${EXT}")"
-	[ -n "$LUCI_PACKAGE_URL" ] || die "no LuCI ${EXT} package found"
-
+	archive_name="$(binary_archive_name)"
+	ARCHIVE_URL="$(find_release_asset "$api_file" "$archive_name" '')"
+	[ -n "$ARCHIVE_URL" ] || die "release asset is missing: $archive_name"
+	LUCI_PACKAGE_URL="$(find_release_asset "$api_file" luci-app-tg-ws-proxy ".$EXT")"
+	[ -n "$LUCI_PACKAGE_URL" ] || die "release LuCI $EXT package is missing"
 	checksums_url="$(find_release_asset "$api_file" SHA256SUMS '')"
-	[ -n "$checksums_url" ] || die "release SHA256SUMS asset is missing"
-	PACKAGE_FILE="$TMP_DIR/${PACKAGE_URL##*/}"
+	[ -n "$checksums_url" ] || die "release SHA256SUMS is missing"
+
+	ARCHIVE_FILE="$TMP_DIR/$archive_name"
 	LUCI_PACKAGE_FILE="$TMP_DIR/${LUCI_PACKAGE_URL##*/}"
 	CHECKSUMS_FILE="$TMP_DIR/SHA256SUMS"
-	dl "$PACKAGE_URL" "$PACKAGE_FILE" || die "cannot download package (set GH_MIRROR if GitHub is blocked)"
-	dl "$LUCI_PACKAGE_URL" "$LUCI_PACKAGE_FILE" || die "cannot download LuCI package"
+	dl "$ARCHIVE_URL" "$ARCHIVE_FILE" || die "cannot download binary archive (set GH_MIRROR if GitHub is blocked)"
+	dl "$LUCI_PACKAGE_URL" "$LUCI_PACKAGE_FILE" || die "cannot download LuCI APK"
 	dl "$checksums_url" "$CHECKSUMS_FILE" || die "cannot download SHA256SUMS"
 }
 
-resolve_luci_package() {
-	[ -n "$LUCI_PACKAGE_FILE" ] && return 0
-	luci_arch=all
-	[ "$PM" = apk ] && luci_arch=noarch
-	case "$PACKAGE_FILE" in */*) package_dir="${PACKAGE_FILE%/*}";; *) package_dir=.;; esac
-	core_name="${PACKAGE_FILE##*/}"
-	core_stem="${core_name#tg-ws-proxy_}"
-	core_stem="${core_stem%."${EXT}"}"
-	core_version="${core_stem%_*}"
-	[ "$core_version" != "$core_stem" ] || die "cannot derive LuCI package version; use --luci-package"
-	LUCI_PACKAGE_FILE="$package_dir/luci-app-tg-ws-proxy_${core_version}_${luci_arch}.${EXT}"
-}
-
-resolve_local_checksums() {
-	[ -z "$CHECKSUMS_FILE" ] || return 0
-	case "$PACKAGE_FILE" in */*) package_dir="${PACKAGE_FILE%/*}";; *) package_dir=.;; esac
-	[ -f "$package_dir/SHA256SUMS" ] && CHECKSUMS_FILE="$package_dir/SHA256SUMS"
-	return 0
+resolve_local_assets() {
+	[ -n "$LUCI_PACKAGE_FILE" ] || die "--luci-package is required with --archive"
+	case "$ARCHIVE_FILE" in
+		*-upx.tar.gz) USE_UPX=1 ;;
+		*) [ "$USE_UPX" -eq 0 ] || die "--upx selects remote assets; pass the local *-upx.tar.gz archive directly" ;;
+	esac
+	case "$ARCHIVE_FILE" in */*) asset_dir="${ARCHIVE_FILE%/*}" ;; *) asset_dir=. ;; esac
+	[ -f "$asset_dir/SHA256SUMS" ] && CHECKSUMS_FILE="$asset_dir/SHA256SUMS"
 }
 
 verify_release_checksum() {
@@ -234,59 +205,34 @@ verify_release_checksum() {
 	name="${file##*/}"
 	expected="$(while read -r sum listed; do
 		listed="${listed#\*}"
-		if [ "$listed" = "$name" ]; then printf '%s' "$sum"; break; fi
+		[ "$listed" = "$name" ] && { printf '%s' "$sum"; break; }
 	done < "$CHECKSUMS_FILE")"
-	[ -n "$expected" ] || die "$label is missing from release SHA256SUMS: $name"
+	[ -n "$expected" ] || die "$label is missing from SHA256SUMS: $name"
 	actual="$(sha256sum "$file" | sed 's/[[:space:]].*//')"
-	[ "$expected" = "$actual" ] || die "$label SHA-256 mismatch"
+	[ "$actual" = "$expected" ] || die "$label SHA-256 mismatch"
 }
 
-verify_checksum() {
-	checksum_file=""
+verify_assets() {
 	if [ -n "$CHECKSUMS_FILE" ]; then
-		verify_release_checksum "$PACKAGE_FILE" package
-		ok "SHA-256 verified."
-		return 0
-	elif [ -n "$PACKAGE_URL" ]; then
-		checksum_file="$TMP_DIR/package.sha256"
-		dl "$PACKAGE_URL.sha256" "$checksum_file" || checksum_file=""
-	elif [ -f "$PACKAGE_FILE.sha256" ]; then
-		checksum_file="$PACKAGE_FILE.sha256"
-	fi
-	if [ -z "$checksum_file" ]; then
-		warn "No SHA-256 sidecar found; package signature/tool verification will be used."
-		return 0
-	fi
-	expected="$(sed -n '1{s/[[:space:]].*//;p;}' "$checksum_file")"
-	actual="$(sha256sum "$PACKAGE_FILE" | sed 's/[[:space:]].*//')"
-	if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
-		die "package SHA-256 mismatch"
-	fi
-	ok "SHA-256 verified."
-}
-
-verify_luci_checksum() {
-	luci_checksum_file=""
-	if [ -n "$CHECKSUMS_FILE" ]; then
+		verify_release_checksum "$ARCHIVE_FILE" "binary archive"
 		verify_release_checksum "$LUCI_PACKAGE_FILE" "LuCI package"
-		ok "LuCI SHA-256 verified."
-		return 0
-	elif [ -n "$LUCI_PACKAGE_URL" ]; then
-		luci_checksum_file="$TMP_DIR/luci-package.sha256"
-		dl "$LUCI_PACKAGE_URL.sha256" "$luci_checksum_file" || luci_checksum_file=""
-	elif [ -f "$LUCI_PACKAGE_FILE.sha256" ]; then
-		luci_checksum_file="$LUCI_PACKAGE_FILE.sha256"
+		ok "SHA-256 verified for binary and LuCI package."
+	else
+		warn "Local assets have no SHA256SUMS; continuing because both paths were supplied explicitly."
 	fi
-	if [ -z "$luci_checksum_file" ]; then
-		warn "No LuCI SHA-256 sidecar found; package signature/tool verification will be used."
-		return 0
-	fi
-	luci_expected="$(sed -n '1{s/[[:space:]].*//;p;}' "$luci_checksum_file")"
-	luci_actual="$(sha256sum "$LUCI_PACKAGE_FILE" | sed 's/[[:space:]].*//')"
-	if [ -z "$luci_expected" ] || [ "$luci_expected" != "$luci_actual" ]; then
-		die "LuCI package SHA-256 mismatch"
-	fi
-	ok "LuCI SHA-256 verified."
+}
+
+stage_binary() {
+	entries="$(tar -tzf "$ARCHIVE_FILE")" || die "cannot read binary archive"
+	case "$entries" in tg-ws-proxy|./tg-ws-proxy) ;; *) die "binary archive has unexpected contents" ;; esac
+	[ -n "$TMP_DIR" ] || TMP_DIR="$(mktemp -d /tmp/tg-ws-proxy-install.XXXXXX)" || die "cannot create temporary directory"
+	stage_dir="$TMP_DIR/binary"
+	mkdir -p "$stage_dir"
+	tar -xzf "$ARCHIVE_FILE" -C "$stage_dir" || die "cannot extract binary archive"
+	STAGED_BINARY="$stage_dir/tg-ws-proxy"
+	[ -f "$STAGED_BINARY" ] || STAGED_BINARY="$stage_dir/./tg-ws-proxy"
+	[ -x "$STAGED_BINARY" ] || die "release binary is not executable"
+	"$STAGED_BINARY" --version >/dev/null 2>&1 || die "release binary cannot run on this router"
 }
 
 backup_path() {
@@ -296,6 +242,15 @@ backup_path() {
 	cp -p "$path" "$BACKUP_DIR$path"
 }
 
+restore_path() {
+	path="$1"
+	rm -f "$path"
+	if [ -e "$BACKUP_DIR$path" ]; then
+		mkdir -p "$(dirname "$path")"
+		cp -p "$BACKUP_DIR$path" "$path"
+	fi
+}
+
 read_old_env() {
 	name="$1"
 	[ -f "$BACKUP_DIR/process.env" ] || return 0
@@ -303,73 +258,69 @@ read_old_env() {
 }
 
 set_from_env() {
-	env_name="$1"
-	option="$2"
-	value="$(read_old_env "$env_name")"
-	[ -n "$value" ] && uci -q set "tg-ws-proxy.main.$option=$value"
+	value="$(read_old_env "$1")"
+	[ -n "$value" ] && uci -q set "tg-ws-proxy.main.$2=$value"
 	return 0
 }
 
 set_list_from_env() {
-	env_name="$1"
-	option="$2"
-	value="$(read_old_env "$env_name")"
+	value="$(read_old_env "$1")"
 	[ -n "$value" ] || return 0
-	uci -q delete "tg-ws-proxy.main.$option"
+	uci -q delete "tg-ws-proxy.main.$2"
 	old_ifs="$IFS"; IFS=','
-	for item in $value; do [ -n "$item" ] && uci -q add_list "tg-ws-proxy.main.$option=$item"; done
+	for item in $value; do [ -n "$item" ] && uci -q add_list "tg-ws-proxy.main.$2=$item"; done
 	IFS="$old_ifs"
 }
 
 migrate_log_level() {
 	value="$(read_old_env RUST_LOG)"
-	case "$value" in
-		off|error|warn|info|debug|trace)
-			uci -q set "tg-ws-proxy.main.log_level=$value"
-			return 0
-		;;
-	esac
-
-	quiet="$(read_old_env TG_QUIET)"
-	verbose="$(read_old_env TG_VERBOSE)"
-	case "$quiet" in
-		1|true|yes|on) value=off ;;
-		*) case "$verbose" in 1|true|yes|on) value=debug ;; *) value=info ;; esac ;;
+	case "$value" in off|error|warn|info|debug|trace) ;;
+		*) quiet="$(read_old_env TG_QUIET)"; verbose="$(read_old_env TG_VERBOSE)"
+			case "$quiet" in 1|true|yes|on) value=off ;;
+				*) case "$verbose" in 1|true|yes|on) value=debug ;; *) value=info ;; esac ;;
+			esac ;;
 	esac
 	uci -q set "tg-ws-proxy.main.log_level=$value"
 }
 
 migrate_command_args() {
 	[ -f "$BACKUP_DIR/process.cmd" ] || return 0
-	pending=""
-	dc_reset=0
-	cf_worker_reset=0
+	pending=''; dc_reset=0; cf_worker_reset=0
 	while IFS= read -r arg; do
 		if [ -n "$pending" ]; then
 			case "$pending" in
 				cf_worker_domain)
-					if [ "$cf_worker_reset" -eq 0 ]; then uci -q delete tg-ws-proxy.main.cf_worker_domain; cf_worker_reset=1; fi
-					uci -q add_list "tg-ws-proxy.main.cf_worker_domain=$arg"
-				;;
+					[ "$cf_worker_reset" -eq 1 ] || { uci -q delete tg-ws-proxy.main.cf_worker_domain; cf_worker_reset=1; }
+					uci -q add_list "tg-ws-proxy.main.cf_worker_domain=$arg" ;;
 				dc_ip)
-					if [ "$dc_reset" -eq 0 ]; then uci -q delete tg-ws-proxy.main.dc_ip; dc_reset=1; fi
-					uci -q add_list "tg-ws-proxy.main.dc_ip=$arg"
-				;;
+					[ "$dc_reset" -eq 1 ] || { uci -q delete tg-ws-proxy.main.dc_ip; dc_reset=1; }
+					uci -q add_list "tg-ws-proxy.main.dc_ip=$arg" ;;
 			esac
-			pending=""
+			pending=''
 			continue
 		fi
-		case "$arg" in
-			--cf-worker-domain|--cfproxy-worker-domain) pending=cf_worker_domain ;;
-			--dc-ip) pending=dc_ip ;;
-		esac
+		case "$arg" in --cf-worker-domain|--cfproxy-worker-domain) pending=cf_worker_domain ;; --dc-ip) pending=dc_ip ;; esac
 	done < "$BACKUP_DIR/process.cmd"
+}
+
+ensure_secret() {
+	secret="$(uci -q get tg-ws-proxy.main.secret)"
+	[ -n "$secret" ] && return 0
+	secret="$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | hexdump -v -e '1/1 "%02x"')"
+	case "$secret" in
+		????????????????????????????????) uci -q set "tg-ws-proxy.main.secret=$secret" ;;
+		*) return 1 ;;
+	esac
 }
 
 migrate_manual_config() {
 	uci -q get tg-ws-proxy.main >/dev/null 2>&1 || uci -q set tg-ws-proxy.main=tg-ws-proxy
 	uci -q set tg-ws-proxy.main.enabled=1
-	[ "$OLD_CONFIG" -eq 0 ] || { uci -q commit tg-ws-proxy; return 0; }
+	if [ "$OLD_CONFIG" -eq 1 ]; then
+		ensure_secret || return 1
+		uci -q commit tg-ws-proxy
+		return 0
+	fi
 
 	set_from_env TG_HOST host
 	set_from_env TG_PORT port
@@ -404,9 +355,9 @@ migrate_manual_config() {
 	set_from_env TG_NO_OUTBOUND_PROXY no_outbound_proxy
 	set_list_from_env TG_MTPROTO_PROXY mtproto_proxy
 	set_list_from_env TG_CF_DOMAIN cf_domain
-
 	migrate_log_level
 	migrate_command_args
+	ensure_secret || return 1
 	uci -q commit tg-ws-proxy
 }
 
@@ -414,259 +365,186 @@ service_control() {
 	/etc/init.d/tg-ws-proxy "$1"
 }
 
-remove_core_package() {
-	if [ "$PM" = apk ]; then
-		apk del tg-ws-proxy >/dev/null 2>&1 || true
-	else
-		opkg remove tg-ws-proxy >/dev/null 2>&1 || true
-	fi
+luci_is_installed() {
+	if [ "$PM" = apk ]; then apk info -e luci-app-tg-ws-proxy >/dev/null 2>&1
+	else opkg status luci-app-tg-ws-proxy 2>/dev/null | grep -q 'Status:.*installed'; fi
 }
 
-remove_luci_package() {
-	if [ "$PM" = apk ]; then
-		apk del luci-app-tg-ws-proxy >/dev/null 2>&1 || true
-	else
-		opkg remove luci-app-tg-ws-proxy >/dev/null 2>&1 || true
-	fi
-}
-
-restore_backup_path() {
-	path="$1"
-	rm -f "$path"
-	if [ -e "$BACKUP_DIR$path" ]; then
-		mkdir -p "$(dirname "$path")"
-		cp -p "$BACKUP_DIR$path" "$path"
-	fi
-}
-
-restore_core_backup_files() {
-	for path in \
-		/usr/bin/tg-ws-proxy \
-		/usr/bin/tg-ws-proxy-rs \
-		/etc/init.d/tg-ws-proxy
-	do
-		restore_backup_path "$path"
-	done
-}
-
-restore_luci_backup_files() {
-	for path in \
-		/usr/share/luci/menu.d/luci-app-tg-ws-proxy.json \
-		/usr/share/rpcd/acl.d/luci-app-tg-ws-proxy.json \
-		/usr/share/ucitrack/luci-app-tg-ws-proxy.json \
-		/www/luci-static/resources/view/tg-ws-proxy/settings.js
-	do
-		restore_backup_path "$path"
-	done
-}
-
-restore_config_backup() {
-	if [ "$OLD_CONFIG" -eq 1 ] && [ -e "$BACKUP_DIR/etc/config/tg-ws-proxy" ]; then
-		restore_backup_path /etc/config/tg-ws-proxy
-	elif [ "$OLD_PACKAGE" -eq 0 ]; then
-		rm -f /etc/config/tg-ws-proxy /etc/config/tg-ws-proxy.apk-new
-	fi
-}
-
-restore_service_state() {
-	[ -x /etc/init.d/tg-ws-proxy ] || return 0
-	if [ "$OLD_ENABLED" -eq 1 ]; then
-		service_control enable >/dev/null 2>&1 || true
-	else
-		service_control disable >/dev/null 2>&1 || true
-	fi
-	if [ "$OLD_RUNNING" -eq 1 ]; then
-		service_control start >/dev/null 2>&1 || true
-	else
-		service_control stop >/dev/null 2>&1 || true
-	fi
-}
-
-rollback() {
-	warn "Installation failed; restoring the previous configuration and service state."
-	service_control stop >/dev/null 2>&1 || true
-
-	# A fresh/manual migration can be returned to its original files after the
-	# newly introduced packages are removed. During an existing package upgrade,
-	# never copy old package-owned files over the new package database: keep the
-	# package transaction internally consistent and restore only UCI/service state.
-	if [ "$OLD_LUCI_PACKAGE" -eq 0 ]; then
-		remove_luci_package
-		restore_luci_backup_files
-	fi
-	if [ "$OLD_PACKAGE" -eq 0 ]; then
-		remove_core_package
-		restore_core_backup_files
-	fi
-	restore_config_backup
-	restore_service_state
-
-	if [ "$OLD_PACKAGE" -eq 1 ] || [ "$OLD_LUCI_PACKAGE" -eq 1 ]; then
-		warn "Package upgrades remain at the package-manager version; reinstall previous APK/IPK artifacts for a full downgrade."
-	fi
-	warn "Recovery files are retained in $BACKUP_DIR"
-}
-
-core_package_arch() {
-	if [ "$PM" = apk ]; then
-		apk adbdump "$PACKAGE_FILE" 2>/dev/null | sed -n 's/^  arch: //p' | sed -n '1p'
-	else
-		tar -xOzf "$PACKAGE_FILE" ./control.tar.gz 2>/dev/null | \
-			tar -xzOf - ./control 2>/dev/null | \
-			sed -n 's/^Architecture: //p' | sed -n '1p'
-	fi
-}
-
-validate_core_package_arch() {
-	[ -n "$PACKAGE_ISA" ] || PACKAGE_ISA="$(package_isa "$ARCH")" || \
-		die "unsupported package architecture: $ARCH"
-	metadata_arch="$(core_package_arch)"
-	[ -n "$metadata_arch" ] || die "cannot read core package architecture"
-	case "$metadata_arch" in
-		"$PACKAGE_ISA"|"$ARCH") ;;
-		*) die "package architecture $metadata_arch is incompatible with $ARCH ($PACKAGE_ISA)" ;;
-	esac
-}
-
-install_package() {
-	if [ "$PM" = apk ]; then
-		apk --force-non-repository add "$PACKAGE_FILE" >/dev/null 2>&1 || \
-			apk --force-non-repository --allow-untrusted add "$PACKAGE_FILE"
-	else
-		opkg --force-architecture install "$PACKAGE_FILE"
-	fi
+core_is_installed() {
+	if [ "$PM" = apk ]; then apk info -e tg-ws-proxy >/dev/null 2>&1
+	else opkg status tg-ws-proxy 2>/dev/null | grep -q 'Status:.*installed'; fi
 }
 
 install_luci_package() {
 	if [ "$PM" = apk ]; then
-		apk --force-non-repository add "$LUCI_PACKAGE_FILE" >/dev/null 2>&1 || \
-			apk --force-non-repository --allow-untrusted add "$LUCI_PACKAGE_FILE"
+		apk --allow-untrusted --force-non-repository add "$LUCI_PACKAGE_FILE"
 	else
 		opkg install "$LUCI_PACKAGE_FILE"
 	fi
 }
 
-verify_luci_files() {
-	[ -s /usr/share/luci/menu.d/luci-app-tg-ws-proxy.json ] && \
-	[ -s /usr/share/rpcd/acl.d/luci-app-tg-ws-proxy.json ] && \
-	[ -s /www/luci-static/resources/view/tg-ws-proxy/settings.js ]
+remove_luci_package() {
+	if [ "$PM" = apk ]; then apk del luci-app-tg-ws-proxy >/dev/null 2>&1 || true
+	else opkg remove luci-app-tg-ws-proxy >/dev/null 2>&1 || true; fi
+}
+
+remove_core_package() {
+	if [ "$PM" = apk ]; then apk del tg-ws-proxy >/dev/null 2>&1 || true
+	else opkg remove tg-ws-proxy >/dev/null 2>&1 || true; fi
+}
+
+restore_service_state() {
+	[ -x /etc/init.d/tg-ws-proxy ] || return 0
+	if [ "$OLD_ENABLED" -eq 1 ]; then service_control enable >/dev/null 2>&1 || true
+	else service_control disable >/dev/null 2>&1 || true; fi
+	if [ "$OLD_RUNNING" -eq 1 ]; then service_control start >/dev/null 2>&1 || true
+	else service_control stop >/dev/null 2>&1 || true; fi
+}
+
+rollback() {
+	warn "Installation failed; restoring the previous binary, UCI config and service state."
+	service_control stop >/dev/null 2>&1 || true
+	restore_path /usr/bin/tg-ws-proxy
+	restore_path /usr/bin/tg-ws-proxy-rs
+	if [ "$OLD_CONFIG" -eq 1 ]; then restore_path /etc/config/tg-ws-proxy; fi
+	if [ "$OLD_LUCI_PACKAGE" -eq 0 ]; then
+		remove_luci_package
+		for path in /etc/init.d/tg-ws-proxy \
+			/usr/share/luci/menu.d/luci-app-tg-ws-proxy.json \
+			/usr/share/rpcd/acl.d/luci-app-tg-ws-proxy.json \
+			/usr/share/ucitrack/luci-app-tg-ws-proxy.json \
+			/www/luci-static/resources/view/tg-ws-proxy/settings.js; do
+			restore_path "$path"
+		done
+		[ "$OLD_CONFIG" -eq 1 ] || rm -f /etc/config/tg-ws-proxy
+	else
+		warn "The LuCI integration package remains at its upgraded version."
+	fi
+	[ "$LEGACY_PACKAGES_REMOVED" -eq 0 ] || \
+		warn "Legacy package registration could not be restored; recovered files are now manually managed."
+	restore_service_state
+	warn "Recovery files are retained in $BACKUP_DIR"
 }
 
 listener_ready() {
 	port="$1"
 	netstat -lnt 2>/dev/null | (
 		while IFS= read -r line; do
-			case "$line" in *":$port "*) exit 0;; esac
+			case "$line" in *":$port "*) exit 0 ;; esac
 		done
 		exit 1
 	)
 }
 
 wait_ready() {
-	port="$(uci -q get tg-ws-proxy.main.port)"
-	[ -n "$port" ] || port=1443
+	port="$(uci -q get tg-ws-proxy.main.port)"; [ -n "$port" ] || port=1443
 	i=0
 	while [ "$i" -lt 15 ]; do
-		if /etc/init.d/tg-ws-proxy status >/dev/null 2>&1 && listener_ready "$port"; then
-			return 0
-		fi
-		i=$((i + 1))
-		sleep 1
+		service_control status >/dev/null 2>&1 && listener_ready "$port" && return 0
+		i=$((i + 1)); sleep 1
 	done
 	return 1
 }
 
 main() {
-resolve_environment
-if [ -z "$PACKAGE_FILE" ]; then resolve_remote_package; fi
-resolve_luci_package
-resolve_local_checksums
+	resolve_environment
+	if [ -z "$ARCHIVE_FILE" ]; then resolve_remote_assets; else resolve_local_assets; fi
 
-if [ "$DRY_RUN" -eq 1 ]; then
-	printf 'package_manager=%s\narchitecture=%s\npackage=%s\nluci_package=%s\n' \
-		"$PM" "$ARCH" "$PACKAGE_FILE" "$LUCI_PACKAGE_FILE"
-	exit 0
-fi
+	if [ "$DRY_RUN" -eq 1 ]; then
+		variant=regular; [ "$USE_UPX" -eq 0 ] || variant=upx
+		printf 'package_manager=%s\narchitecture=%s\ntarget=%s\nvariant=%s\narchive=%s\nluci_package=%s\n' \
+			"$PM" "$ARCH" "$TARGET" "$variant" "$ARCHIVE_FILE" "$LUCI_PACKAGE_FILE"
+		exit 0
+	fi
 
-[ "$(id -u)" = 0 ] || die "run as root"
-load_openwrt_release || die "this is not OpenWrt"
-if [ ! -f "$PACKAGE_FILE" ] || [ ! -s "$PACKAGE_FILE" ]; then
-	die "package is missing or empty: $PACKAGE_FILE"
-fi
-case "$PACKAGE_FILE" in *.$EXT) ;; *) die "package extension does not match $PM: expected .$EXT";; esac
-if [ ! -f "$LUCI_PACKAGE_FILE" ] || [ ! -s "$LUCI_PACKAGE_FILE" ]; then
-	die "LuCI package is missing or empty: $LUCI_PACKAGE_FILE"
-fi
-case "$LUCI_PACKAGE_FILE" in *.$EXT) ;; *) die "LuCI package extension does not match $PM: expected .$EXT";; esac
-verify_checksum
-verify_luci_checksum
-validate_core_package_arch
+	[ "$(id -u)" = 0 ] || die "run as root"
+	load_openwrt_release || die "this is not OpenWrt"
+	command -v "$PM" >/dev/null 2>&1 || die "$PM is required"
+	command -v uci >/dev/null 2>&1 || die "uci is required"
+	[ -s "$ARCHIVE_FILE" ] || die "binary archive is missing: $ARCHIVE_FILE"
+	[ -s "$LUCI_PACKAGE_FILE" ] || die "LuCI package is missing: $LUCI_PACKAGE_FILE"
+	case "$ARCHIVE_FILE" in *.tar.gz) ;; *) die "binary archive must end in .tar.gz" ;; esac
+	case "$LUCI_PACKAGE_FILE" in *.$EXT) ;; *) die "LuCI package must end in .$EXT" ;; esac
+	verify_assets
+	stage_binary
 
-stamp="$(date +%Y%m%d-%H%M%S)"
-BACKUP_DIR="/root/tg-ws-proxy-backups/package-$stamp"
-mkdir -p "$BACKUP_DIR"
-chmod 0700 /root/tg-ws-proxy-backups "$BACKUP_DIR"
+	stamp="$(date +%Y%m%d-%H%M%S)"
+	BACKUP_DIR="/root/tg-ws-proxy-backups/install-$stamp"
+	mkdir -p "$BACKUP_DIR"
+	chmod 0700 /root/tg-ws-proxy-backups "$BACKUP_DIR"
+	[ -e /etc/config/tg-ws-proxy ] && OLD_CONFIG=1
+	core_is_installed && OLD_CORE_PACKAGE=1
+	luci_is_installed && OLD_LUCI_PACKAGE=1
+	service_control status >/dev/null 2>&1 && OLD_RUNNING=1
+	service_control enabled >/dev/null 2>&1 && OLD_ENABLED=1
 
-[ -e /etc/config/tg-ws-proxy ] && OLD_CONFIG=1
-if [ "$PM" = apk ]; then apk info -e tg-ws-proxy >/dev/null 2>&1 && OLD_PACKAGE=1; else opkg status tg-ws-proxy 2>/dev/null | grep -q 'Status:.*installed' && OLD_PACKAGE=1; fi
-if [ "$PM" = apk ]; then apk info -e luci-app-tg-ws-proxy >/dev/null 2>&1 && OLD_LUCI_PACKAGE=1; else opkg status luci-app-tg-ws-proxy 2>/dev/null | grep -q 'Status:.*installed' && OLD_LUCI_PACKAGE=1; fi
-/etc/init.d/tg-ws-proxy status >/dev/null 2>&1 && OLD_RUNNING=1
-/etc/init.d/tg-ws-proxy enabled >/dev/null 2>&1 && OLD_ENABLED=1
+	for path in /usr/bin/tg-ws-proxy /usr/bin/tg-ws-proxy-rs \
+		/etc/init.d/tg-ws-proxy /etc/config/tg-ws-proxy \
+		/usr/share/luci/menu.d/luci-app-tg-ws-proxy.json \
+		/usr/share/rpcd/acl.d/luci-app-tg-ws-proxy.json \
+		/usr/share/ucitrack/luci-app-tg-ws-proxy.json \
+		/www/luci-static/resources/view/tg-ws-proxy/settings.js; do
+		backup_path "$path"
+	done
+	pid="$(pidof tg-ws-proxy 2>/dev/null || pidof tg-ws-proxy-rs 2>/dev/null || true)"
+	if [ -n "$pid" ]; then
+		pid="${pid%% *}"
+		tr '\0' '\n' < "/proc/$pid/environ" > "$BACKUP_DIR/process.env"
+		tr '\0' '\n' < "/proc/$pid/cmdline" > "$BACKUP_DIR/process.cmd"
+		chmod 0600 "$BACKUP_DIR/process.env" "$BACKUP_DIR/process.cmd"
+	fi
 
-for path in \
-	/usr/bin/tg-ws-proxy \
-	/usr/bin/tg-ws-proxy-rs \
-	/etc/init.d/tg-ws-proxy \
-	/etc/config/tg-ws-proxy \
-	/usr/share/luci/menu.d/luci-app-tg-ws-proxy.json \
-	/usr/share/rpcd/acl.d/luci-app-tg-ws-proxy.json \
-	/usr/share/ucitrack/luci-app-tg-ws-proxy.json \
-	/www/luci-static/resources/view/tg-ws-proxy/settings.js
-do
-	backup_path "$path"
-done
-pid="$(pidof tg-ws-proxy 2>/dev/null || pidof tg-ws-proxy-rs 2>/dev/null || true)"
-if [ -n "$pid" ]; then
-	pid="${pid%% *}"
-	tr '\0' '\n' < "/proc/$pid/environ" > "$BACKUP_DIR/process.env"
-	tr '\0' '\n' < "/proc/$pid/cmdline" > "$BACKUP_DIR/process.cmd"
-	chmod 0600 "$BACKUP_DIR/process.env" "$BACKUP_DIR/process.cmd"
-fi
+	info "Backup: $BACKUP_DIR"
+	service_control stop >/dev/null 2>&1 || true
+	if [ "$OLD_CORE_PACKAGE" -eq 1 ]; then
+		info "Migrating the previous core-package installation to a raw release binary."
+		LEGACY_PACKAGES_REMOVED=1
+		OLD_LUCI_PACKAGE=0
+		remove_luci_package
+		luci_is_installed && { rollback; die "cannot remove the previous LuCI package"; }
+		remove_core_package
+		core_is_installed && { rollback; die "cannot remove the previous core package"; }
+		if [ "$OLD_CONFIG" -eq 1 ] && [ ! -e /etc/config/tg-ws-proxy ]; then
+			cp -p "$BACKUP_DIR/etc/config/tg-ws-proxy" /etc/config/tg-ws-proxy
+		fi
+	fi
+	if [ "$OLD_LUCI_PACKAGE" -eq 0 ]; then
+		rm -f /etc/init.d/tg-ws-proxy /etc/init.d/tg-ws-proxy.apk-new \
+			/etc/init.d/tg-ws-proxy-opkg
+	fi
+	if ! install_luci_package; then
+		rollback; die "LuCI package installation failed"
+	fi
+	rm -f /etc/config/tg-ws-proxy.apk-new /etc/config/tg-ws-proxy-opkg
+	if [ -x /etc/uci-defaults/95_luci-tg-ws-proxy ]; then
+		/etc/uci-defaults/95_luci-tg-ws-proxy || { rollback; die "OpenWrt migration failed"; }
+		rm -f /etc/uci-defaults/95_luci-tg-ws-proxy
+	fi
+	migrate_manual_config || { rollback; die "manual configuration migration failed"; }
 
-info "Backup: $BACKUP_DIR"
-/etc/init.d/tg-ws-proxy stop >/dev/null 2>&1 || true
-if [ "$OLD_PACKAGE" -eq 0 ]; then
-	# /etc is protected by apk. Without removing the backed-up manual init,
-	# apk installs the packaged procd script as .apk-new and restarts legacy code.
-	rm -f /etc/init.d/tg-ws-proxy /etc/init.d/tg-ws-proxy.apk-new
-fi
-if ! install_package; then rollback; die "package manager failed"; fi
-# Preserve the active UCI config and discard the package-default copy produced on upgrades.
-rm -f /etc/config/tg-ws-proxy.apk-new
-if ! migrate_manual_config; then rollback; die "UCI migration failed"; fi
-/etc/init.d/tg-ws-proxy enable >/dev/null 2>&1 || { rollback; die "cannot enable service"; }
-/etc/init.d/tg-ws-proxy restart >/dev/null 2>&1 || { rollback; die "cannot restart service"; }
-if ! wait_ready; then rollback; die "service did not become ready"; fi
+	binary_tmp="/usr/bin/.tg-ws-proxy.$$"
+	install -m 0755 "$STAGED_BINARY" "$binary_tmp" || { rollback; die "cannot stage binary"; }
+	mv -f "$binary_tmp" /usr/bin/tg-ws-proxy || { rm -f "$binary_tmp"; rollback; die "cannot install binary"; }
+	service_control enable >/dev/null 2>&1 || { rollback; die "cannot enable service"; }
+	service_control restart >/dev/null 2>&1 || { rollback; die "cannot restart service"; }
+	wait_ready || { rollback; die "service did not become ready"; }
 
-new_pid="$(pidof tg-ws-proxy 2>/dev/null || true)"
-[ -n "$new_pid" ] || { rollback; die "new process is missing"; }
-new_pid="${new_pid%% *}"
-new_exe="$(readlink "/proc/$new_pid/exe" 2>/dev/null || true)"
-[ "$new_exe" = /usr/bin/tg-ws-proxy ] || { rollback; die "unexpected running executable: $new_exe"; }
+	new_pid="$(pidof tg-ws-proxy 2>/dev/null || true)"
+	[ -n "$new_pid" ] || { rollback; die "new process is missing"; }
+	new_pid="${new_pid%% *}"
+	new_exe="$(readlink "/proc/$new_pid/exe" 2>/dev/null || true)"
+	[ "$new_exe" = /usr/bin/tg-ws-proxy ] || { rollback; die "unexpected running executable: $new_exe"; }
+	[ -s /usr/share/luci/menu.d/luci-app-tg-ws-proxy.json ] || { rollback; die "LuCI menu is missing"; }
+	[ -s /www/luci-static/resources/view/tg-ws-proxy/settings.js ] || { rollback; die "LuCI view is missing"; }
+	rm -f /usr/bin/tg-ws-proxy-rs /tmp/luci-indexcache
+	rm -rf /tmp/luci-modulecache
+	/etc/init.d/rpcd reload >/dev/null 2>&1 || warn "rpcd reload failed; LuCI may need a manual reload"
 
-if ! install_luci_package; then rollback; die "LuCI package manager failed"; fi
-rm -f /tmp/luci-indexcache
-rm -rf /tmp/luci-modulecache
-/etc/init.d/rpcd reload >/dev/null 2>&1 || { rollback; die "cannot reload rpcd"; }
-if ! verify_luci_files; then rollback; die "LuCI package files are missing"; fi
-
-# The package owns /usr/bin/tg-ws-proxy. Keep the legacy binary only in rollback backup.
-rm -f /usr/bin/tg-ws-proxy-rs
-
-ok "tg-ws-proxy installed and running."
-ok "LuCI page installed under Services → Telegram WS Proxy."
-info "Package manager: $PM | architecture: $ARCH | PID: $new_pid"
-info "Rollback backup: $BACKUP_DIR"
+	variant=regular; [ "$USE_UPX" -eq 0 ] || variant=upx
+	ok "tg-ws-proxy installed and running."
+	ok "LuCI page installed under Services → Telegram WS Proxy."
+	info "Binary: $TARGET ($variant) | PID: $new_pid"
+	info "Rollback backup: $BACKUP_DIR"
 }
 
 if [ "${TG_WS_PROXY_TEST_MODE:-0}" != 1 ]; then

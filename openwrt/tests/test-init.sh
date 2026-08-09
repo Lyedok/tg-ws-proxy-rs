@@ -2,16 +2,14 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-INIT="$ROOT/openwrt/files/tg-ws-proxy.init"
-[[ -f "$INIT" ]] || { printf 'FAIL: missing openwrt/files/tg-ws-proxy.init\n' >&2; exit 1; }
+INIT="$ROOT/openwrt/luci-app/root/etc/init.d/tg-ws-proxy"
+[[ -f "$INIT" ]] || { printf 'FAIL: missing packaged init script\n' >&2; exit 1; }
 
 declare -A CFG=()
 declare -A LISTS=()
 declare -a EVENTS=()
 declare -a ENVS=()
-TEST_RUNTIME="$(mktemp -d)"
-export TG_WS_PROXY_RUNTIME_DIR="$TEST_RUNTIME"
-trap 'rm -rf "$TEST_RUNTIME"' EXIT
+
 
 config_load() { EVENTS+=("config_load:$1"); }
 config_get() {
@@ -90,9 +88,6 @@ CFG[main.cf_priority]=1
 LISTS[main.dc_ip]=$'2:149.154.167.220\n4:149.154.167.220'
 LISTS[main.cf_domain]=$'one.example\ntwo.example'
 LISTS[main.cf_worker_domain]=$'worker-one.example\nworker-two.example'
-printf 'legacy current log' > "$TEST_RUNTIME/tg-ws-proxy.log"
-printf 'legacy rotated log' > "$TEST_RUNTIME/tg-ws-proxy.log.1"
-
 start_service
 has_event 'open:tg-ws-proxy.main' || { printf 'FAIL: enabled service did not open procd\n' >&2; exit 1; }
 has_event 'set:command:/usr/bin/tg-ws-proxy' || { printf 'FAIL: wrong procd command\n' >&2; exit 1; }
@@ -109,10 +104,7 @@ for expected in \
     'TG_CF_DOMAIN=one.example,two.example'; do
     has_env "$expected" || { printf 'FAIL: missing env %s\n' "$expected" >&2; exit 1; }
 done
-[[ ! -e "$TEST_RUNTIME/tg-ws-proxy.log" && ! -e "$TEST_RUNTIME/tg-ws-proxy.log.1" ]] || {
-    printf 'FAIL: legacy runtime logs were not removed\n' >&2
-    exit 1
-}
+
 for legacy_env in TG_LOG_FILE TG_VERBOSE TG_QUIET; do
     for item in "${ENVS[@]}"; do
         [[ "$item" != "$legacy_env="* ]] || { printf 'FAIL: legacy env %s is still passed\n' "$legacy_env" >&2; exit 1; }
@@ -132,16 +124,18 @@ has_env 'TG_CF_WORKER_DOMAIN=legacy-worker.example' || {
     exit 1
 }
 
-# Existing UCI with legacy quiet/verbose options is mapped to native Rust levels.
+# Legacy quiet/verbose remains readable, but normal service start must not mutate UCI.
 EVENTS=(); ENVS=(); CFG=(); LISTS=()
 CFG[main.enabled]=1
 CFG[main.secret]=0123456789abcdef0123456789abcdef
 CFG[main.verbose]=1
 start_service
 has_env 'RUST_LOG=warn,tg_ws_proxy=debug,tg_ws_proxy_rs=debug' || { printf 'FAIL: legacy verbose=1 did not map to app-only debug\n' >&2; exit 1; }
-has_event 'uci:-q set tg-ws-proxy.main.log_level=debug' || { printf 'FAIL: debug level was not persisted\n' >&2; exit 1; }
-has_event 'uci:-q delete tg-ws-proxy.main.verbose' || { printf 'FAIL: legacy verbose option was not removed\n' >&2; exit 1; }
-has_event 'uci:-q commit tg-ws-proxy' || { printf 'FAIL: logging migration was not committed\n' >&2; exit 1; }
+for item in "${EVENTS[@]}"; do
+    [[ "$item" != uci:-q\ set* && "$item" != uci:-q\ delete* && "$item" != 'uci:-q commit'* ]] || {
+        printf 'FAIL: start_service mutates UCI: %s\n' "$item" >&2; exit 1;
+    }
+done
 
 EVENTS=(); ENVS=(); CFG=(); LISTS=()
 CFG[main.enabled]=1
@@ -150,22 +144,19 @@ CFG[main.verbose]=1
 CFG[main.quiet]=1
 start_service
 has_env 'RUST_LOG=off' || { printf 'FAIL: legacy quiet=1 did not take precedence as off\n' >&2; exit 1; }
-has_event 'uci:-q set tg-ws-proxy.main.log_level=off' || { printf 'FAIL: off level was not persisted\n' >&2; exit 1; }
-has_event 'uci:-q delete tg-ws-proxy.main.quiet' || { printf 'FAIL: legacy quiet option was not removed\n' >&2; exit 1; }
 
-# A missing secret must become a persistent 32-hex UCI value.
+# A missing secret is an installation error, not a reason to mutate UCI on start.
 EVENTS=(); ENVS=(); CFG=(); LISTS=()
 CFG[main.enabled]=1
 CFG[main.host]=127.0.0.1
 CFG[main.port]=1443
-start_service
-generated=''
-for item in "${ENVS[@]}"; do
-    case "$item" in TG_SECRET=*) generated="${item#TG_SECRET=}";; esac
-done
-[[ "$generated" =~ ^[0-9a-f]{32}$ ]] || { printf 'FAIL: generated secret is not 32 lowercase hex chars\n' >&2; exit 1; }
-has_event "uci:-q set tg-ws-proxy.main.secret=$generated" || { printf 'FAIL: generated secret was not written to UCI\n' >&2; exit 1; }
-has_event 'uci:-q commit tg-ws-proxy' || { printf 'FAIL: generated secret was not committed\n' >&2; exit 1; }
+start_service || true
+if has_event 'open:tg-ws-proxy.main'; then
+    printf 'FAIL: missing secret still started the service\n' >&2; exit 1
+fi
+has_event 'logger:-t tg-ws-proxy proxy secret is missing; rerun install.sh or set tg-ws-proxy.main.secret' || {
+    printf 'FAIL: missing secret error was not logged\n' >&2; exit 1;
+}
 
 EVENTS=()
 service_triggers

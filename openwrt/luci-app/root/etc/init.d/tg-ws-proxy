@@ -9,7 +9,6 @@ NAME="tg-ws-proxy"
 PROG="/usr/bin/tg-ws-proxy"
 CONFIG="tg-ws-proxy"
 SECTION="main"
-LEGACY_RUNTIME_DIR="${TG_WS_PROXY_RUNTIME_DIR:-/var/run/tg-ws-proxy}"
 
 append_env() {
 	local option="$1"
@@ -70,10 +69,6 @@ append_dc_ip() {
 	return 0
 }
 
-generate_secret() {
-	dd if=/dev/urandom bs=16 count=1 2>/dev/null | hexdump -v -e '1/1 "%02x"'
-}
-
 resolve_log_level() {
 	local log_level quiet verbose
 
@@ -103,30 +98,6 @@ rust_log_filter() {
 	esac
 }
 
-migrate_logging_config() {
-	local log_level="$1"
-	local current option changed=0
-
-	config_get current "$SECTION" log_level
-	if [ "$current" != "$log_level" ]; then
-		uci -q set "$CONFIG.$SECTION.log_level=$log_level"
-		changed=1
-	fi
-	for option in quiet verbose log_file; do
-		if uci -q get "$CONFIG.$SECTION.$option" >/dev/null 2>&1; then
-			uci -q delete "$CONFIG.$SECTION.$option"
-			changed=1
-		fi
-	done
-	[ "$changed" -eq 0 ] || uci -q commit "$CONFIG"
-}
-
-cleanup_legacy_runtime_logs() {
-	rm -f "$LEGACY_RUNTIME_DIR/tg-ws-proxy.log" \
-		"$LEGACY_RUNTIME_DIR/tg-ws-proxy.log.1"
-	rmdir "$LEGACY_RUNTIME_DIR" 2>/dev/null || true
-}
-
 start_service() {
 	local enabled secret log_level log_filter
 
@@ -136,19 +107,12 @@ start_service() {
 
 	config_get secret "$SECTION" secret
 	if [ -z "$secret" ]; then
-		secret="$(generate_secret)"
-		case "$secret" in
-			????????????????????????????????) ;;
-			*) logger -t "$NAME" "failed to generate persistent proxy secret"; return 1 ;;
-		esac
-		uci -q set "$CONFIG.$SECTION.secret=$secret"
-		uci -q commit "$CONFIG"
+		logger -t "$NAME" "proxy secret is missing; rerun install.sh or set tg-ws-proxy.main.secret"
+		return 1
 	fi
 
 	log_level="$(resolve_log_level)"
 	log_filter="$(rust_log_filter "$log_level")"
-	migrate_logging_config "$log_level"
-	cleanup_legacy_runtime_logs
 
 	procd_open_instance "$NAME.$SECTION"
 	procd_set_param command "$PROG"
@@ -184,7 +148,6 @@ start_service() {
 	append_env pool_max_age TG_POOL_MAX_AGE 55
 	append_env outbound_proxy TG_OUTBOUND_PROXY
 	append_env no_proxy TG_NO_PROXY
-
 
 	append_bool_env danger_accept_invalid_certs TG_SKIP_TLS_VERIFY 0
 	append_bool_env cf_priority TG_CF_PRIORITY 0
