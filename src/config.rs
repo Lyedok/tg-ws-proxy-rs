@@ -122,6 +122,7 @@ fn parse_dc_ip(s: &str) -> Result<(u32, String), String> {
 #[derive(Parser, Clone, Debug)]
 #[command(
     name = "tg-ws-proxy",
+    version,
     about = "Telegram MTProto WebSocket Bridge Proxy",
     long_about = "Local MTProto proxy that tunnels Telegram Desktop traffic \
                   through WebSocket connections to Telegram DCs.\n\

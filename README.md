@@ -101,6 +101,7 @@ tg-ws-proxy [OPTIONS]
 | `-q / --quiet` | off | Suppress all log output |
 | `-v / --verbose` | off | Debug logging |
 | `--danger-accept-invalid-certs` | off | Skip TLS verification |
+| `-V / --version` | — | Print the version and exit |
 
 Every flag has a matching `TG_*` environment variable (`TG_PORT`, `TG_HOST`,
 `TG_SECRET`, …) — the full list is in
