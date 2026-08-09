@@ -27,6 +27,9 @@ grep -Fq '/etc/config/tg-ws-proxy' "$makefile" || fail 'UCI conffile is not decl
 cargo_version="$(python3 -c 'import tomllib,sys; print(tomllib.load(open(sys.argv[1], "rb"))["package"]["version"])' "$ROOT/Cargo.toml")"
 grep -Fq ",$cargo_version)" "$makefile" || fail "LuCI default version does not match Cargo $cargo_version"
 [[ -f "$ROOT/docs/release-notes/$cargo_version.md" ]] || fail "release notes for $cargo_version are missing"
+# shellcheck disable=SC2016 # Match a literal Bash parameter expansion.
+grep -Fq 'output_name="${output_name//\~/.}"' "$ROOT/openwrt/build-luci-package.sh" || \
+    fail 'beta IPK release filename is not normalized before checksums'
 
 workflow="$ROOT/.github/workflows/release.yml"
 grep -Fq 'openwrt/build-luci-package.sh' "$workflow" || fail 'release does not build LuCI through the SDK recipe'

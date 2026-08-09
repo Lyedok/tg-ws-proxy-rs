@@ -64,5 +64,11 @@ else
 fi
 
 mkdir -p "$OUTPUT"
-cp "$package" "$OUTPUT/"
-printf '%s\n' "$OUTPUT/${package##*/}"
+output_name="${package##*/}"
+# GitHub Releases rewrites '~' to '.' in asset names. Normalize the public IPK
+# filename before checksums are generated; package metadata keeps '~beta'.
+if [[ "$FORMAT" == ipk ]]; then
+    output_name="${output_name//\~/.}"
+fi
+cp "$package" "$OUTPUT/$output_name"
+printf '%s\n' "$OUTPUT/$output_name"
