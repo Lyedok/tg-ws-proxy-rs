@@ -56,6 +56,11 @@ cargo build --release
 The binary lands in `target/release/tg-ws-proxy`. Cross-compiling for OpenWrt
 (MIPS/ARM/ARM64) is covered in [docs/Building.md](docs/Building.md).
 
+### OpenWrt
+
+APK/IPK packages, LuCI and a one-line installer are available. See
+[OpenWrt installation](#openwrt-installation) below.
+
 ### Telegram Desktop setup
 
 1. **Settings → Advanced → Connection type → Use custom proxy**
@@ -65,6 +70,77 @@ The binary lands in `target/release/tg-ws-proxy`. Cross-compiling for OpenWrt
    - **Secret:** shown in the proxy startup log
 
 Or use the `tg://proxy?...` link that is printed on startup.
+
+## OpenWrt installation
+
+### Requirements
+
+- **OpenWrt 25.12+ (APK)** or **ImmortalWrt 25.12+ (APK)**.
+- **OpenWrt 24.10 (opkg)** or **ImmortalWrt 24.10 (opkg)**.
+- A CPU ISA supported by
+  [`openwrt/release-architectures.tsv`](openwrt/release-architectures.tsv).
+  The installer maps `DISTRIB_ARCH` to `aarch64`, `armv7`, `mips`, `mipsel` or
+  `x86_64` and downloads that package directly.
+- Root SSH access to the router and enough overlay space for the core and LuCI
+  packages. Python is not required: the proxy is a static musl binary.
+
+GitHub Releases contains one core APK and IPK for each of the five real CPU
+ISAs, one architecture-independent LuCI package per format and one
+`SHA256SUMS`. There are no duplicated per-microarchitecture packages or bundle
+archives, and adding a third-party feed is not required.
+
+### Quick install (one-liner)
+
+Run over SSH **on the router**:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/valnesfjord/tg-ws-proxy-rs/main/install.sh | sh
+```
+
+The installer detects APK/opkg and `DISTRIB_ARCH`, downloads only the matching
+core and LuCI packages, verifies both against `SHA256SUMS`, migrates a known
+manual configuration and starts the procd service. Re-run the same command to
+upgrade; configuration backup and rollback are handled automatically.
+
+If GitHub release downloads require a mirror, put the variable on `sh` (not on
+`wget`):
+
+```sh
+wget -qO- https://raw.githubusercontent.com/valnesfjord/tg-ws-proxy-rs/main/install.sh | \
+  GH_MIRROR=https://your.mirror sh
+```
+
+### Beta releases
+
+Beta tags (`vX.Y.Z-beta.N`) are normal GitHub prereleases containing the same
+platform binaries and direct OpenWrt package set. Stable is the default; beta
+installation is explicit:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/valnesfjord/tg-ws-proxy-rs/main/install.sh | \
+  sh -s -- --channel beta
+```
+
+Publishing a beta does not change the stable `releases/latest` channel.
+
+### Manual APK/IPK install
+
+Download the core package for the router's CPU ISA, the matching LuCI package
+and `SHA256SUMS` from [Releases](../../releases), place all three in one
+directory, then run the downloaded installer with `--package CORE_PATH`. A
+copy-over-SSH example is in the
+[OpenWrt package guide](docs/OpenWrtPackage.md#install-a-local-build).
+
+### Configure and operate
+
+After installation, open **Services → Telegram WS Proxy** in LuCI. Configure the
+listener, advertised link address, secret and any outbound/Cloudflare fallback,
+then use **Save & Apply**. The page includes service controls and a filtered live
+view of the bounded OpenWrt `logd` ring buffer. The package does not open a WAN
+firewall port automatically.
+
+For UCI examples, firewall guidance, package internals and rollback details, see
+the full [OpenWrt package guide](docs/OpenWrtPackage.md).
 
 ## Usage
 
@@ -190,6 +266,7 @@ cooldown are all documented in [docs/Fallbacks.md](docs/Fallbacks.md).
 | [docs/Fallbacks.md](docs/Fallbacks.md) | Routing tiers: Cloudflare proxy/Worker, default domains, domain fronting, upstream MTProto proxies, inbound FakeTLS, outbound proxy |
 | [docs/Building.md](docs/Building.md) | Building, cross-compiling for OpenWrt, and shrinking the binary with UPX |
 | [docs/Deployment.md](docs/Deployment.md) | Docker, router deployment, OpenWrt init script, environment variables |
+| [docs/OpenWrtPackage.md](docs/OpenWrtPackage.md) | Standalone APK/IPK builds, UCI/procd configuration, installer, upgrades and rollback |
 | [docs/CfProxy.md](docs/CfProxy.md) | Cloudflare DNS proxy setup, step by step |
 | [docs/CfWorker.md](docs/CfWorker.md) | Cloudflare Worker TCP tunnel setup |
 | [AGENTS.md](AGENTS.md) | Repository layout and conventions for contributors |

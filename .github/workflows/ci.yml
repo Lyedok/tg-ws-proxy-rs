@@ -55,12 +55,15 @@ jobs:
             echo "Release version OK: $base_version -> $current_version"
           elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             tag_version="${GITHUB_REF_NAME#v}"
-            if [[ "$current_version" != "$tag_version" ]]; then
-              echo "::error file=Cargo.toml::tag ${GITHUB_REF_NAME} does not match package.version $current_version"
+            escaped_version="${current_version//./\\.}"
+            if [[ "$tag_version" == "$current_version" ]]; then
+              echo "Stable release tag OK: ${GITHUB_REF_NAME} matches Cargo.toml"
+            elif [[ "$tag_version" =~ ^${escaped_version}-beta\.[1-9][0-9]*$ ]]; then
+              echo "Beta release tag OK: ${GITHUB_REF_NAME} is based on Cargo.toml $current_version"
+            else
+              echo "::error file=Cargo.toml::tag ${GITHUB_REF_NAME} must be v${current_version} or v${current_version}-beta.N"
               exit 1
             fi
-
-            echo "Release tag OK: ${GITHUB_REF_NAME} matches Cargo.toml"
           else
             echo "Release version check skipped for ${GITHUB_EVENT_NAME} on ${GITHUB_REF_NAME}"
           fi
@@ -83,3 +86,29 @@ jobs:
 
       - name: Release build
         run: cargo build --release --locked
+
+  openwrt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install shell tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Check shell scripts
+        run: |
+          shellcheck -s sh install.sh openwrt/files/tg-ws-proxy.init \
+            openwrt/luci-app/root/etc/uci-defaults/95_luci-tg-ws-proxy
+          shellcheck -s bash openwrt/build-package.sh openwrt/tests/*.sh
+
+      - name: Check LuCI JavaScript and JSON
+        run: |
+          node --check openwrt/luci-app/htdocs/luci-static/resources/view/tg-ws-proxy/settings.js
+          python3 -m json.tool openwrt/luci-app/root/usr/share/luci/menu.d/luci-app-tg-ws-proxy.json >/dev/null
+          python3 -m json.tool openwrt/luci-app/root/usr/share/rpcd/acl.d/luci-app-tg-ws-proxy.json >/dev/null
+          python3 -m json.tool openwrt/luci-app/root/usr/share/ucitrack/luci-app-tg-ws-proxy.json >/dev/null
+
+      - name: Run OpenWrt package contracts
+        run: openwrt/tests/run.sh

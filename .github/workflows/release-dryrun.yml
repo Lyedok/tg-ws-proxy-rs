@@ -101,7 +101,7 @@ jobs:
                   .github/scripts/pack-verify.sh \
                       "target/${{ matrix.target }}/release/tg-ws-proxy" ${{ matrix.qemu }}
 
-            - uses: actions/upload-artifact@v4
+            - uses: actions/upload-artifact@v7
               with:
                   name: packed-${{ matrix.target }}
                   path: target/${{ matrix.target }}/release/tg-ws-proxy

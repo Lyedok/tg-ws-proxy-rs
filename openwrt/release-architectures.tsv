@@ -1,0 +1,8 @@
+# Rust target	Package CPU ISA
+# One package payload per actually different release binary. Device-specific
+# OpenWrt optimization labels are resolved to these ISAs by install.sh.
+aarch64-unknown-linux-musl	aarch64
+armv7-unknown-linux-musleabihf	armv7
+mips-unknown-linux-musl	mips
+mipsel-unknown-linux-musl	mipsel
+x86_64-unknown-linux-musl	x86_64

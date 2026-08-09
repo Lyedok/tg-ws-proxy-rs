@@ -133,6 +133,111 @@ jobs:
                   tar -C "${TMPDIR}" -czf "${NAME}.tar.gz" tg-ws-proxy
                   gh release upload "$TAG" "${NAME}.tar.gz" --clobber
 
+    openwrt-packages:
+        needs: [create-release, upload-assets]
+        runs-on: ubuntu-latest
+        env:
+            OPENWRT_VERSION: 25.12.5
+            OPENWRT_SDK_FILE: openwrt-sdk-25.12.5-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+            OPENWRT_SDK_SHA256: ff4a38a397caa2cfe1c39e18f84ddede14878221b3593c3f2c4cfe24e3ec4c25
+        steps:
+            - uses: actions/checkout@v6
+
+            - name: Download Linux musl release binaries
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  root=/tmp/tg-ws-proxy-release-binaries
+                  mkdir -p "$root"
+                  declare -A downloaded=()
+                  while IFS=$'\t' read -r target _; do
+                      case "$target" in ''|'#'*) continue ;; esac
+                      if [[ -z "${downloaded[$target]:-}" ]]; then
+                          target_dir="$root/$target"
+                          mkdir -p "$target_dir"
+                          archive="tg-ws-proxy-${target}.tar.gz"
+                          gh release download "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+                              --pattern "$archive" --dir "$target_dir"
+                          tar -C "$target_dir" -xzf "$target_dir/$archive"
+                          test -x "$target_dir/tg-ws-proxy"
+                          downloaded[$target]=1
+                      fi
+                  done < openwrt/release-architectures.tsv
+
+            - name: Download and verify OpenWrt SDK host tools
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  base="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/mediatek/filogic"
+                  curl -fsSLO "${base}/${OPENWRT_SDK_FILE}"
+                  printf '%s  %s\n' "${OPENWRT_SDK_SHA256}" "${OPENWRT_SDK_FILE}" | sha256sum -c -
+                  tar --zstd -xf "${OPENWRT_SDK_FILE}"
+                  sdk_dir="${PWD}/${OPENWRT_SDK_FILE%.tar.zst}"
+                  test -x "${sdk_dir}/staging_dir/host/bin/apk"
+                  printf 'OPENWRT_SDK=%s\n' "$sdk_dir" >> "$GITHUB_ENV"
+
+            - name: Build and verify multi-architecture OpenWrt packages
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+                  prerelease=''
+                  case "${GITHUB_REF_NAME}" in
+                      "v${version}") ;;
+                      "v${version}-beta."[1-9]*)
+                          tag_version="${GITHUB_REF_NAME#v}"
+                          prerelease="${tag_version#"$version"-}"
+                      ;;
+                      *) echo "::error::unsupported release tag ${GITHUB_REF_NAME}"; exit 1 ;;
+                  esac
+
+                  binaries=/tmp/tg-ws-proxy-release-binaries
+                  final="${PWD}/dist/openwrt"
+                  rm -rf "$final"
+                  mkdir -p "$final"
+                  luci_copied=0
+                  while IFS=$'\t' read -r target package_arch; do
+                      case "$target" in ''|'#'*) continue ;; esac
+                      out="/tmp/openwrt-package-${package_arch}"
+                      rm -rf "$out"
+                      openwrt/build-package.sh \
+                          --binary "$binaries/$target/tg-ws-proxy" \
+                          --apk-arch "$package_arch" \
+                          --ipk-arch "$package_arch" \
+                          --prerelease "$prerelease" \
+                          --output "$out" \
+                          --format both
+                      cp "$out"/tg-ws-proxy_*.apk "$out"/tg-ws-proxy_*.ipk "$final/"
+                      if [[ "$luci_copied" -eq 0 ]]; then
+                          cp "$out"/luci-app-tg-ws-proxy_*.apk \
+                              "$out"/luci-app-tg-ws-proxy_*.ipk "$final/"
+                          luci_copied=1
+                      fi
+                  done < openwrt/release-architectures.tsv
+
+                  (
+                      cd "$final"
+                      set -- tg-ws-proxy_*.apk
+                      [[ "$#" -eq 5 ]]
+                      set -- tg-ws-proxy_*.ipk
+                      [[ "$#" -eq 5 ]]
+                      set -- luci-app-tg-ws-proxy_*.apk luci-app-tg-ws-proxy_*.ipk
+                      [[ "$#" -eq 2 ]]
+                      sha256sum -- *.apk *.ipk > SHA256SUMS
+                      sha256sum -c SHA256SUMS
+                  )
+
+            - name: Upload OpenWrt packages
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  gh release upload "${GITHUB_REF_NAME}" dist/openwrt/* \
+                      --repo "${GITHUB_REPOSITORY}" --clobber
+
     # Extra UPX-packed assets for flash-constrained devices (OpenWrt routers).
     #
     # These do not replace the plain assets: packing trades RAM for flash. A
@@ -210,11 +315,12 @@ jobs:
                   gh release upload "$TAG" "${NAME}-upx.tar.gz" \
                       --repo "${GITHUB_REPOSITORY}" --clobber
 
-    # Both `needs` must succeed, so a target that failed to build leaves the
-    # release a draft rather than publishing a half-populated one. Finish the
-    # job by hand (or re-run the failed leg) and the draft is still there.
+    # Every asset job must succeed, so a target or OpenWrt package set that failed
+    # to build leaves the release a draft rather than publishing a half-populated
+    # one. Finish the job by hand (or re-run the failed leg) and the draft is
+    # still there.
     publish-release:
-        needs: [upload-assets, compress-assets]
+        needs: [upload-assets, openwrt-packages, compress-assets]
         runs-on: ubuntu-latest
         steps:
             - name: Publish the draft now that every asset is uploaded

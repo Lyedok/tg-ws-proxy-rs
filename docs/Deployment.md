@@ -60,7 +60,16 @@ On flash-tight routers, grab the `-upx` release asset — it is about 70% smalle
 on disk. See [Building.md](Building.md#shrinking-the-binary-for-flash-constrained-devices)
 for what that costs in RAM.
 
-### OpenWrt procd init script
+### OpenWrt package (recommended)
+
+This repository contains standalone core APK/IPK packaging, a matching
+`luci-app-tg-ws-proxy`, a UCI-managed procd service, and a BusyBox-compatible
+installer. Configure it at **Services → Telegram WS Proxy**; the Logging tab
+shows filtered entries from the bounded OpenWrt `logd` ring buffer. See
+[OpenWrtPackage.md](OpenWrtPackage.md) for local builds, installation,
+configuration, upgrades, and rollback.
+
+### Manual OpenWrt procd init script
 
 Create `/etc/init.d/tg-ws-proxy`:
 
