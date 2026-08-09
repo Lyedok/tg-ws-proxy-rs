@@ -64,6 +64,35 @@ builds. **Any change destined for `main` must bump the `version` field in `Cargo
 `cargo build` regenerate the matching line in `Cargo.lock`) — the CI job `release-version` fails
 the PR otherwise.
 
+## Releases
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which needs nothing done by hand
+afterwards — **but the release notes have to be in the commit being tagged.**
+
+**Every PR that bumps the version also writes `docs/release-notes/<version>.md`** (no `v`, e.g.
+`docs/release-notes/2.2.2.md`). `create-release` feeds that file to `parse-changelog` and uses the
+result as the release body; `allow-missing-changelog` is left at `false`, so a missing or
+misnamed file fails the release *after* the tag has been pushed. Two constraints on the file:
+
+- **The heading must be a bare `# vX.Y.Z`.** `# tg-ws-proxy-rs v2.2.2` is not recognised as a
+  version heading, and `prefix-format` does not fix it. The crate name lives in the workflow's
+  `title:` input. Everything below the heading is the body verbatim, so `##` sections, tables and
+  `<details>` blocks work — match the tone of the existing notes: what changed, why it matters,
+  and honestly what it costs.
+- **Check it before tagging** with `parse-changelog docs/release-notes/<version>.md <version>`,
+  which prints exactly what the release will show.
+
+If a version is bumped past without ever being tagged, **fold its notes into the new version's
+file** rather than leaving both — only the tagged version's file is ever read, and the skipped
+one's changes would silently go unannounced.
+
+The release is created as a draft and published by the `publish-release` job only once every
+asset (plain and UPX) has uploaded. A failed target therefore leaves a draft rather than a
+half-populated public release: fix or re-run the failed leg, and the same draft is completed and
+published. Anything in `release.yml` that addresses the release by tag name is addressing a draft
+— `.github/workflows/release-dryrun.yml` rehearses those calls on pull requests, so add a
+rehearsal there when adding one.
+
 ## Conventions to follow
 
 - **CLI flags mirror env vars.** Every `#[arg(...)]` in `config.rs` has an `env = "TG_*"` fallback.
