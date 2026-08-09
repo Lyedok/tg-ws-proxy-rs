@@ -397,3 +397,17 @@ fn cf_worker_domains_accept_repeated_flags_including_alias() {
         ]
     );
 }
+
+#[test]
+fn version_flag_prints_the_crate_version() {
+    for flag in ["--version", "-V"] {
+        let err = Config::try_parse_from(["tg-ws-proxy", flag]).unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(
+            err.to_string().contains(env!("CARGO_PKG_VERSION")),
+            "{flag} output {:?} does not contain the crate version",
+            err.to_string()
+        );
+    }
+}
