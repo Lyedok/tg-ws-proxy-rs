@@ -523,7 +523,8 @@ main() {
 	migrate_manual_config || { rollback; die "manual configuration migration failed"; }
 
 	binary_tmp="/usr/bin/.tg-ws-proxy.$$"
-	install -m 0755 "$STAGED_BINARY" "$binary_tmp" || { rollback; die "cannot stage binary"; }
+	cp "$STAGED_BINARY" "$binary_tmp" || { rollback; die "cannot stage binary"; }
+	chmod 0755 "$binary_tmp" || { rm -f "$binary_tmp"; rollback; die "cannot make binary executable"; }
 	mv -f "$binary_tmp" /usr/bin/tg-ws-proxy || { rm -f "$binary_tmp"; rollback; die "cannot install binary"; }
 	service_control enable >/dev/null 2>&1 || { rollback; die "cannot enable service"; }
 	service_control restart >/dev/null 2>&1 || { rollback; die "cannot restart service"; }

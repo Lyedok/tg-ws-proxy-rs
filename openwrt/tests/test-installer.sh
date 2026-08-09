@@ -11,6 +11,10 @@ for token in '--archive' '--luci-package' '--upx' '--channel' 'stable' 'beta' 'a
     [[ "$help" == *"$token"* ]] || { printf 'FAIL: installer help misses %s\n' "$token" >&2; exit 1; }
 done
 [[ "$help" != *'--package PATH'* ]] || { printf 'FAIL: obsolete core package option remains\n' >&2; exit 1; }
+if grep -Eq '(^|[[:space:]])install[[:space:]]+-m' "$INSTALLER"; then
+    printf 'FAIL: installer requires the absent OpenWrt install command\n' >&2
+    exit 1
+fi
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
