@@ -1,0 +1,21 @@
+{
+	"luci-app-tg-ws-proxy": {
+		"description": "Grant access to tg-ws-proxy configuration and service controls",
+		"read": {
+			"cgi-io": [ "exec" ],
+			"file": {
+				"/sbin/logread -e tg-ws-proxy": [ "exec" ]
+			},
+			"ubus": {
+				"service": [ "list" ]
+			},
+			"uci": [ "tg-ws-proxy" ]
+		},
+		"write": {
+			"ubus": {
+				"rc": [ "init" ]
+			},
+			"uci": [ "tg-ws-proxy" ]
+		}
+	}
+}

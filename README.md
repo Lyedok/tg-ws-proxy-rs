@@ -56,6 +56,11 @@ cargo build --release
 The binary lands in `target/release/tg-ws-proxy`. Cross-compiling for OpenWrt
 (MIPS/ARM/ARM64) is covered in [docs/Building.md](docs/Building.md).
 
+### OpenWrt
+
+Raw release binaries, LuCI packages and a one-line installer are available. See
+[OpenWrt installation](#openwrt-installation) below.
+
 ### Telegram Desktop setup
 
 1. **Settings → Advanced → Connection type → Use custom proxy**
@@ -65,6 +70,82 @@ The binary lands in `target/release/tg-ws-proxy`. Cross-compiling for OpenWrt
    - **Secret:** shown in the proxy startup log
 
 Or use the `tg://proxy?...` link that is printed on startup.
+
+## OpenWrt installation
+
+### Requirements
+
+- **OpenWrt 25.12+ (APK)** or **ImmortalWrt 25.12+ (APK)**.
+- **OpenWrt 24.10 (opkg)** or **ImmortalWrt 24.10 (opkg)**.
+- Root SSH access and a supported musl target: AArch64, ARMv7, MIPS, MIPSel or
+  x86_64. Python is not required.
+
+The proxy itself is the existing static musl release binary, not an OpenWrt
+package. Only the architecture-independent LuCI/service integration is packaged:
+`luci-app-tg-ws-proxy` is published as APK (`noarch`) and IPK (`all`).
+
+### Quick install (one-liner)
+
+Run over SSH **on the router**:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/valnesfjord/tg-ws-proxy-rs/main/install.sh | sh
+```
+
+The installer detects APK/opkg and `DISTRIB_ARCH`, downloads the matching raw
+musl archive and LuCI package, verifies both against `SHA256SUMS`, migrates a
+known manual configuration and starts the procd service. Re-run it to upgrade.
+
+To trade higher runtime memory use for a smaller file on flash, explicitly
+select the existing UPX release asset:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/valnesfjord/tg-ws-proxy-rs/main/install.sh | \
+  sh -s -- --upx
+```
+
+If GitHub release downloads require a mirror, put the variable on `sh` (not on
+`wget`):
+
+```sh
+wget -qO- https://raw.githubusercontent.com/valnesfjord/tg-ws-proxy-rs/main/install.sh | \
+  GH_MIRROR=https://your.mirror sh
+```
+
+### Beta releases
+
+Beta tags (`vX.Y.Z-beta.N`) are normal GitHub prereleases. Stable is the default;
+beta installation is explicit and can be combined with `--upx`:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/valnesfjord/tg-ws-proxy-rs/main/install.sh | \
+  sh -s -- --channel beta
+```
+
+Publishing a beta does not change the stable `releases/latest` channel.
+
+### Local install
+
+Put the matching `tg-ws-proxy-<target>[-upx].tar.gz`, LuCI APK/IPK and
+`SHA256SUMS` in one directory, then run:
+
+```sh
+sh install.sh --archive /tmp/tg-ws-proxy-<target>.tar.gz \
+  --luci-package /tmp/luci-app-tg-ws-proxy.<apk-or-ipk>
+```
+
+### Configure and operate
+
+After installation, open **Services → Telegram WS Proxy** in LuCI. Configure the
+listener, advertised link address, secret and any outbound/Cloudflare fallback,
+then use **Save & Apply**. The page includes service controls and a filtered live
+view of the bounded OpenWrt `logd` ring buffer. The package does not open a WAN
+firewall port automatically.
+
+![Telegram WS Proxy LuCI demo](docs/assets/openwrt-demo.gif)
+
+For UCI examples, firewall guidance and rollback details, see the full
+[OpenWrt guide](docs/OpenWrtPackage.md).
 
 ## Usage
 
@@ -190,6 +271,7 @@ cooldown are all documented in [docs/Fallbacks.md](docs/Fallbacks.md).
 | [docs/Fallbacks.md](docs/Fallbacks.md) | Routing tiers: Cloudflare proxy/Worker, default domains, domain fronting, upstream MTProto proxies, inbound FakeTLS, outbound proxy |
 | [docs/Building.md](docs/Building.md) | Building, cross-compiling for OpenWrt, and shrinking the binary with UPX |
 | [docs/Deployment.md](docs/Deployment.md) | Docker, router deployment, OpenWrt init script, environment variables |
+| [docs/OpenWrtPackage.md](docs/OpenWrtPackage.md) | Standalone APK/IPK builds, UCI/procd configuration, installer, upgrades and rollback |
 | [docs/CfProxy.md](docs/CfProxy.md) | Cloudflare DNS proxy setup, step by step |
 | [docs/CfWorker.md](docs/CfWorker.md) | Cloudflare Worker TCP tunnel setup |
 | [AGENTS.md](AGENTS.md) | Repository layout and conventions for contributors |

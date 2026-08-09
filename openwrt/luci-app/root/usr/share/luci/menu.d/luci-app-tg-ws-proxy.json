@@ -1,0 +1,14 @@
+{
+	"admin/services/tg-ws-proxy": {
+		"title": "Telegram WS Proxy",
+		"order": 80,
+		"action": {
+			"type": "view",
+			"path": "tg-ws-proxy/settings"
+		},
+		"depends": {
+			"acl": [ "luci-app-tg-ws-proxy" ],
+			"uci": { "tg-ws-proxy": true }
+		}
+	}
+}

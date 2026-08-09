@@ -133,6 +133,107 @@ jobs:
                   tar -C "${TMPDIR}" -czf "${NAME}.tar.gz" tg-ws-proxy
                   gh release upload "$TAG" "${NAME}.tar.gz" --clobber
 
+    openwrt-luci:
+        needs: [create-release, upload-assets, compress-assets]
+        runs-on: ubuntu-latest
+        env:
+            APK_VERSION: 25.12.5
+            APK_SDK_FILE: openwrt-sdk-25.12.5-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+            APK_SDK_SHA256: ff4a38a397caa2cfe1c39e18f84ddede14878221b3593c3f2c4cfe24e3ec4c25
+            IPK_VERSION: 24.10.5
+            IPK_SDK_FILE: openwrt-sdk-24.10.5-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+            IPK_SDK_SHA256: 0fa98c542ee07f1423ebcdce19aed464bc7f8008ef2cbe83cb723ec694ed8c56
+        steps:
+            - uses: actions/checkout@v6
+
+            - name: Download and verify OpenWrt SDKs
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  for kind in APK IPK; do
+                      version_var="${kind}_VERSION"
+                      file_var="${kind}_SDK_FILE"
+                      sha_var="${kind}_SDK_SHA256"
+                      version="${!version_var}"
+                      file="${!file_var}"
+                      sha="${!sha_var}"
+                      base="https://downloads.openwrt.org/releases/${version}/targets/mediatek/filogic"
+                      curl -fsSLO "${base}/${file}"
+                      printf '%s  %s\n' "$sha" "$file" | sha256sum -c -
+                      tar --zstd -xf "$file"
+                      sdk_dir="${PWD}/${file%.tar.zst}"
+                      test -f "${sdk_dir}/include/package.mk"
+                      printf 'OPENWRT_%s_SDK=%s\n' "$kind" "$sdk_dir" >> "$GITHUB_ENV"
+                  done
+
+            - name: Build and verify LuCI integration packages
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+                  apk_version="$version"
+                  ipk_version="$version"
+                  case "${GITHUB_REF_NAME}" in
+                      "v${version}") ;;
+                      "v${version}-beta."[1-9]*)
+                          tag_version="${GITHUB_REF_NAME#v}"
+                          beta="${tag_version#"$version-beta."}"
+                          apk_version="${version}_beta${beta}"
+                          ipk_version="${version}~beta.${beta}"
+                      ;;
+                      *) echo "::error::unsupported release tag ${GITHUB_REF_NAME}"; exit 1 ;;
+                  esac
+                  final="${PWD}/dist/openwrt"
+                  rm -rf "$final"
+                  mkdir -p "$final"
+                  openwrt/build-luci-package.sh \
+                      --sdk "$OPENWRT_APK_SDK" \
+                      --version "$apk_version" \
+                      --format apk \
+                      --output "$final"
+                  openwrt/build-luci-package.sh \
+                      --sdk "$OPENWRT_IPK_SDK" \
+                      --version "$ipk_version" \
+                      --format ipk \
+                      --output "$final"
+
+                  (
+                      cd "$final"
+                      set -- luci-app-tg-ws-proxy-*.apk
+                      [[ "$#" -eq 1 && -f "$1" ]]
+                      set -- luci-app-tg-ws-proxy_*.ipk
+                      [[ "$#" -eq 1 && -f "$1" ]]
+                  )
+
+            - name: Build shared release checksums
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  final="${PWD}/dist/openwrt"
+                  gh release download "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+                      --pattern 'tg-ws-proxy-*-unknown-linux-musl*.tar.gz' --dir "$final"
+                  (
+                      cd "$final"
+                      set -- tg-ws-proxy-*-unknown-linux-musl*.tar.gz
+                      [[ "$#" -eq 10 ]]
+                      sha256sum -- *.tar.gz *.apk *.ipk > SHA256SUMS
+                      sha256sum -c SHA256SUMS
+                  )
+
+            - name: Upload LuCI packages and checksums
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  gh release upload "${GITHUB_REF_NAME}" \
+                      dist/openwrt/luci-app-tg-ws-proxy-*.apk \
+                      dist/openwrt/luci-app-tg-ws-proxy_*.ipk \
+                      dist/openwrt/SHA256SUMS \
+                      --repo "${GITHUB_REPOSITORY}" --clobber
+
     # Extra UPX-packed assets for flash-constrained devices (OpenWrt routers).
     #
     # These do not replace the plain assets: packing trades RAM for flash. A
@@ -210,11 +311,12 @@ jobs:
                   gh release upload "$TAG" "${NAME}-upx.tar.gz" \
                       --repo "${GITHUB_REPOSITORY}" --clobber
 
-    # Both `needs` must succeed, so a target that failed to build leaves the
-    # release a draft rather than publishing a half-populated one. Finish the
-    # job by hand (or re-run the failed leg) and the draft is still there.
+    # Every asset job must succeed, so a target or OpenWrt package set that failed
+    # to build leaves the release a draft rather than publishing a half-populated
+    # one. Finish the job by hand (or re-run the failed leg) and the draft is
+    # still there.
     publish-release:
-        needs: [upload-assets, compress-assets]
+        needs: [upload-assets, openwrt-luci, compress-assets]
         runs-on: ubuntu-latest
         steps:
             - name: Publish the draft now that every asset is uploaded
