@@ -233,7 +233,9 @@ verify_asset_digest() {
 
 verify_assets() {
 	if [ -n "$ARCHIVE_DIGEST" ] || [ -n "$LUCI_PACKAGE_DIGEST" ]; then
-		[ -n "$ARCHIVE_DIGEST" ] && [ -n "$LUCI_PACKAGE_DIGEST" ] || die "GitHub API digests are incomplete"
+		if [ -z "$ARCHIVE_DIGEST" ] || [ -z "$LUCI_PACKAGE_DIGEST" ]; then
+			die "GitHub API digests are incomplete"
+		fi
 		verify_asset_digest "$ARCHIVE_FILE" "$ARCHIVE_DIGEST" "binary archive"
 		verify_asset_digest "$LUCI_PACKAGE_FILE" "$LUCI_PACKAGE_DIGEST" "LuCI package"
 		ok "SHA-256 verified against GitHub release asset digests."
