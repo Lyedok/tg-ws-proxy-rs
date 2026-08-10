@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034,SC2329 # Globals and apk/opkg stubs are consumed by functions sourced from install.sh.
+# shellcheck disable=SC2034,SC2317,SC2329 # Globals and apk/opkg stubs are consumed by functions sourced from install.sh.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
