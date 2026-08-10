@@ -199,9 +199,9 @@ jobs:
 
                   (
                       cd "$final"
-                      set -- luci-app-tg-ws-proxy-*.apk
+                      set -- luci-app-tg-ws-proxy-rs-*.apk
                       [[ "$#" -eq 1 && -f "$1" ]]
-                      set -- luci-app-tg-ws-proxy_*.ipk
+                      set -- luci-app-tg-ws-proxy-rs_*.ipk
                       [[ "$#" -eq 1 && -f "$1" ]]
                   )
 
@@ -229,8 +229,8 @@ jobs:
               run: |
                   set -euo pipefail
                   gh release upload "${GITHUB_REF_NAME}" \
-                      dist/openwrt/luci-app-tg-ws-proxy-*.apk \
-                      dist/openwrt/luci-app-tg-ws-proxy_*.ipk \
+                      dist/openwrt/luci-app-tg-ws-proxy-rs-*.apk \
+                      dist/openwrt/luci-app-tg-ws-proxy-rs_*.ipk \
                       dist/openwrt/SHA256SUMS \
                       --repo "${GITHUB_REPOSITORY}" --clobber
 

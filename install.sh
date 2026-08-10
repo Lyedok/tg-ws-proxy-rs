@@ -1,5 +1,9 @@
 #!/bin/sh
-# Installs a tg-ws-proxy release binary and LuCI integration on OpenWrt 24.10+.
+# Installs a tg-ws-proxy-rs release binary and LuCI integration on OpenWrt 24.10+.
+#
+# Every installed path is suffixed with -rs so this port coexists with an
+# upstream tg-ws-proxy package; releases up to 2.2.3 used the unsuffixed names
+# and are migrated here.
 
 G='\033[0;32m'; R='\033[0;31m'; Y='\033[0;33m'; C='\033[0;36m'; N='\033[0m'
 ok()   { printf "${G}%s${N}\n" "$1"; }
@@ -31,6 +35,11 @@ OLD_CONFIG=0
 OLD_LUCI_PACKAGE=0
 OLD_RUNNING=0
 OLD_ENABLED=0
+LEGACY_INIT=/etc/init.d/tg-ws-proxy
+LEGACY_PACKAGE=0
+LEGACY_RUNNING=0
+LEGACY_ENABLED=0
+LEGACY_CONFIG_MIGRATED=0
 
 usage() {
 	cat <<'EOF'
@@ -38,7 +47,7 @@ Usage: sh install.sh [options]
 
 Options:
   --archive PATH       Install a local release .tar.gz archive
-  --luci-package PATH  Install a local luci-app-tg-ws-proxy APK/IPK
+  --luci-package PATH  Install a local luci-app-tg-ws-proxy-rs APK/IPK
   --upx                Select the smaller UPX-packed release binary
   --channel stable|beta
                        Select latest stable (default) or beta release
@@ -185,8 +194,8 @@ resolve_remote_assets() {
 	[ -n "$ARCHIVE_URL" ] || die "release asset is missing: $archive_name"
 	ARCHIVE_DIGEST="$(release_asset_digest "$api_file" "$archive_name")"
 	[ -n "$ARCHIVE_DIGEST" ] || die "GitHub API digest is missing: $archive_name"
-	LUCI_PACKAGE_URL="$(find_release_asset "$api_file" luci-app-tg-ws-proxy ".$EXT")"
-	[ -n "$LUCI_PACKAGE_URL" ] || die "release LuCI $EXT package is missing"
+	LUCI_PACKAGE_URL="$(find_release_asset "$api_file" luci-app-tg-ws-proxy-rs ".$EXT")"
+	[ -n "$LUCI_PACKAGE_URL" ] || die "release LuCI $EXT package is missing (this installer needs release 2.2.4 or newer)"
 	luci_package_name="${LUCI_PACKAGE_URL##*/}"
 	LUCI_PACKAGE_DIGEST="$(release_asset_digest "$api_file" "$luci_package_name")"
 	[ -n "$LUCI_PACKAGE_DIGEST" ] || die "GitHub API digest is missing: $luci_package_name"
@@ -296,16 +305,16 @@ read_old_env() {
 
 set_from_env() {
 	value="$(read_old_env "$1")"
-	[ -n "$value" ] && uci -q set "tg-ws-proxy.main.$2=$value"
+	[ -n "$value" ] && uci -q set "tg-ws-proxy-rs.main.$2=$value"
 	return 0
 }
 
 set_list_from_env() {
 	value="$(read_old_env "$1")"
 	[ -n "$value" ] || return 0
-	uci -q delete "tg-ws-proxy.main.$2"
+	uci -q delete "tg-ws-proxy-rs.main.$2"
 	old_ifs="$IFS"; IFS=','
-	for item in $value; do [ -n "$item" ] && uci -q add_list "tg-ws-proxy.main.$2=$item"; done
+	for item in $value; do [ -n "$item" ] && uci -q add_list "tg-ws-proxy-rs.main.$2=$item"; done
 	IFS="$old_ifs"
 }
 
@@ -317,7 +326,7 @@ migrate_log_level() {
 				*) case "$verbose" in 1|true|yes|on) value=debug ;; *) value=info ;; esac ;;
 			esac ;;
 	esac
-	uci -q set "tg-ws-proxy.main.log_level=$value"
+	uci -q set "tg-ws-proxy-rs.main.log_level=$value"
 }
 
 migrate_command_args() {
@@ -327,11 +336,11 @@ migrate_command_args() {
 		if [ -n "$pending" ]; then
 			case "$pending" in
 				cf_worker_domain)
-					[ "$cf_worker_reset" -eq 1 ] || { uci -q delete tg-ws-proxy.main.cf_worker_domain; cf_worker_reset=1; }
-					uci -q add_list "tg-ws-proxy.main.cf_worker_domain=$arg" ;;
+					[ "$cf_worker_reset" -eq 1 ] || { uci -q delete tg-ws-proxy-rs.main.cf_worker_domain; cf_worker_reset=1; }
+					uci -q add_list "tg-ws-proxy-rs.main.cf_worker_domain=$arg" ;;
 				dc_ip)
-					[ "$dc_reset" -eq 1 ] || { uci -q delete tg-ws-proxy.main.dc_ip; dc_reset=1; }
-					uci -q add_list "tg-ws-proxy.main.dc_ip=$arg" ;;
+					[ "$dc_reset" -eq 1 ] || { uci -q delete tg-ws-proxy-rs.main.dc_ip; dc_reset=1; }
+					uci -q add_list "tg-ws-proxy-rs.main.dc_ip=$arg" ;;
 			esac
 			pending=''
 			continue
@@ -341,21 +350,21 @@ migrate_command_args() {
 }
 
 ensure_secret() {
-	secret="$(uci -q get tg-ws-proxy.main.secret)"
+	secret="$(uci -q get tg-ws-proxy-rs.main.secret)"
 	[ -n "$secret" ] && return 0
 	secret="$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | hexdump -v -e '1/1 "%02x"')"
 	case "$secret" in
-		????????????????????????????????) uci -q set "tg-ws-proxy.main.secret=$secret" ;;
+		????????????????????????????????) uci -q set "tg-ws-proxy-rs.main.secret=$secret" ;;
 		*) return 1 ;;
 	esac
 }
 
 migrate_manual_config() {
-	uci -q get tg-ws-proxy.main >/dev/null 2>&1 || uci -q set tg-ws-proxy.main=tg-ws-proxy
-	uci -q set tg-ws-proxy.main.enabled=1
+	uci -q set tg-ws-proxy-rs.main=tg-ws-proxy-rs
+	uci -q set tg-ws-proxy-rs.main.enabled=1
 	if [ "$OLD_CONFIG" -eq 1 ]; then
 		ensure_secret || return 1
-		uci -q commit tg-ws-proxy
+		uci -q commit tg-ws-proxy-rs
 		return 0
 	fi
 
@@ -395,14 +404,77 @@ migrate_manual_config() {
 	migrate_log_level
 	migrate_command_args
 	ensure_secret || return 1
-	uci -q commit tg-ws-proxy
+	uci -q commit tg-ws-proxy-rs
 }
 
 service_control() {
-	/etc/init.d/tg-ws-proxy "$1"
+	/etc/init.d/tg-ws-proxy-rs "$1"
+}
+
+# Releases up to 2.2.3 installed the unsuffixed names. They are only ever
+# touched when luci-app-tg-ws-proxy is installed and no other package claims
+# them; an upstream tg-ws-proxy package owns those names on some routers.
+legacy_service_control() {
+	[ "$LEGACY_PACKAGE" -eq 1 ] || return 1
+	[ -x "$LEGACY_INIT" ] || return 1
+	"$LEGACY_INIT" "$1"
+}
+
+# Fails closed: any output counts as "owned", because apk only prints the
+# "<path> is owned by <package>" form at verbosity >= 1 and the bare package
+# name below it, and an unparsed name must not read as an unowned path.
+package_owning_path() {
+	if [ "$PM" = apk ]; then
+		owner_line="$(apk info --who-owns "$1" 2>/dev/null | sed -n 1p)"
+		case "$owner_line" in *' is owned by '*) owner_line="${owner_line##* is owned by }" ;; esac
+	else
+		owner_line="$(opkg search "$1" 2>/dev/null | sed -n 1p)"
+		case "$owner_line" in *' - '*) owner_line="${owner_line%% - *}" ;; esac
+	fi
+	printf '%s' "$owner_line"
+}
+
+# opkg reports the package name, apk reports name-version-release.
+legacy_path_is_foreign() {
+	owner="$(package_owning_path "$1")"
+	[ -n "$owner" ] || return 1
+	case "$owner" in luci-app-tg-ws-proxy|luci-app-tg-ws-proxy-[0-9]*) return 1 ;; esac
+	return 0
+}
+
+legacy_process_pid() {
+	for candidate in $(pidof tg-ws-proxy 2>/dev/null); do
+		case "$(readlink "/proc/$candidate/exe" 2>/dev/null || true)" in
+			/usr/bin/tg-ws-proxy) printf '%s' "$candidate"; return 0 ;;
+		esac
+	done
+	return 1
+}
+
+# A pre-package manual installation is only imported when the running process
+# runs from a path no package claims: /usr/bin/tg-ws-proxy can belong to an
+# upstream tg-ws-proxy package, whose configuration is none of our business.
+manual_process_pid() {
+	for candidate in $(pidof tg-ws-proxy-rs 2>/dev/null) $(pidof tg-ws-proxy 2>/dev/null); do
+		exe="$(readlink "/proc/$candidate/exe" 2>/dev/null || true)"
+		case "$exe" in
+			/usr/bin/tg-ws-proxy-rs) printf '%s' "$candidate"; return 0 ;;
+			/usr/bin/tg-ws-proxy)
+				[ -n "$(package_owning_path /usr/bin/tg-ws-proxy)" ] || {
+					printf '%s' "$candidate"; return 0
+				}
+			;;
+		esac
+	done
+	return 1
 }
 
 luci_is_installed() {
+	if [ "$PM" = apk ]; then apk info -e luci-app-tg-ws-proxy-rs >/dev/null 2>&1
+	else opkg status luci-app-tg-ws-proxy-rs 2>/dev/null | grep -q 'Status:.*installed'; fi
+}
+
+legacy_luci_is_installed() {
 	if [ "$PM" = apk ]; then apk info -e luci-app-tg-ws-proxy >/dev/null 2>&1
 	else opkg status luci-app-tg-ws-proxy 2>/dev/null | grep -q 'Status:.*installed'; fi
 }
@@ -416,37 +488,76 @@ install_luci_package() {
 }
 
 remove_luci_package() {
+	if [ "$PM" = apk ]; then apk del luci-app-tg-ws-proxy-rs >/dev/null 2>&1 || true
+	else opkg remove luci-app-tg-ws-proxy-rs >/dev/null 2>&1 || true; fi
+}
+
+remove_legacy_installation() {
+	[ "$LEGACY_PACKAGE" -eq 1 ] || return 0
+	# A 2.2.3 process still holding the listening port means the readiness
+	# probe above may have matched its socket rather than ours, so nothing it
+	# depends on may be deleted yet.
+	if [ -n "$(legacy_process_pid)" ]; then
+		warn "The 2.2.3 process is still running; its package and files were left in place."
+		warn "Stop it, verify tg-ws-proxy-rs, then remove luci-app-tg-ws-proxy by hand."
+		return 0
+	fi
+	legacy_service_control disable >/dev/null 2>&1 || true
 	if [ "$PM" = apk ]; then apk del luci-app-tg-ws-proxy >/dev/null 2>&1 || true
 	else opkg remove luci-app-tg-ws-proxy >/dev/null 2>&1 || true; fi
+	if legacy_luci_is_installed; then
+		warn "luci-app-tg-ws-proxy could not be removed; its files were left in place."
+		return 0
+	fi
+	if [ "$LEGACY_CONFIG_MIGRATED" -eq 1 ]; then
+		rm -f /etc/config/tg-ws-proxy /etc/config/tg-ws-proxy.apk-new /etc/config/tg-ws-proxy-opkg
+	elif [ -e /etc/config/tg-ws-proxy ]; then
+		warn "/etc/config/tg-ws-proxy was not carried over and is left in place;"
+		warn "the service now reads /etc/config/tg-ws-proxy-rs."
+	fi
+	owner="$(package_owning_path /usr/bin/tg-ws-proxy)"
+	if [ -z "$owner" ]; then
+		rm -f /usr/bin/tg-ws-proxy
+	elif [ -e /usr/bin/tg-ws-proxy ]; then
+		warn "/usr/bin/tg-ws-proxy belongs to package $owner and was left untouched."
+		warn "Reinstall that package if an earlier tg-ws-proxy-rs release overwrote its binary."
+	fi
+	ok "Removed the previous luci-app-tg-ws-proxy integration."
 }
 
 restore_service_state() {
-	[ -x /etc/init.d/tg-ws-proxy ] || return 0
-	if [ "$OLD_ENABLED" -eq 1 ]; then service_control enable >/dev/null 2>&1 || true
-	else service_control disable >/dev/null 2>&1 || true; fi
-	if [ "$OLD_RUNNING" -eq 1 ]; then service_control start >/dev/null 2>&1 || true
-	else service_control stop >/dev/null 2>&1 || true; fi
+	if [ -x /etc/init.d/tg-ws-proxy-rs ]; then
+		if [ "$OLD_ENABLED" -eq 1 ]; then service_control enable >/dev/null 2>&1 || true
+		else service_control disable >/dev/null 2>&1 || true; fi
+		if [ "$OLD_RUNNING" -eq 1 ]; then service_control start >/dev/null 2>&1 || true
+		else service_control stop >/dev/null 2>&1 || true; fi
+	fi
+	[ "$LEGACY_PACKAGE" -eq 1 ] || return 0
+	if [ "$LEGACY_ENABLED" -eq 1 ]; then legacy_service_control enable >/dev/null 2>&1 || true
+	else legacy_service_control disable >/dev/null 2>&1 || true; fi
+	if [ "$LEGACY_RUNNING" -eq 1 ]; then legacy_service_control start >/dev/null 2>&1 || true
+	else legacy_service_control stop >/dev/null 2>&1 || true; fi
 }
 
 rollback() {
 	warn "Installation failed; restoring the previous binary, UCI config and service state."
 	service_control stop >/dev/null 2>&1 || true
-	restore_path /usr/bin/tg-ws-proxy
 	restore_path /usr/bin/tg-ws-proxy-rs
-	if [ "$OLD_CONFIG" -eq 1 ]; then restore_path /etc/config/tg-ws-proxy; fi
+	if [ "$OLD_CONFIG" -eq 1 ]; then restore_path /etc/config/tg-ws-proxy-rs; fi
 	if [ "$OLD_LUCI_PACKAGE" -eq 0 ]; then
 		remove_luci_package
-		for path in /etc/init.d/tg-ws-proxy \
-			/usr/share/luci/menu.d/luci-app-tg-ws-proxy.json \
-			/usr/share/rpcd/acl.d/luci-app-tg-ws-proxy.json \
-			/usr/share/ucitrack/luci-app-tg-ws-proxy.json \
-			/www/luci-static/resources/view/tg-ws-proxy/settings.js; do
+		for path in /etc/init.d/tg-ws-proxy-rs \
+			/usr/share/luci/menu.d/luci-app-tg-ws-proxy-rs.json \
+			/usr/share/rpcd/acl.d/luci-app-tg-ws-proxy-rs.json \
+			/usr/share/ucitrack/luci-app-tg-ws-proxy-rs.json \
+			/www/luci-static/resources/view/tg-ws-proxy-rs/settings.js; do
 			restore_path "$path"
 		done
-		[ "$OLD_CONFIG" -eq 1 ] || rm -f /etc/config/tg-ws-proxy
+		[ "$OLD_CONFIG" -eq 1 ] || rm -f /etc/config/tg-ws-proxy-rs
 	else
 		warn "The LuCI integration package remains at its upgraded version."
 	fi
+	uci -q revert tg-ws-proxy-rs
 	restore_service_state
 	warn "Recovery files are retained in $BACKUP_DIR"
 }
@@ -462,7 +573,7 @@ listener_ready() {
 }
 
 wait_ready() {
-	port="$(uci -q get tg-ws-proxy.main.port)"; [ -n "$port" ] || port=1443
+	port="$(uci -q get tg-ws-proxy-rs.main.port)"; [ -n "$port" ] || port=1443
 	i=0
 	while [ "$i" -lt 15 ]; do
 		service_control status >/dev/null 2>&1 && listener_ready "$port" && return 0
@@ -497,22 +608,34 @@ main() {
 	BACKUP_DIR="/root/tg-ws-proxy-backups/install-$stamp"
 	mkdir -p "$BACKUP_DIR"
 	chmod 0700 /root/tg-ws-proxy-backups "$BACKUP_DIR"
-	[ -e /etc/config/tg-ws-proxy ] && OLD_CONFIG=1
+	[ -e /etc/config/tg-ws-proxy-rs ] && OLD_CONFIG=1
 	luci_is_installed && OLD_LUCI_PACKAGE=1
+	legacy_luci_is_installed && LEGACY_PACKAGE=1
+	if [ "$LEGACY_PACKAGE" -eq 1 ] && { legacy_path_is_foreign "$LEGACY_INIT" ||
+		legacy_path_is_foreign /etc/config/tg-ws-proxy; }; then
+		LEGACY_PACKAGE=0
+		warn "Another package owns the unsuffixed tg-ws-proxy files; leaving them untouched."
+	fi
 	service_control status >/dev/null 2>&1 && OLD_RUNNING=1
 	service_control enabled >/dev/null 2>&1 && OLD_ENABLED=1
+	legacy_service_control status >/dev/null 2>&1 && LEGACY_RUNNING=1
+	legacy_service_control enabled >/dev/null 2>&1 && LEGACY_ENABLED=1
 
-	for path in /usr/bin/tg-ws-proxy /usr/bin/tg-ws-proxy-rs \
-		/etc/init.d/tg-ws-proxy /etc/config/tg-ws-proxy \
-		/usr/share/luci/menu.d/luci-app-tg-ws-proxy.json \
-		/usr/share/rpcd/acl.d/luci-app-tg-ws-proxy.json \
-		/usr/share/ucitrack/luci-app-tg-ws-proxy.json \
-		/www/luci-static/resources/view/tg-ws-proxy/settings.js; do
+	for path in /usr/bin/tg-ws-proxy-rs /etc/init.d/tg-ws-proxy-rs \
+		/etc/config/tg-ws-proxy-rs \
+		/usr/share/luci/menu.d/luci-app-tg-ws-proxy-rs.json \
+		/usr/share/rpcd/acl.d/luci-app-tg-ws-proxy-rs.json \
+		/usr/share/ucitrack/luci-app-tg-ws-proxy-rs.json \
+		/www/luci-static/resources/view/tg-ws-proxy-rs/settings.js; do
 		backup_path "$path"
 	done
-	pid="$(pidof tg-ws-proxy 2>/dev/null || pidof tg-ws-proxy-rs 2>/dev/null || true)"
-	if [ "$OLD_CONFIG" -eq 0 ] && [ -n "$pid" ]; then
-		pid="${pid%% *}"
+	if [ "$LEGACY_PACKAGE" -eq 1 ]; then
+		for path in /usr/bin/tg-ws-proxy /etc/init.d/tg-ws-proxy /etc/config/tg-ws-proxy; do
+			backup_path "$path"
+		done
+	fi
+	pid="$(manual_process_pid)"
+	if [ "$OLD_CONFIG" -eq 0 ] && [ "$LEGACY_PACKAGE" -eq 0 ] && [ -n "$pid" ]; then
 		tr '\0' '\n' < "/proc/$pid/environ" > "$BACKUP_DIR/process.env"
 		tr '\0' '\n' < "/proc/$pid/cmdline" > "$BACKUP_DIR/process.cmd"
 		chmod 0600 "$BACKUP_DIR/process.env" "$BACKUP_DIR/process.cmd"
@@ -520,44 +643,58 @@ main() {
 
 	info "Backup: $BACKUP_DIR"
 	service_control stop >/dev/null 2>&1 || true
+	# The 2.2.3 service binds the same port, so it goes down before the renamed
+	# one comes up. It is only restarted again if this installation rolls back.
+	legacy_service_control stop >/dev/null 2>&1 || true
 	if [ "$OLD_LUCI_PACKAGE" -eq 0 ]; then
-		rm -f /etc/init.d/tg-ws-proxy /etc/init.d/tg-ws-proxy.apk-new \
-			/etc/init.d/tg-ws-proxy-opkg
+		rm -f /etc/init.d/tg-ws-proxy-rs /etc/init.d/tg-ws-proxy-rs.apk-new \
+			/etc/init.d/tg-ws-proxy-rs-opkg
 	fi
 	if ! install_luci_package; then
 		rollback; die "LuCI package installation failed"
 	fi
-	rm -f /etc/config/tg-ws-proxy.apk-new /etc/config/tg-ws-proxy-opkg
-	if [ -x /etc/uci-defaults/95_luci-tg-ws-proxy ]; then
-		/etc/uci-defaults/95_luci-tg-ws-proxy || { rollback; die "OpenWrt migration failed"; }
-		rm -f /etc/uci-defaults/95_luci-tg-ws-proxy
+	rm -f /etc/config/tg-ws-proxy-rs.apk-new /etc/config/tg-ws-proxy-rs-opkg
+	# After the package install, so that no apk/opkg conffile policy decides
+	# which copy of the config survives.
+	if [ "$OLD_CONFIG" -eq 0 ] && [ "$LEGACY_PACKAGE" -eq 1 ] && [ -f /etc/config/tg-ws-proxy ]; then
+		cp -p /etc/config/tg-ws-proxy /etc/config/tg-ws-proxy-rs || {
+			rollback; die "cannot carry the previous UCI config over to tg-ws-proxy-rs"
+		}
+		OLD_CONFIG=1
+		LEGACY_CONFIG_MIGRATED=1
+		info "Carried /etc/config/tg-ws-proxy over to /etc/config/tg-ws-proxy-rs."
+	fi
+	if [ -x /etc/uci-defaults/95_luci-tg-ws-proxy-rs ]; then
+		/etc/uci-defaults/95_luci-tg-ws-proxy-rs || { rollback; die "OpenWrt migration failed"; }
+		rm -f /etc/uci-defaults/95_luci-tg-ws-proxy-rs
 	fi
 	migrate_manual_config || { rollback; die "manual configuration migration failed"; }
-	chmod 0600 /etc/config/tg-ws-proxy || { rollback; die "cannot restrict UCI config permissions"; }
+	chmod 0600 /etc/config/tg-ws-proxy-rs || { rollback; die "cannot restrict UCI config permissions"; }
 
-	binary_tmp="/usr/bin/.tg-ws-proxy.$$"
+	binary_tmp="/usr/bin/.tg-ws-proxy-rs.$$"
 	cp "$STAGED_BINARY" "$binary_tmp" || { rollback; die "cannot stage binary"; }
 	chmod 0755 "$binary_tmp" || { rm -f "$binary_tmp"; rollback; die "cannot make binary executable"; }
-	mv -f "$binary_tmp" /usr/bin/tg-ws-proxy || { rm -f "$binary_tmp"; rollback; die "cannot install binary"; }
+	mv -f "$binary_tmp" /usr/bin/tg-ws-proxy-rs || { rm -f "$binary_tmp"; rollback; die "cannot install binary"; }
 	service_control enable >/dev/null 2>&1 || { rollback; die "cannot enable service"; }
 	service_control restart >/dev/null 2>&1 || { rollback; die "cannot restart service"; }
 	wait_ready || { rollback; die "service did not become ready"; }
 
-	new_pid="$(pidof tg-ws-proxy 2>/dev/null || true)"
+	new_pid="$(pidof tg-ws-proxy-rs 2>/dev/null || true)"
 	[ -n "$new_pid" ] || { rollback; die "new process is missing"; }
 	new_pid="${new_pid%% *}"
 	new_exe="$(readlink "/proc/$new_pid/exe" 2>/dev/null || true)"
-	[ "$new_exe" = /usr/bin/tg-ws-proxy ] || { rollback; die "unexpected running executable: $new_exe"; }
-	[ -s /usr/share/luci/menu.d/luci-app-tg-ws-proxy.json ] || { rollback; die "LuCI menu is missing"; }
-	[ -s /www/luci-static/resources/view/tg-ws-proxy/settings.js ] || { rollback; die "LuCI view is missing"; }
-	rm -f /usr/bin/tg-ws-proxy-rs /tmp/luci-indexcache
+	[ "$new_exe" = /usr/bin/tg-ws-proxy-rs ] || { rollback; die "unexpected running executable: $new_exe"; }
+	[ -s /usr/share/luci/menu.d/luci-app-tg-ws-proxy-rs.json ] || { rollback; die "LuCI menu is missing"; }
+	[ -s /www/luci-static/resources/view/tg-ws-proxy-rs/settings.js ] || { rollback; die "LuCI view is missing"; }
+	remove_legacy_installation
+	rm -f /tmp/luci-indexcache
 	rm -rf /tmp/luci-modulecache
 	/etc/init.d/rpcd reload >/dev/null 2>&1 || warn "rpcd reload failed; LuCI may need a manual reload"
 
 	variant=regular; [ "$USE_UPX" -eq 0 ] || variant=upx
 	prune_backups /root/tg-ws-proxy-backups 3
-	ok "tg-ws-proxy installed and running."
-	ok "LuCI page installed under Services → Telegram WS Proxy."
+	ok "tg-ws-proxy-rs installed and running."
+	ok "LuCI page installed under Services → Telegram WS Proxy (Rust)."
 	info "Binary: $TARGET ($variant) | PID: $new_pid"
 	info "Rollback backup: $BACKUP_DIR"
 }

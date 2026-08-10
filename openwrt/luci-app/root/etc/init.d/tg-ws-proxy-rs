@@ -5,9 +5,9 @@ USE_PROCD=1
 START=90
 STOP=10
 
-NAME="tg-ws-proxy"
-PROG="/usr/bin/tg-ws-proxy"
-CONFIG="tg-ws-proxy"
+NAME="tg-ws-proxy-rs"
+PROG="/usr/bin/tg-ws-proxy-rs"
+CONFIG="tg-ws-proxy-rs"
 SECTION="main"
 
 append_env() {
@@ -107,7 +107,7 @@ start_service() {
 
 	config_get secret "$SECTION" secret
 	if [ -z "$secret" ]; then
-		logger -t "$NAME" "proxy secret is missing; rerun install.sh or set tg-ws-proxy.main.secret"
+		logger -t "$NAME" "proxy secret is missing; rerun install.sh or set tg-ws-proxy-rs.main.secret"
 		return 1
 	fi
 

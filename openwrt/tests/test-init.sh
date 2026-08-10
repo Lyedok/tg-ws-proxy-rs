@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-INIT="$ROOT/openwrt/luci-app/root/etc/init.d/tg-ws-proxy"
+INIT="$ROOT/openwrt/luci-app/root/etc/init.d/tg-ws-proxy-rs"
 [[ -f "$INIT" ]] || { printf 'FAIL: missing packaged init script\n' >&2; exit 1; }
 
 declare -A CFG=()
@@ -46,7 +46,7 @@ uci() {
     local key
     EVENTS+=("uci:$*")
     if [[ "${1-}" == -q && "${2-}" == get ]]; then
-        key="${3#tg-ws-proxy.}"
+        key="${3#tg-ws-proxy-rs.}"
         [[ -v "CFG[$key]" ]]
         return
     fi
@@ -70,7 +70,7 @@ has_env() {
 # Disabled by default: loading config is allowed, but procd must not be opened.
 CFG[main.enabled]=0
 start_service
-if has_event 'open:tg-ws-proxy.main'; then
+if has_event 'open:tg-ws-proxy-rs.main'; then
     printf 'FAIL: disabled service opened a procd instance\n' >&2
     exit 1
 fi
@@ -89,8 +89,8 @@ LISTS[main.dc_ip]=$'2:149.154.167.220\n4:149.154.167.220'
 LISTS[main.cf_domain]=$'one.example\ntwo.example'
 LISTS[main.cf_worker_domain]=$'worker-one.example\nworker-two.example'
 start_service
-has_event 'open:tg-ws-proxy.main' || { printf 'FAIL: enabled service did not open procd\n' >&2; exit 1; }
-has_event 'set:command:/usr/bin/tg-ws-proxy' || { printf 'FAIL: wrong procd command\n' >&2; exit 1; }
+has_event 'open:tg-ws-proxy-rs.main' || { printf 'FAIL: enabled service did not open procd\n' >&2; exit 1; }
+has_event 'set:command:/usr/bin/tg-ws-proxy-rs' || { printf 'FAIL: wrong procd command\n' >&2; exit 1; }
 for expected in \
     'TG_HOST=0.0.0.0' \
     'TG_PORT=3443' \
@@ -151,15 +151,15 @@ CFG[main.enabled]=1
 CFG[main.host]=127.0.0.1
 CFG[main.port]=1443
 start_service || true
-if has_event 'open:tg-ws-proxy.main'; then
+if has_event 'open:tg-ws-proxy-rs.main'; then
     printf 'FAIL: missing secret still started the service\n' >&2; exit 1
 fi
-has_event 'logger:-t tg-ws-proxy proxy secret is missing; rerun install.sh or set tg-ws-proxy.main.secret' || {
+has_event 'logger:-t tg-ws-proxy-rs proxy secret is missing; rerun install.sh or set tg-ws-proxy-rs.main.secret' || {
     printf 'FAIL: missing secret error was not logged\n' >&2; exit 1;
 }
 
 EVENTS=()
 service_triggers
-has_event 'trigger:tg-ws-proxy' || { printf 'FAIL: reload trigger missing\n' >&2; exit 1; }
+has_event 'trigger:tg-ws-proxy-rs' || { printf 'FAIL: reload trigger missing\n' >&2; exit 1; }
 
 printf 'PASS: init/UCI mapping\n'

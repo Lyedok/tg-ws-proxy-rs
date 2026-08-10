@@ -82,7 +82,9 @@ Or use the `tg://proxy?...` link that is printed on startup.
 
 The proxy itself is the existing static musl release binary, not an OpenWrt
 package. Only the architecture-independent LuCI/service integration is packaged:
-`luci-app-tg-ws-proxy` is published as APK (`noarch`) and IPK (`all`).
+`luci-app-tg-ws-proxy-rs` is published as APK (`noarch`) and IPK (`all`). Every
+installed path carries the `-rs` suffix, so a router can keep an upstream
+`tg-ws-proxy` package installed alongside this port.
 
 ### Quick install (one-liner)
 
@@ -135,12 +137,12 @@ Put the matching `tg-ws-proxy-<target>[-upx].tar.gz`, LuCI APK/IPK and
 
 ```sh
 sh install.sh --archive /tmp/tg-ws-proxy-<target>.tar.gz \
-  --luci-package /tmp/luci-app-tg-ws-proxy.<apk-or-ipk>
+  --luci-package /tmp/luci-app-tg-ws-proxy-rs.<apk-or-ipk>
 ```
 
 ### Configure and operate
 
-After installation, open **Services → Telegram WS Proxy** in LuCI. Configure the
+After installation, open **Services → Telegram WS Proxy (Rust)** in LuCI. Configure the
 listener, advertised link address, secret and any outbound/Cloudflare fallback,
 then use **Save & Apply**. The page includes service controls and a filtered live
 view of the bounded OpenWrt `logd` ring buffer. The package does not open a WAN
