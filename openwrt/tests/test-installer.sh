@@ -94,4 +94,27 @@ LUCI_PACKAGE_FILE="$tmp/luci"
 CHECKSUMS_FILE="$tmp/SHA256SUMS"
 verify_assets >/dev/null
 
+printf 'trusted payload\n' > "$tmp/digest-payload"
+payload_digest="sha256:$(sha256sum "$tmp/digest-payload" | sed 's/[[:space:]].*//')"
+verify_asset_digest "$tmp/digest-payload" "$payload_digest" "test payload"
+if (verify_asset_digest "$tmp/digest-payload" "sha256:$(printf '%064d' 0)" "test payload") >/dev/null 2>&1; then
+    printf 'FAIL: a mismatched GitHub asset digest was accepted\n' >&2
+    exit 1
+fi
+
+backup_root="$tmp/backups"
+mkdir -p "$backup_root"
+for n in 1 2 3 4 5; do mkdir "$backup_root/install-20260810-00000$n"; done
+prune_backups "$backup_root" 3
+[[ "$(find "$backup_root" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 3 ]] || {
+    printf 'FAIL: backup retention did not keep exactly three recovery points\n' >&2
+    exit 1
+}
+for n in 3 4 5; do
+    [[ -d "$backup_root/install-20260810-00000$n" ]] || {
+        printf 'FAIL: backup retention removed a recent recovery point\n' >&2
+        exit 1
+    }
+done
+
 printf 'PASS: installer contract\n'

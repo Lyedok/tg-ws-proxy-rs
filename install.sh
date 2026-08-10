@@ -12,8 +12,10 @@ CHANNEL="${TG_WS_PROXY_RELEASE_CHANNEL:-stable}"
 USE_UPX="${TG_WS_PROXY_UPX:-0}"
 ARCHIVE_FILE=''
 ARCHIVE_URL=''
+ARCHIVE_DIGEST=''
 LUCI_PACKAGE_FILE=''
 LUCI_PACKAGE_URL=''
+LUCI_PACKAGE_DIGEST=''
 CHECKSUMS_FILE=''
 ARCH_OVERRIDE=''
 PM_OVERRIDE=''
@@ -148,6 +150,12 @@ find_release_asset() {
 	done
 }
 
+release_asset_digest() {
+	json_file="$1"
+	name="$2"
+	jsonfilter -i "$json_file" -e "@.assets[@.name=\"$name\"].digest"
+}
+
 latest_beta_tag() {
 	jsonfilter -i "$1" -e '@[*].tag_name' | while IFS= read -r tag; do
 		case "$tag" in v*-beta.[1-9]*) printf '%s\n' "$tag"; break ;; esac
@@ -162,29 +170,31 @@ resolve_remote_assets() {
 		releases_file="$TMP_DIR/releases.json"
 		wget -qO "$releases_file" --timeout=30 \
 			"https://api.github.com/repos/$REPOSITORY/releases?per_page=100" 2>/dev/null || \
-			die "cannot query GitHub beta releases"
+			die "cannot query GitHub beta releases (the unauthenticated API may be rate-limited; retry later)"
 		release_tag="$(latest_beta_tag "$releases_file")"
 		[ -n "$release_tag" ] || die "no beta release found"
 		api_url="https://api.github.com/repos/$REPOSITORY/releases/tags/$release_tag"
 	else
 		api_url="https://api.github.com/repos/$REPOSITORY/releases/latest"
 	fi
-	wget -qO "$api_file" --timeout=30 "$api_url" 2>/dev/null || die "cannot query GitHub release API"
+	wget -qO "$api_file" --timeout=30 "$api_url" 2>/dev/null || \
+		die "cannot query GitHub release API (the unauthenticated API may be rate-limited; retry later)"
 
 	archive_name="$(binary_archive_name)"
 	ARCHIVE_URL="$(find_release_asset "$api_file" "$archive_name" '')"
 	[ -n "$ARCHIVE_URL" ] || die "release asset is missing: $archive_name"
+	ARCHIVE_DIGEST="$(release_asset_digest "$api_file" "$archive_name")"
+	[ -n "$ARCHIVE_DIGEST" ] || die "GitHub API digest is missing: $archive_name"
 	LUCI_PACKAGE_URL="$(find_release_asset "$api_file" luci-app-tg-ws-proxy ".$EXT")"
 	[ -n "$LUCI_PACKAGE_URL" ] || die "release LuCI $EXT package is missing"
-	checksums_url="$(find_release_asset "$api_file" SHA256SUMS '')"
-	[ -n "$checksums_url" ] || die "release SHA256SUMS is missing"
+	luci_package_name="${LUCI_PACKAGE_URL##*/}"
+	LUCI_PACKAGE_DIGEST="$(release_asset_digest "$api_file" "$luci_package_name")"
+	[ -n "$LUCI_PACKAGE_DIGEST" ] || die "GitHub API digest is missing: $luci_package_name"
 
 	ARCHIVE_FILE="$TMP_DIR/$archive_name"
-	LUCI_PACKAGE_FILE="$TMP_DIR/${LUCI_PACKAGE_URL##*/}"
-	CHECKSUMS_FILE="$TMP_DIR/SHA256SUMS"
+	LUCI_PACKAGE_FILE="$TMP_DIR/$luci_package_name"
 	dl "$ARCHIVE_URL" "$ARCHIVE_FILE" || die "cannot download binary archive (set GH_MIRROR if GitHub is blocked)"
 	dl "$LUCI_PACKAGE_URL" "$LUCI_PACKAGE_FILE" || die "cannot download LuCI APK"
-	dl "$checksums_url" "$CHECKSUMS_FILE" || die "cannot download SHA256SUMS"
 }
 
 resolve_local_assets() {
@@ -210,8 +220,24 @@ verify_release_checksum() {
 	[ "$actual" = "$expected" ] || die "$label SHA-256 mismatch"
 }
 
+verify_asset_digest() {
+	file="$1"
+	digest="$2"
+	label="$3"
+	case "$digest" in sha256:*) expected="${digest#sha256:}" ;; *) die "$label has an unsupported GitHub digest" ;; esac
+	[ "${#expected}" -eq 64 ] || die "$label has an invalid GitHub SHA-256 digest"
+	case "$expected" in *[!0-9a-fA-F]*) die "$label has an invalid GitHub SHA-256 digest" ;; esac
+	actual="$(sha256sum "$file" | sed 's/[[:space:]].*//')"
+	[ "$actual" = "$expected" ] || die "$label SHA-256 mismatch"
+}
+
 verify_assets() {
-	if [ -n "$CHECKSUMS_FILE" ]; then
+	if [ -n "$ARCHIVE_DIGEST" ] || [ -n "$LUCI_PACKAGE_DIGEST" ]; then
+		[ -n "$ARCHIVE_DIGEST" ] && [ -n "$LUCI_PACKAGE_DIGEST" ] || die "GitHub API digests are incomplete"
+		verify_asset_digest "$ARCHIVE_FILE" "$ARCHIVE_DIGEST" "binary archive"
+		verify_asset_digest "$LUCI_PACKAGE_FILE" "$LUCI_PACKAGE_DIGEST" "LuCI package"
+		ok "SHA-256 verified against GitHub release asset digests."
+	elif [ -n "$CHECKSUMS_FILE" ]; then
 		verify_release_checksum "$ARCHIVE_FILE" "binary archive"
 		verify_release_checksum "$LUCI_PACKAGE_FILE" "LuCI package"
 		ok "SHA-256 verified for binary and LuCI package."
@@ -247,6 +273,17 @@ restore_path() {
 		mkdir -p "$(dirname "$path")"
 		cp -p "$BACKUP_DIR$path" "$path"
 	fi
+}
+
+prune_backups() {
+	backup_root="$1"
+	keep="$2"
+	set -- "$backup_root"/install-*
+	[ -e "$1" ] || return 0
+	first_old=$((keep + 1))
+	printf '%s\n' "$@" | sort -r | sed -n "${first_old},\$p" | while IFS= read -r backup; do
+		[ -n "$backup" ] && rm -rf "$backup"
+	done
 }
 
 read_old_env() {
@@ -472,7 +509,7 @@ main() {
 		backup_path "$path"
 	done
 	pid="$(pidof tg-ws-proxy 2>/dev/null || pidof tg-ws-proxy-rs 2>/dev/null || true)"
-	if [ -n "$pid" ]; then
+	if [ "$OLD_CONFIG" -eq 0 ] && [ -n "$pid" ]; then
 		pid="${pid%% *}"
 		tr '\0' '\n' < "/proc/$pid/environ" > "$BACKUP_DIR/process.env"
 		tr '\0' '\n' < "/proc/$pid/cmdline" > "$BACKUP_DIR/process.cmd"
@@ -494,6 +531,7 @@ main() {
 		rm -f /etc/uci-defaults/95_luci-tg-ws-proxy
 	fi
 	migrate_manual_config || { rollback; die "manual configuration migration failed"; }
+	chmod 0600 /etc/config/tg-ws-proxy || { rollback; die "cannot restrict UCI config permissions"; }
 
 	binary_tmp="/usr/bin/.tg-ws-proxy.$$"
 	cp "$STAGED_BINARY" "$binary_tmp" || { rollback; die "cannot stage binary"; }
@@ -515,6 +553,7 @@ main() {
 	/etc/init.d/rpcd reload >/dev/null 2>&1 || warn "rpcd reload failed; LuCI may need a manual reload"
 
 	variant=regular; [ "$USE_UPX" -eq 0 ] || variant=upx
+	prune_backups /root/tg-ws-proxy-backups 3
 	ok "tg-ws-proxy installed and running."
 	ok "LuCI page installed under Services → Telegram WS Proxy."
 	info "Binary: $TARGET ($variant) | PID: $new_pid"

@@ -93,8 +93,9 @@ wget -qO- https://raw.githubusercontent.com/valnesfjord/tg-ws-proxy-rs/main/inst
 ```
 
 The installer detects APK/opkg and `DISTRIB_ARCH`, downloads the matching raw
-musl archive and LuCI package, verifies both against `SHA256SUMS`, migrates a
-known manual configuration and starts the procd service. Re-run it to upgrade.
+musl archive and LuCI package, verifies both against immutable SHA-256 digests
+from the GitHub release API, migrates a known manual configuration and starts
+the procd service. Re-run it to upgrade.
 
 To trade higher runtime memory use for a smaller file on flash, explicitly
 select the existing UPX release asset:
@@ -111,6 +112,9 @@ If GitHub release downloads require a mirror, put the variable on `sh` (not on
 wget -qO- https://raw.githubusercontent.com/valnesfjord/tg-ws-proxy-rs/main/install.sh | \
   GH_MIRROR=https://your.mirror sh
 ```
+
+The mirror may provide the payload, but the expected digest always comes from
+`api.github.com`; the mirror is not part of the trust boundary.
 
 ### Beta releases
 

@@ -29,7 +29,14 @@ assert "luci-app-tg-ws-proxy" in entry["depends"]["acl"]
 assert "tg-ws-proxy" in acl["read"]["uci"]
 assert "tg-ws-proxy" in acl["write"]["uci"]
 assert "list" in acl["read"]["ubus"]["service"]
-assert "init" in acl["write"]["ubus"]["rc"]
+assert "rc" not in acl["write"].get("ubus", {})
+service_commands = acl["write"]["file"]
+assert set(service_commands) == {
+    "/etc/init.d/tg-ws-proxy start",
+    "/etc/init.d/tg-ws-proxy restart",
+    "/etc/init.d/tg-ws-proxy stop",
+}
+assert all(actions == ["exec"] for actions in service_commands.values())
 assert track == {"config": "tg-ws-proxy", "init": "tg-ws-proxy"}
 PY
 
@@ -37,6 +44,11 @@ grep -Fq "new form.Map('tg-ws-proxy'" "$VIEW" || fail 'view is not bound to UCI'
 grep -Fq "o.password = true" "$VIEW" || fail 'secret is not a password field'
 grep -Fq "form.ListValue, 'log_level'" "$VIEW" || fail 'log-level selector is missing'
 grep -Fq "fs.exec_direct('/sbin/logread', ['-e', SERVICE], 'text')" "$VIEW" || fail 'filtered live log is missing'
+grep -Fq "node.textContent = visible || _('Log is empty.')" "$VIEW" || fail 'log output is not rendered as text'
+grep -Fq "node.textContent = _('Log is not available yet: %s').format(error.message)" "$VIEW" || fail 'log errors are not rendered as text'
+if grep -Fq 'dom.content(node, visible' "$VIEW"; then fail 'untrusted log output still reaches dom.content'; fi
+grep -Fq 'statusPollRegistered' "$VIEW" || fail 'service status poller is not guarded against duplicate registration'
+grep -Fq "fs.exec('/etc/init.d/tg-ws-proxy', [action])" "$VIEW" || fail 'service controls do not use the scoped init script'
 grep -Fq "form.DynamicList, 'cf_worker_domain'" "$VIEW" || fail 'Worker domains are not repeatable'
 for action in start stop restart; do
     grep -Fq "'$action'" "$VIEW" || fail "$action action is missing"

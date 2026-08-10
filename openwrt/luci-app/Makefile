@@ -34,6 +34,7 @@ endef
 define Package/luci-app-tg-ws-proxy/install
 	$(INSTALL_DIR) $(1)/etc $(1)/usr/share $(1)/www
 	$(CP) ./root/etc/* $(1)/etc/
+	chmod 0600 $(1)/etc/config/tg-ws-proxy
 	$(CP) ./root/usr/share/* $(1)/usr/share/
 	$(CP) ./htdocs/* $(1)/www/
 endef

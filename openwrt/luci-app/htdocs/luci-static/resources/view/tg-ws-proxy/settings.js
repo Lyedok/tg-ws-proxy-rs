@@ -19,12 +19,6 @@ const callServiceList = rpc.declare({
 	expect: { '': {} }
 });
 
-const callRcInit = rpc.declare({
-	object: 'rc',
-	method: 'init',
-	params: [ 'name', 'action' ]
-});
-
 function serviceStatus() {
 	return L.resolveDefault(callServiceList(SERVICE), {}).then((result) => {
 		const service = result[SERVICE] || {};
@@ -143,12 +137,12 @@ return view.extend({
 			const lines = String(text || '').trimEnd().split('\n')
 				.map(formatLogLine).filter((line) => line !== null);
 			const visible = lines.slice(-500).join('\n').trim();
-			dom.content(node, visible || _('Log is empty.'));
+			node.textContent = visible || _('Log is empty.');
 			node.scrollTop = node.scrollHeight;
 		}).catch((error) => {
 			const node = document.getElementById('tg_ws_proxy_live_log');
 			if (node)
-				dom.content(node, _('Log is not available yet: %s').format(error.message));
+				node.textContent = _('Log is not available yet: %s').format(error.message);
 		});
 	},
 
@@ -183,8 +177,8 @@ return view.extend({
 	handleServiceAction(action, event) {
 		const button = event.currentTarget;
 		button.disabled = true;
-		return callRcInit(SERVICE, action).then((result) => {
-			if (result)
+		return fs.exec('/etc/init.d/tg-ws-proxy', [action]).then((result) => {
+			if (result.code !== 0)
 				throw new Error(_('Command failed'));
 			return new Promise((resolve) => window.setTimeout(resolve, 500));
 		}).then(() => this.updateStatus()).catch((error) => {
@@ -204,7 +198,10 @@ return view.extend({
 
 		s = m.section(form.TypedSection);
 		s.render = function() {
-			poll.add(() => self.updateStatus());
+			if (!self.statusPollRegistered) {
+				poll.add(() => self.updateStatus());
+				self.statusPollRegistered = true;
+			}
 			return E('div', { class: 'cbi-section' }, [
 				E('h3', {}, _('Service status')),
 				E('p', { id: 'tg_ws_proxy_service_status' }, _('Collecting data...')),
@@ -251,88 +248,88 @@ return view.extend({
 
 		o = addValue(s, 'general', 'secret', _('Proxy secrets'),
 			_('Comma-separated proxy secrets stored in UCI. Leave empty once to generate one persistent random secret at service start.'));
-	o.password = true;
-	o.validate = validateSecrets;
+		o.password = true;
+		o.validate = validateSecrets;
 
-	o = addValue(s, 'general', 'link_ip', _('Public link host'),
-		_('Hostname or IP advertised in the generated tg:// proxy link.'), 'host');
-	o = addValue(s, 'general', 'listen_faketls_domain', _('Inbound FakeTLS domain'),
-		_('Optional SNI hostname for inbound FakeTLS camouflage.'), 'hostname');
+		o = addValue(s, 'general', 'link_ip', _('Public link host'),
+			_('Hostname or IP advertised in the generated tg:// proxy link.'), 'host');
+		o = addValue(s, 'general', 'listen_faketls_domain', _('Inbound FakeTLS domain'),
+			_('Optional SNI hostname for inbound FakeTLS camouflage.'), 'hostname');
 
-	o = s.taboption('routing', form.DynamicList, 'dc_ip', _('Telegram DC overrides'),
-		_('One entry per line in DC:IP form, for example 2:149.154.167.220.'));
-	o.validate = validateDcIp;
+		o = s.taboption('routing', form.DynamicList, 'dc_ip', _('Telegram DC overrides'),
+			_('One entry per line in DC:IP form, for example 2:149.154.167.220.'));
+		o.validate = validateDcIp;
 
-	o = s.taboption('routing', form.DynamicList, 'cf_domain', _('Cloudflare proxy domains'));
-	o.datatype = 'hostname';
-	o = s.taboption('routing', form.DynamicList, 'cf_worker_domain', _('Cloudflare Worker domains'));
-	o.datatype = 'hostname';
-	o = s.taboption('routing', form.DynamicList, 'mtproto_proxy', _('Upstream MTProto proxies'),
-		_('HOST:PORT:SECRET entries. Secrets are stored in UCI.'));
-	o.password = true;
-	o.validate = function(sectionId, value) {
-		if (!value || /^[^:]+:[0-9]+:[0-9a-fA-F]+$/.test(value))
-			return true;
-		return _('Expecting HOST:PORT:SECRET');
-	};
+		o = s.taboption('routing', form.DynamicList, 'cf_domain', _('Cloudflare proxy domains'));
+		o.datatype = 'hostname';
+		o = s.taboption('routing', form.DynamicList, 'cf_worker_domain', _('Cloudflare Worker domains'));
+		o.datatype = 'hostname';
+		o = s.taboption('routing', form.DynamicList, 'mtproto_proxy', _('Upstream MTProto proxies'),
+			_('HOST:PORT:SECRET entries. Secrets are stored in UCI.'));
+		o.password = true;
+		o.validate = function(sectionId, value) {
+			if (!value || /^[^:]+:[0-9]+:[0-9a-fA-F]+$/.test(value))
+				return true;
+			return _('Expecting HOST:PORT:SECRET');
+		};
 
-	o = addValue(s, 'routing', 'outbound_proxy', _('Outbound proxy URL'),
-		_('HTTP, SOCKS5 or SOCKS5H URL used for outbound connections.'), null,
-		'socks5h://127.0.0.1:1080');
-	o = addFlag(s, 'routing', 'no_outbound_proxy', _('Disable outbound proxy'),
-		_('Ignore configured and environment proxy settings.'), '0');
-	o = addValue(s, 'routing', 'no_proxy', _('NO_PROXY'),
-		_('Comma-separated hosts, suffixes or CIDR ranges that bypass the outbound proxy.'));
-	o = addFlag(s, 'routing', 'default_domains', _('Use default Cloudflare domains'), null, '0');
-	o = addFlag(s, 'routing', 'cf_priority', _('Prefer Cloudflare routes'),
-		_('Try Cloudflare Worker/proxy before direct Telegram WebSocket routes.'), '0');
-	o = addFlag(s, 'routing', 'cf_balance', _('Balance Cloudflare domains'),
-		_('Rotate the first attempted Cloudflare domain between connections.'), '0');
-	o = addValue(s, 'routing', 'fronting_domain', _('Domain-fronting SNI'), null, 'hostname');
+		o = addValue(s, 'routing', 'outbound_proxy', _('Outbound proxy URL'),
+			_('HTTP, SOCKS5 or SOCKS5H URL used for outbound connections.'), null,
+			'socks5h://127.0.0.1:1080');
+		o = addFlag(s, 'routing', 'no_outbound_proxy', _('Disable outbound proxy'),
+			_('Ignore configured and environment proxy settings.'), '0');
+		o = addValue(s, 'routing', 'no_proxy', _('NO_PROXY'),
+			_('Comma-separated hosts, suffixes or CIDR ranges that bypass the outbound proxy.'));
+		o = addFlag(s, 'routing', 'default_domains', _('Use default Cloudflare domains'), null, '0');
+		o = addFlag(s, 'routing', 'cf_priority', _('Prefer Cloudflare routes'),
+			_('Try Cloudflare Worker/proxy before direct Telegram WebSocket routes.'), '0');
+		o = addFlag(s, 'routing', 'cf_balance', _('Balance Cloudflare domains'),
+			_('Rotate the first attempted Cloudflare domain between connections.'), '0');
+		o = addValue(s, 'routing', 'fronting_domain', _('Domain-fronting SNI'), null, 'hostname');
 
-	o = addValue(s, 'performance', 'pool_size', _('WebSocket pool size'), null,
-		'uinteger', '4', '4');
-	o.rmempty = false;
-	o = addValue(s, 'performance', 'pool_max_age', _('Pool maximum age'),
-		_('Maximum age of a pooled connection in seconds.'), 'uinteger', '55', '55');
-	o.rmempty = false;
-	o = addValue(s, 'performance', 'buf_kb', _('Buffer size (KiB)'), null,
-		'uinteger', '256', '256');
-	o.rmempty = false;
-	o = addValue(s, 'performance', 'max_connections', _('Maximum client connections'),
-		_('Leave empty to derive the limit from the process file-descriptor budget.'), 'uinteger');
+		o = addValue(s, 'performance', 'pool_size', _('WebSocket pool size'), null,
+			'uinteger', '4', '4');
+		o.rmempty = false;
+		o = addValue(s, 'performance', 'pool_max_age', _('Pool maximum age'),
+			_('Maximum age of a pooled connection in seconds.'), 'uinteger', '55', '55');
+		o.rmempty = false;
+		o = addValue(s, 'performance', 'buf_kb', _('Buffer size (KiB)'), null,
+			'uinteger', '256', '256');
+		o.rmempty = false;
+		o = addValue(s, 'performance', 'max_connections', _('Maximum client connections'),
+			_('Leave empty to derive the limit from the process file-descriptor budget.'), 'uinteger');
 
-	o = addSeconds(s, 'ws_connect_timeout', _('WebSocket connect timeout'), null, '10');
-	o = addSeconds(s, 'ws_fail_probe_timeout', _('WebSocket failure probe timeout'), null, '2');
-	o = addSeconds(s, 'ws_fail_cooldown', _('WebSocket failure cooldown'), null, '30');
-	o = addSeconds(s, 'ws_redirect_cooldown', _('WebSocket redirect cooldown'), null, '300');
-	o = addSeconds(s, 'ip_fail_cooldown', _('IP failure cooldown'), null, '3600');
-	o = addSeconds(s, 'handshake_timeout', _('Client handshake timeout'), null, '10');
-	o = addSeconds(s, 'tcp_fallback_timeout', _('TCP fallback timeout'), null, '10');
-	o = addSeconds(s, 'upstream_connect_timeout', _('Upstream proxy connect timeout'), null, '5');
-	o = addSeconds(s, 'upstream_fail_cooldown', _('Upstream proxy failure cooldown'), null, '60');
-	o = addSeconds(s, 'cf_connect_timeout', _('Cloudflare connect timeout'), null, '10');
-	o = addSeconds(s, 'cf_fail_cooldown', _('Cloudflare failure cooldown'), null, '60');
-	o = addSeconds(s, 'fronting_cooldown', _('Successful fronting cooldown'), null, '1800');
-	o = addSeconds(s, 'fronting_fail_cooldown', _('Fronting failure cooldown'), null, '60');
+		o = addSeconds(s, 'ws_connect_timeout', _('WebSocket connect timeout'), null, '10');
+		o = addSeconds(s, 'ws_fail_probe_timeout', _('WebSocket failure probe timeout'), null, '2');
+		o = addSeconds(s, 'ws_fail_cooldown', _('WebSocket failure cooldown'), null, '30');
+		o = addSeconds(s, 'ws_redirect_cooldown', _('WebSocket redirect cooldown'), null, '300');
+		o = addSeconds(s, 'ip_fail_cooldown', _('IP failure cooldown'), null, '3600');
+		o = addSeconds(s, 'handshake_timeout', _('Client handshake timeout'), null, '10');
+		o = addSeconds(s, 'tcp_fallback_timeout', _('TCP fallback timeout'), null, '10');
+		o = addSeconds(s, 'upstream_connect_timeout', _('Upstream proxy connect timeout'), null, '5');
+		o = addSeconds(s, 'upstream_fail_cooldown', _('Upstream proxy failure cooldown'), null, '60');
+		o = addSeconds(s, 'cf_connect_timeout', _('Cloudflare connect timeout'), null, '10');
+		o = addSeconds(s, 'cf_fail_cooldown', _('Cloudflare failure cooldown'), null, '60');
+		o = addSeconds(s, 'fronting_cooldown', _('Successful fronting cooldown'), null, '1800');
+		o = addSeconds(s, 'fronting_fail_cooldown', _('Fronting failure cooldown'), null, '60');
 
-	o = s.taboption('logging', form.ListValue, 'log_level', _('Log level'),
-		_('Native Rust tracing level passed through RUST_LOG.'));
-	o.value('off', _('Off'));
-	o.value('error', _('Error'));
-	o.value('warn', _('Warn'));
-	o.value('info', _('Info'));
-	o.value('debug', _('Debug'));
-	o.value('trace', _('Trace'));
-	o.default = 'info';
-	o.rmempty = false;
-	o = s.taboption('logging', form.DummyValue, '_live_log', _('Live log'));
-	o.renderWidget = function() {
-		return self.renderLogWidget();
-	};
-	o = addFlag(s, 'logging', 'danger_accept_invalid_certs',
-		_('Accept invalid TLS certificates'),
-		_('Dangerous: disables certificate verification for Telegram/Cloudflare connections.'), '0');
+		o = s.taboption('logging', form.ListValue, 'log_level', _('Log level'),
+			_('Native Rust tracing level passed through RUST_LOG.'));
+		o.value('off', _('Off'));
+		o.value('error', _('Error'));
+		o.value('warn', _('Warn'));
+		o.value('info', _('Info'));
+		o.value('debug', _('Debug'));
+		o.value('trace', _('Trace'));
+		o.default = 'info';
+		o.rmempty = false;
+		o = s.taboption('logging', form.DummyValue, '_live_log', _('Live log'));
+		o.renderWidget = function() {
+			return self.renderLogWidget();
+		};
+		o = addFlag(s, 'logging', 'danger_accept_invalid_certs',
+			_('Accept invalid TLS certificates'),
+			_('Dangerous: disables certificate verification for Telegram/Cloudflare connections.'), '0');
 
 		return m.render();
 	}

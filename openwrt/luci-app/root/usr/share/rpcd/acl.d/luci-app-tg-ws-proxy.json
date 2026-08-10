@@ -12,8 +12,10 @@
 			"uci": [ "tg-ws-proxy" ]
 		},
 		"write": {
-			"ubus": {
-				"rc": [ "init" ]
+			"file": {
+				"/etc/init.d/tg-ws-proxy restart": [ "exec" ],
+				"/etc/init.d/tg-ws-proxy start": [ "exec" ],
+				"/etc/init.d/tg-ws-proxy stop": [ "exec" ]
 			},
 			"uci": [ "tg-ws-proxy" ]
 		}

@@ -23,6 +23,13 @@ grep -Eq '^[[:space:]]*PKGARCH:=all$' "$makefile" || fail 'LuCI recipe must decl
 grep -Fq 'include $(INCLUDE_DIR)/package.mk' "$makefile" || fail 'LuCI package does not use the standard package recipe'
 if grep -Fq '+tg-ws-proxy' "$makefile"; then fail 'architecture-independent LuCI package must not depend on a core package'; fi
 grep -Fq '/etc/config/tg-ws-proxy' "$makefile" || fail 'UCI conffile is not declared'
+# shellcheck disable=SC2016 # Match the literal package staging path in the recipe.
+grep -Fq 'chmod 0600 $(1)/etc/config/tg-ws-proxy' "$makefile" || \
+    fail 'packaged UCI config secret is not mode 0600'
+# shellcheck disable=SC2016 # Match the literal config variable in the installation hook.
+grep -Fq 'chmod 0600 "/etc/config/$config"' \
+    "$ROOT/openwrt/luci-app/root/etc/uci-defaults/95_luci-tg-ws-proxy" || \
+    fail 'UCI config secret is not restricted to mode 0600'
 
 cargo_version="$(python3 -c 'import tomllib,sys; print(tomllib.load(open(sys.argv[1], "rb"))["package"]["version"])' "$ROOT/Cargo.toml")"
 grep -Fq ",$cargo_version)" "$makefile" || fail "LuCI default version does not match Cargo $cargo_version"

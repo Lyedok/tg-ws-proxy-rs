@@ -85,12 +85,14 @@ TG_WS_PROXY_RELEASE_CHANNEL=beta TG_WS_PROXY_UPX=1 sh install.sh
 
 Set `TG_WS_PROXY_REPOSITORY=owner/repository` to test a fork release. Set
 `GH_MIRROR=https://mirror.example` when GitHub release downloads need a mirror.
+The mirror may provide payload files, but their expected immutable SHA-256
+digests are always read from `api.github.com`.
 
 The installer:
 
 1. detects APK/opkg and maps `DISTRIB_ARCH` to the compatible Rust musl target;
 2. selects the regular or `-upx` archive and the matching LuCI APK/IPK;
-3. verifies both against the release `SHA256SUMS`;
+3. verifies both against the SHA-256 digests supplied by the GitHub release API;
 4. extracts the archive and runs the staged binary with `--version` before
    touching the running service;
 5. backs up the previous binary, UCI config and service state under
@@ -98,6 +100,10 @@ The installer:
 6. installs the LuCI package, migrates a known manual `TG_*` configuration and
    atomically replaces `/usr/bin/tg-ws-proxy`;
 7. enables/restarts procd and verifies both the process and listening socket.
+
+Only the three newest installer backup directories are retained after a
+successful installation. Process command and environment snapshots are captured
+only when importing a pre-existing manual installation without a UCI config.
 
 If the new binary cannot start, the previous binary, UCI config and service state
 are restored. A newly introduced LuCI package is removed as well. When an
@@ -131,10 +137,11 @@ asset-resolution checks without installation.
 
 The LuCI APK is intentionally installed with `--allow-untrusted`; this project
 does not operate an APK signing-key lifecycle. The installer does not perform a
-misleading strict-signature attempt first. It verifies `SHA256SUMS`, then invokes
-APK with the accepted trust policy explicitly. In this model, repository control
-and GitHub HTTPS are the source-authentication boundary; the checksum detects
-asset corruption but is not an independent package signature.
+misleading strict-signature attempt first. Remote installation verifies the
+immutable SHA-256 digest returned by the GitHub release API before invoking APK;
+local installation uses the supplied `SHA256SUMS`. In this model, repository
+control and GitHub API HTTPS are the source-authentication boundary. A download
+mirror can supply an asset but cannot supply or override its expected digest.
 
 IPK installation uses ordinary `opkg install`. Because the IPK contains only
 architecture-independent integration files, no `--force-architecture` bypass is
