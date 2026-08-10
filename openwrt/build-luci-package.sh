@@ -31,7 +31,7 @@ case "$FORMAT" in apk|ipk) ;; *) printf 'error: --format must be apk or ipk\n' >
 [[ -f "$SDK/include/package.mk" ]] || { printf 'error: not an OpenWrt SDK: %s\n' "$SDK" >&2; exit 1; }
 
 package_dir="$SDK/package/luci-app-tg-ws-proxy-rs"
-rm -rf "$package_dir"
+rm -rf "$package_dir" "$SDK/package/luci-app-tg-ws-proxy"
 mkdir -p "$package_dir"
 cp -a "$ROOT/openwrt/luci-app/." "$package_dir/"
 

@@ -81,7 +81,7 @@ USE_PROCD=1
 START=90
 STOP=10
 
-PROG=/usr/local/bin/tg-ws-proxy-rs
+PROG=/usr/local/bin/tg-ws-proxy
 
 start_service() {
     procd_open_instance

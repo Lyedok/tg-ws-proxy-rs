@@ -44,8 +44,6 @@ done
 
 [ "$changed" -eq 0 ] || uci -q commit "$config"
 chmod 0600 "/etc/config/$config"
-rm -f /var/run/tg-ws-proxy/tg-ws-proxy.log /var/run/tg-ws-proxy/tg-ws-proxy.log.1
-rmdir /var/run/tg-ws-proxy 2>/dev/null || true
 rm -f /tmp/luci-indexcache
 rm -rf /tmp/luci-modulecache
 exit 0

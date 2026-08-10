@@ -21,7 +21,7 @@ makefile="$ROOT/openwrt/luci-app/Makefile"
 grep -Eq '^[[:space:]]*PKGARCH:=all$' "$makefile" || fail 'LuCI recipe must declare OpenWrt PKGARCH=all'
 # shellcheck disable=SC2016 # Match a literal OpenWrt make variable.
 grep -Fq 'include $(INCLUDE_DIR)/package.mk' "$makefile" || fail 'LuCI package does not use the standard package recipe'
-if grep -Fq '+tg-ws-proxy-rs' "$makefile"; then fail 'architecture-independent LuCI package must not depend on a core package'; fi
+if grep -Fq '+tg-ws-proxy' "$makefile"; then fail 'architecture-independent LuCI package must not depend on a core package'; fi
 grep -Fq 'PKG_NAME:=luci-app-tg-ws-proxy-rs' "$makefile" || fail 'LuCI package is not named luci-app-tg-ws-proxy-rs'
 grep -Fq '/etc/config/tg-ws-proxy-rs' "$makefile" || fail 'UCI conffile is not declared'
 # shellcheck disable=SC2016 # Match the literal package staging path in the recipe.

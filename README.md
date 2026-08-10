@@ -142,7 +142,7 @@ sh install.sh --archive /tmp/tg-ws-proxy-<target>.tar.gz \
 
 ### Configure and operate
 
-After installation, open **Services → Telegram WS Proxy** in LuCI. Configure the
+After installation, open **Services → Telegram WS Proxy (Rust)** in LuCI. Configure the
 listener, advertised link address, secret and any outbound/Cloudflare fallback,
 then use **Save & Apply**. The page includes service controls and a filtered live
 view of the bounded OpenWrt `logd` ring buffer. The package does not open a WAN

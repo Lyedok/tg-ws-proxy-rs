@@ -127,22 +127,29 @@ etc/config/tg-ws-proxy owned by tg-ws-proxy`, and since the installer writes the
 binary itself, `/usr/bin/tg-ws-proxy` was replaced without the package manager
 noticing. From 2.2.4 on, every installed path is suffixed with `-rs`.
 
-`install.sh` moves an existing installation over, and only when
-`luci-app-tg-ws-proxy` is installed — that package is the proof the unsuffixed
-files came from this project and not from upstream:
+`install.sh` moves an existing installation over when `luci-app-tg-ws-proxy` is
+installed and no other package claims `/etc/init.d/tg-ws-proxy` or
+`/etc/config/tg-ws-proxy`:
 
 1. stops the 2.2.3 service, which binds the same port;
-2. copies `/etc/config/tg-ws-proxy` to `/etc/config/tg-ws-proxy-rs` with the
-   secret and every setting intact;
-3. installs `luci-app-tg-ws-proxy-rs` plus the binary, and verifies the process,
-   the listening socket and the LuCI files;
+2. installs `luci-app-tg-ws-proxy-rs` plus the binary, then copies
+   `/etc/config/tg-ws-proxy` to `/etc/config/tg-ws-proxy-rs` with the secret and
+   every setting intact — after the package install, so that no APK/opkg
+   conffile policy decides which copy survives;
+3. verifies the process, the listening socket and the LuCI files;
 4. only then removes `luci-app-tg-ws-proxy`, `/etc/config/tg-ws-proxy` and
-   `/usr/bin/tg-ws-proxy`. A `/usr/bin/tg-ws-proxy` that belongs to another
-   package is reported and left alone; reinstall that package if 2.2.3
-   overwrote its binary.
+   `/usr/bin/tg-ws-proxy`.
 
 Failing anywhere before step 4 restores the 2.2.3 binary, config and service
 state, and keeps the backup under `/root/tg-ws-proxy-backups/`.
+
+Step 4 is skipped, with a message, in every case where removal could destroy
+something the installer did not replace: a `/usr/bin/tg-ws-proxy` owned by
+another package (reinstall that package if 2.2.3 overwrote its binary), a
+package removal that fails, a `/etc/config/tg-ws-proxy` that was not carried
+over because `/etc/config/tg-ws-proxy-rs` already existed, and a 2.2.3 process
+that is still running — that last one could otherwise be the process holding the
+listening port the readiness check just matched.
 
 Nothing is migrated when `luci-app-tg-ws-proxy` is absent, because the
 unsuffixed files are then either not package-managed or not this project's. To

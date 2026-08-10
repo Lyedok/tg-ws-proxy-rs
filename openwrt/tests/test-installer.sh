@@ -114,11 +114,44 @@ grep -Fxq 'status luci-app-tg-ws-proxy' "$tmp/pm.log" || {
     printf 'FAIL: IPK does not probe the legacy package\n' >&2; exit 1;
 }
 
+LEGACY_INIT="$tmp/legacy-init"
+# shellcheck disable=SC2016 # $1 belongs to the generated stub, not to this shell.
+printf '#!/bin/sh\nprintf "%%s\\n" "$1" >> "%s/legacy-init.log"\n' "$tmp" > "$LEGACY_INIT"
+chmod +x "$LEGACY_INIT"
 LEGACY_PACKAGE=0
 if legacy_service_control stop >/dev/null 2>&1; then
     printf 'FAIL: the legacy init script is driven without proof that it is ours\n' >&2
     exit 1
 fi
+[[ ! -e "$tmp/legacy-init.log" ]] || {
+    printf 'FAIL: the legacy init script ran while LEGACY_PACKAGE was 0\n' >&2
+    exit 1
+}
+LEGACY_PACKAGE=1
+legacy_service_control stop
+grep -Fxq stop "$tmp/legacy-init.log" || {
+    printf 'FAIL: the legacy init script was not driven once it is proven ours\n' >&2
+    exit 1
+}
+
+for owner_output in 'tg-ws-proxy - 0.9.2-r1' 'tg-ws-proxy'; do
+    PM=opkg
+    # shellcheck disable=SC2317
+    opkg() { printf '%s\n' "$owner_output"; }
+    legacy_path_is_foreign /etc/config/tg-ws-proxy || {
+        printf 'FAIL: a foreign owner (%s) was not detected\n' "$owner_output" >&2
+        exit 1
+    }
+done
+for owner_output in 'luci-app-tg-ws-proxy - 2.2.3-r1' ''; do
+    PM=opkg
+    # shellcheck disable=SC2317
+    opkg() { [[ -z "$owner_output" ]] || printf '%s\n' "$owner_output"; }
+    if legacy_path_is_foreign /etc/config/tg-ws-proxy; then
+        printf 'FAIL: our own 2.2.3 package (%s) was treated as foreign\n' "$owner_output" >&2
+        exit 1
+    fi
+done
 
 PM=apk
 apk() { printf '/usr/bin/tg-ws-proxy is owned by tg-ws-proxy-0.9.2-r1\n'; }

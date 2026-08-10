@@ -35,9 +35,11 @@ OLD_CONFIG=0
 OLD_LUCI_PACKAGE=0
 OLD_RUNNING=0
 OLD_ENABLED=0
+LEGACY_INIT=/etc/init.d/tg-ws-proxy
 LEGACY_PACKAGE=0
 LEGACY_RUNNING=0
 LEGACY_ENABLED=0
+LEGACY_CONFIG_MIGRATED=0
 
 usage() {
 	cat <<'EOF'
@@ -193,7 +195,7 @@ resolve_remote_assets() {
 	ARCHIVE_DIGEST="$(release_asset_digest "$api_file" "$archive_name")"
 	[ -n "$ARCHIVE_DIGEST" ] || die "GitHub API digest is missing: $archive_name"
 	LUCI_PACKAGE_URL="$(find_release_asset "$api_file" luci-app-tg-ws-proxy-rs ".$EXT")"
-	[ -n "$LUCI_PACKAGE_URL" ] || die "release LuCI $EXT package is missing"
+	[ -n "$LUCI_PACKAGE_URL" ] || die "release LuCI $EXT package is missing (this installer needs release 2.2.4 or newer)"
 	luci_package_name="${LUCI_PACKAGE_URL##*/}"
 	LUCI_PACKAGE_DIGEST="$(release_asset_digest "$api_file" "$luci_package_name")"
 	[ -n "$LUCI_PACKAGE_DIGEST" ] || die "GitHub API digest is missing: $luci_package_name"
@@ -410,24 +412,47 @@ service_control() {
 }
 
 # Releases up to 2.2.3 installed the unsuffixed names. They are only ever
-# touched when luci-app-tg-ws-proxy proves they were installed by this project
-# and not by an upstream tg-ws-proxy package.
+# touched when luci-app-tg-ws-proxy is installed and no other package claims
+# them; an upstream tg-ws-proxy package owns those names on some routers.
 legacy_service_control() {
 	[ "$LEGACY_PACKAGE" -eq 1 ] || return 1
-	[ -x /etc/init.d/tg-ws-proxy ] || return 1
-	/etc/init.d/tg-ws-proxy "$1"
+	[ -x "$LEGACY_INIT" ] || return 1
+	"$LEGACY_INIT" "$1"
 }
 
+# Fails closed: any output counts as "owned", because apk only prints the
+# "<path> is owned by <package>" form at verbosity >= 1 and the bare package
+# name below it, and an unparsed name must not read as an unowned path.
 package_owning_path() {
 	if [ "$PM" = apk ]; then
-		apk info --who-owns "$1" 2>/dev/null | sed -n 's/^.* is owned by //p'
+		owner_line="$(apk info --who-owns "$1" 2>/dev/null | sed -n 1p)"
+		case "$owner_line" in *' is owned by '*) owner_line="${owner_line##* is owned by }" ;; esac
 	else
-		opkg search "$1" 2>/dev/null | sed -n 's/ - .*//p'
+		owner_line="$(opkg search "$1" 2>/dev/null | sed -n 1p)"
+		case "$owner_line" in *' - '*) owner_line="${owner_line%% - *}" ;; esac
 	fi
+	printf '%s' "$owner_line"
+}
+
+# opkg reports the package name, apk reports name-version-release.
+legacy_path_is_foreign() {
+	owner="$(package_owning_path "$1")"
+	[ -n "$owner" ] || return 1
+	case "$owner" in luci-app-tg-ws-proxy|luci-app-tg-ws-proxy-[0-9]*) return 1 ;; esac
+	return 0
+}
+
+legacy_process_pid() {
+	for candidate in $(pidof tg-ws-proxy 2>/dev/null); do
+		case "$(readlink "/proc/$candidate/exe" 2>/dev/null || true)" in
+			/usr/bin/tg-ws-proxy) printf '%s' "$candidate"; return 0 ;;
+		esac
+	done
+	return 1
 }
 
 # A pre-package manual installation is only imported when the running process
-# really is this project's binary: /usr/bin/tg-ws-proxy can belong to an
+# runs from a path no package claims: /usr/bin/tg-ws-proxy can belong to an
 # upstream tg-ws-proxy package, whose configuration is none of our business.
 manual_process_pid() {
 	for candidate in $(pidof tg-ws-proxy-rs 2>/dev/null) $(pidof tg-ws-proxy 2>/dev/null); do
@@ -469,10 +494,27 @@ remove_luci_package() {
 
 remove_legacy_installation() {
 	[ "$LEGACY_PACKAGE" -eq 1 ] || return 0
+	# A 2.2.3 process still holding the listening port means the readiness
+	# probe above may have matched its socket rather than ours, so nothing it
+	# depends on may be deleted yet.
+	if [ -n "$(legacy_process_pid)" ]; then
+		warn "The 2.2.3 process is still running; its package and files were left in place."
+		warn "Stop it, verify tg-ws-proxy-rs, then remove luci-app-tg-ws-proxy by hand."
+		return 0
+	fi
 	legacy_service_control disable >/dev/null 2>&1 || true
 	if [ "$PM" = apk ]; then apk del luci-app-tg-ws-proxy >/dev/null 2>&1 || true
 	else opkg remove luci-app-tg-ws-proxy >/dev/null 2>&1 || true; fi
-	rm -f /etc/config/tg-ws-proxy /etc/config/tg-ws-proxy.apk-new /etc/config/tg-ws-proxy-opkg
+	if legacy_luci_is_installed; then
+		warn "luci-app-tg-ws-proxy could not be removed; its files were left in place."
+		return 0
+	fi
+	if [ "$LEGACY_CONFIG_MIGRATED" -eq 1 ]; then
+		rm -f /etc/config/tg-ws-proxy /etc/config/tg-ws-proxy.apk-new /etc/config/tg-ws-proxy-opkg
+	elif [ -e /etc/config/tg-ws-proxy ]; then
+		warn "/etc/config/tg-ws-proxy was not carried over and is left in place;"
+		warn "the service now reads /etc/config/tg-ws-proxy-rs."
+	fi
 	owner="$(package_owning_path /usr/bin/tg-ws-proxy)"
 	if [ -z "$owner" ]; then
 		rm -f /usr/bin/tg-ws-proxy
@@ -480,7 +522,7 @@ remove_legacy_installation() {
 		warn "/usr/bin/tg-ws-proxy belongs to package $owner and was left untouched."
 		warn "Reinstall that package if an earlier tg-ws-proxy-rs release overwrote its binary."
 	fi
-	ok "Removed the previous luci-app-tg-ws-proxy integration and its unsuffixed files."
+	ok "Removed the previous luci-app-tg-ws-proxy integration."
 }
 
 restore_service_state() {
@@ -515,6 +557,7 @@ rollback() {
 	else
 		warn "The LuCI integration package remains at its upgraded version."
 	fi
+	uci -q revert tg-ws-proxy-rs
 	restore_service_state
 	warn "Recovery files are retained in $BACKUP_DIR"
 }
@@ -568,6 +611,11 @@ main() {
 	[ -e /etc/config/tg-ws-proxy-rs ] && OLD_CONFIG=1
 	luci_is_installed && OLD_LUCI_PACKAGE=1
 	legacy_luci_is_installed && LEGACY_PACKAGE=1
+	if [ "$LEGACY_PACKAGE" -eq 1 ] && { legacy_path_is_foreign "$LEGACY_INIT" ||
+		legacy_path_is_foreign /etc/config/tg-ws-proxy; }; then
+		LEGACY_PACKAGE=0
+		warn "Another package owns the unsuffixed tg-ws-proxy files; leaving them untouched."
+	fi
 	service_control status >/dev/null 2>&1 && OLD_RUNNING=1
 	service_control enabled >/dev/null 2>&1 && OLD_ENABLED=1
 	legacy_service_control status >/dev/null 2>&1 && LEGACY_RUNNING=1
@@ -598,13 +646,6 @@ main() {
 	# The 2.2.3 service binds the same port, so it goes down before the renamed
 	# one comes up. It is only restarted again if this installation rolls back.
 	legacy_service_control stop >/dev/null 2>&1 || true
-	if [ "$OLD_CONFIG" -eq 0 ] && [ "$LEGACY_PACKAGE" -eq 1 ] && [ -f /etc/config/tg-ws-proxy ]; then
-		cp -p /etc/config/tg-ws-proxy /etc/config/tg-ws-proxy-rs || {
-			rollback; die "cannot carry the previous UCI config over to tg-ws-proxy-rs"
-		}
-		OLD_CONFIG=1
-		info "Carried /etc/config/tg-ws-proxy over to /etc/config/tg-ws-proxy-rs."
-	fi
 	if [ "$OLD_LUCI_PACKAGE" -eq 0 ]; then
 		rm -f /etc/init.d/tg-ws-proxy-rs /etc/init.d/tg-ws-proxy-rs.apk-new \
 			/etc/init.d/tg-ws-proxy-rs-opkg
@@ -613,6 +654,16 @@ main() {
 		rollback; die "LuCI package installation failed"
 	fi
 	rm -f /etc/config/tg-ws-proxy-rs.apk-new /etc/config/tg-ws-proxy-rs-opkg
+	# After the package install, so that no apk/opkg conffile policy decides
+	# which copy of the config survives.
+	if [ "$OLD_CONFIG" -eq 0 ] && [ "$LEGACY_PACKAGE" -eq 1 ] && [ -f /etc/config/tg-ws-proxy ]; then
+		cp -p /etc/config/tg-ws-proxy /etc/config/tg-ws-proxy-rs || {
+			rollback; die "cannot carry the previous UCI config over to tg-ws-proxy-rs"
+		}
+		OLD_CONFIG=1
+		LEGACY_CONFIG_MIGRATED=1
+		info "Carried /etc/config/tg-ws-proxy over to /etc/config/tg-ws-proxy-rs."
+	fi
 	if [ -x /etc/uci-defaults/95_luci-tg-ws-proxy-rs ]; then
 		/etc/uci-defaults/95_luci-tg-ws-proxy-rs || { rollback; die "OpenWrt migration failed"; }
 		rm -f /etc/uci-defaults/95_luci-tg-ws-proxy-rs

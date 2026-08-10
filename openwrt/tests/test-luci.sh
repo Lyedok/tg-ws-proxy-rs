@@ -72,6 +72,6 @@ done < "$CONFIG"
 
 grep -Eq '^[[:space:]]*PKGARCH:=all$' "$MAKEFILE" || fail 'package is not architecture-independent'
 grep -Fq 'DEPENDS:=+luci-base' "$MAKEFILE" || fail 'luci-base dependency is missing'
-if grep -Fq '+tg-ws-proxy-rs' "$MAKEFILE"; then fail 'architecture-independent LuCI package must not depend on a core package'; fi
+if grep -Fq '+tg-ws-proxy' "$MAKEFILE"; then fail 'architecture-independent LuCI package must not depend on a core package'; fi
 
 printf 'PASS: LuCI contract\n'
