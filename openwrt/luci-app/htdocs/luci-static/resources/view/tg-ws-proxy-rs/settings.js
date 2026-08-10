@@ -9,7 +9,7 @@
 'require validation';
 'require view';
 
-const SERVICE = 'tg-ws-proxy';
+const SERVICE = 'tg-ws-proxy-rs';
 const isReadonlyView = !L.hasViewPermission() || null;
 
 const callServiceList = rpc.declare({
@@ -48,7 +48,7 @@ function statusNode(status) {
 
 function formatLogLine(line) {
 	const value = String(line || '');
-	const traced = value.match(/^[A-Z][a-z]{2}\s+([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\d{4}\s+\S+\s+tg-ws-proxy\[\d+\]:\s+\d{4}-\d{2}-\d{2}T\S+\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+(\S+):\s*(.*)$/);
+	const traced = value.match(/^[A-Z][a-z]{2}\s+([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\d{4}\s+\S+\s+tg-ws-proxy-rs\[\d+\]:\s+\d{4}-\d{2}-\d{2}T\S+\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+(\S+):\s*(.*)$/);
 	if (traced) {
 		const level = traced[2];
 		const target = traced[3];
@@ -58,7 +58,7 @@ function formatLogLine(line) {
 		return `${traced[1]} [${level}] ${target} — ${traced[4]}`;
 	}
 
-	const plain = value.match(/^[A-Z][a-z]{2}\s+([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\d{4}\s+\S+\s+tg-ws-proxy\[\d+\]:\s*(.*)$/);
+	const plain = value.match(/^[A-Z][a-z]{2}\s+([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\d{4}\s+\S+\s+tg-ws-proxy-rs\[\d+\]:\s*(.*)$/);
 	return plain ? `${plain[1]} ${plain[2]}` : value;
 }
 
@@ -177,13 +177,13 @@ return view.extend({
 	handleServiceAction(action, event) {
 		const button = event.currentTarget;
 		button.disabled = true;
-		return fs.exec('/etc/init.d/tg-ws-proxy', [action]).then((result) => {
+		return fs.exec('/etc/init.d/tg-ws-proxy-rs', [action]).then((result) => {
 			if (result.code !== 0)
 				throw new Error(_('Command failed'));
 			return new Promise((resolve) => window.setTimeout(resolve, 500));
 		}).then(() => this.updateStatus()).catch((error) => {
 			ui.addNotification(null, E('p', {},
-				_('Unable to %s tg-ws-proxy: %s').format(action, error.message)));
+				_('Unable to %s tg-ws-proxy-rs: %s').format(action, error.message)));
 		}).finally(() => {
 			button.disabled = isReadonlyView;
 		});
@@ -193,7 +193,7 @@ return view.extend({
 		let m, s, o;
 		const self = this;
 
-		m = new form.Map('tg-ws-proxy', _('Telegram WS Proxy'),
+		m = new form.Map('tg-ws-proxy-rs', _('Telegram WS Proxy (Rust)'),
 			_('Telegram MTProto proxy with WebSocket, FakeTLS, Cloudflare and upstream proxy fallbacks.'));
 
 		s = m.section(form.TypedSection);
@@ -227,7 +227,7 @@ return view.extend({
 			]);
 		};
 
-		s = m.section(form.NamedSection, 'main', 'tg-ws-proxy', _('Settings'));
+		s = m.section(form.NamedSection, 'main', 'tg-ws-proxy-rs', _('Settings'));
 		s.addremove = false;
 		s.tab('general', _('General'));
 		s.tab('routing', _('Routing & fallbacks'));
@@ -236,7 +236,7 @@ return view.extend({
 		s.tab('logging', _('Logging & security'));
 
 		o = addFlag(s, 'general', 'enabled', _('Enable service'),
-			_('Start tg-ws-proxy under procd and enable automatic respawn.'), '0');
+			_('Start tg-ws-proxy-rs under procd and enable automatic respawn.'), '0');
 
 		o = addValue(s, 'general', 'host', _('Listen address'), null,
 			'ipaddr', '0.0.0.0', '0.0.0.0');

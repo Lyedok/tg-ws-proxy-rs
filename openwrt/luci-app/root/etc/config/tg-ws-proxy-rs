@@ -1,4 +1,4 @@
-config tg-ws-proxy 'main'
+config tg-ws-proxy-rs 'main'
 	option enabled '0'
 	option host '0.0.0.0'
 	option port '1443'

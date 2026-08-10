@@ -30,21 +30,21 @@ done
 case "$FORMAT" in apk|ipk) ;; *) printf 'error: --format must be apk or ipk\n' >&2; exit 1 ;; esac
 [[ -f "$SDK/include/package.mk" ]] || { printf 'error: not an OpenWrt SDK: %s\n' "$SDK" >&2; exit 1; }
 
-package_dir="$SDK/package/luci-app-tg-ws-proxy"
+package_dir="$SDK/package/luci-app-tg-ws-proxy-rs"
 rm -rf "$package_dir"
 mkdir -p "$package_dir"
 cp -a "$ROOT/openwrt/luci-app/." "$package_dir/"
 
 shopt -s nullglob
-old_packages=("$SDK"/bin/packages/*/*/luci-app-tg-ws-proxy*."$FORMAT")
+old_packages=("$SDK"/bin/packages/*/*/luci-app-tg-ws-proxy-rs*."$FORMAT")
 ((${#old_packages[@]} == 0)) || rm -f "${old_packages[@]}"
 
 make -C "$SDK" defconfig >/dev/null
-make -C "$SDK" package/luci-app-tg-ws-proxy/clean >/dev/null
-make -C "$SDK" package/luci-app-tg-ws-proxy/compile \
+make -C "$SDK" package/luci-app-tg-ws-proxy-rs/clean >/dev/null
+make -C "$SDK" package/luci-app-tg-ws-proxy-rs/compile \
     TG_PACKAGE_VERSION="$VERSION"
 
-packages=("$SDK"/bin/packages/*/*/luci-app-tg-ws-proxy*."$FORMAT")
+packages=("$SDK"/bin/packages/*/*/luci-app-tg-ws-proxy-rs*."$FORMAT")
 [[ "${#packages[@]}" -eq 1 ]] || {
     printf 'error: expected one LuCI %s, found %s\n' "$FORMAT" "${#packages[@]}" >&2
     exit 1
@@ -53,12 +53,12 @@ package="${packages[0]}"
 
 if [[ "$FORMAT" == apk ]]; then
     metadata="$("$SDK"/staging_dir/host/bin/apk adbdump "$package")"
-    grep -Fq 'name: luci-app-tg-ws-proxy' <<<"$metadata"
+    grep -Fq 'name: luci-app-tg-ws-proxy-rs' <<<"$metadata"
     grep -Fq "version: $VERSION-r1" <<<"$metadata"
     grep -Fq 'arch: noarch' <<<"$metadata"
 else
     metadata="$(tar -xOzf "$package" ./control.tar.gz | tar -xzOf - ./control)"
-    grep -Fq 'Package: luci-app-tg-ws-proxy' <<<"$metadata"
+    grep -Fq 'Package: luci-app-tg-ws-proxy-rs' <<<"$metadata"
     grep -Fq "Version: $VERSION-r1" <<<"$metadata"
     grep -Fq 'Architecture: all' <<<"$metadata"
 fi

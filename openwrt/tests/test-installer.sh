@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034 # Globals are consumed by functions sourced from install.sh.
+# shellcheck disable=SC2034,SC2329 # Globals and apk/opkg stubs are consumed by functions sourced from install.sh.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -81,6 +81,58 @@ PM=opkg
 install_luci_package
 [[ "$OPKG_ARGS" == "install $LUCI_PACKAGE_FILE" ]] || {
     printf 'FAIL: IPK install uses unexpected options: %s\n' "$OPKG_ARGS" >&2; exit 1;
+}
+
+PM=apk
+APK_ARGS=''
+remove_luci_package
+[[ "$APK_ARGS" == "del luci-app-tg-ws-proxy-rs" ]] || {
+    printf 'FAIL: APK removal does not target the -rs package: %s\n' "$APK_ARGS" >&2; exit 1;
+}
+PM=opkg
+OPKG_ARGS=''
+remove_luci_package
+[[ "$OPKG_ARGS" == "remove luci-app-tg-ws-proxy-rs" ]] || {
+    printf 'FAIL: IPK removal does not target the -rs package: %s\n' "$OPKG_ARGS" >&2; exit 1;
+}
+
+# The unsuffixed names belong to the upstream tg-ws-proxy package unless this
+# project's own 2.2.3 integration package claims them.
+: > "$tmp/pm.log"
+apk() { printf '%s\n' "$*" >> "$tmp/pm.log"; }
+opkg() { printf '%s\n' "$*" >> "$tmp/pm.log"; printf 'Status: install ok installed\n'; }
+PM=apk
+luci_is_installed
+legacy_luci_is_installed
+PM=opkg
+luci_is_installed
+legacy_luci_is_installed
+grep -Fxq 'info -e luci-app-tg-ws-proxy-rs' "$tmp/pm.log" || {
+    printf 'FAIL: APK does not probe the -rs package\n' >&2; exit 1;
+}
+grep -Fxq 'status luci-app-tg-ws-proxy' "$tmp/pm.log" || {
+    printf 'FAIL: IPK does not probe the legacy package\n' >&2; exit 1;
+}
+
+LEGACY_PACKAGE=0
+if legacy_service_control stop >/dev/null 2>&1; then
+    printf 'FAIL: the legacy init script is driven without proof that it is ours\n' >&2
+    exit 1
+fi
+
+PM=apk
+apk() { printf '/usr/bin/tg-ws-proxy is owned by tg-ws-proxy-0.9.2-r1\n'; }
+[[ "$(package_owning_path /usr/bin/tg-ws-proxy)" == 'tg-ws-proxy-0.9.2-r1' ]] || {
+    printf 'FAIL: APK file ownership is not detected\n' >&2; exit 1;
+}
+PM=opkg
+opkg() { printf 'tg-ws-proxy - 0.9.2-r1\n'; }
+[[ "$(package_owning_path /usr/bin/tg-ws-proxy)" == 'tg-ws-proxy' ]] || {
+    printf 'FAIL: IPK file ownership is not detected\n' >&2; exit 1;
+}
+opkg() { :; }
+[[ -z "$(package_owning_path /usr/bin/tg-ws-proxy)" ]] || {
+    printf 'FAIL: an unowned path was reported as package-owned\n' >&2; exit 1;
 }
 
 printf 'binary archive\n' > "$tmp/archive"

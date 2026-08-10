@@ -2,14 +2,16 @@
 
 [ -n "${IPKG_INSTROOT:-}" ] && exit 0
 
-config=tg-ws-proxy
+config=tg-ws-proxy-rs
 section=main
 changed=0
 
-uci -q get "$config.$section" >/dev/null 2>&1 || {
-	uci -q set "$config.$section=tg-ws-proxy"
+# Also normalizes the section type of a config carried over from the releases
+# that named this package's files tg-ws-proxy.
+if [ "$(uci -q get "$config.$section")" != tg-ws-proxy-rs ]; then
+	uci -q set "$config.$section=tg-ws-proxy-rs"
 	changed=1
-}
+fi
 
 secret="$(uci -q get "$config.$section.secret")"
 if [ -z "$secret" ]; then

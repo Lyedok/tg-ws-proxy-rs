@@ -63,16 +63,17 @@ for what that costs in RAM.
 ### OpenWrt package (recommended)
 
 This repository installs the existing static musl release binary directly and
-packages only the matching `luci-app-tg-ws-proxy` integration as APK/IPK. It
+packages only the matching `luci-app-tg-ws-proxy-rs` integration as APK/IPK. It
 provides a UCI-managed procd service and a BusyBox-compatible installer. Configure
-it at **Services → Telegram WS Proxy**; the Logging tab shows filtered entries
+it at **Services → Telegram WS Proxy (Rust)**; the Logging tab shows filtered entries
 from the bounded OpenWrt `logd` ring buffer. See
 [OpenWrtPackage.md](OpenWrtPackage.md) for local builds, installation,
 configuration, upgrades, and rollback.
 
 ### Manual OpenWrt procd init script
 
-Create `/etc/init.d/tg-ws-proxy`:
+Create `/etc/init.d/tg-ws-proxy-rs` (the `-rs` suffix keeps the script clear of
+an upstream `tg-ws-proxy` package):
 
 ```sh
 #!/bin/sh /etc/rc.common
@@ -80,7 +81,7 @@ USE_PROCD=1
 START=90
 STOP=10
 
-PROG=/usr/local/bin/tg-ws-proxy
+PROG=/usr/local/bin/tg-ws-proxy-rs
 
 start_service() {
     procd_open_instance
@@ -93,9 +94,9 @@ start_service() {
 ```
 
 ```bash
-chmod +x /etc/init.d/tg-ws-proxy
-/etc/init.d/tg-ws-proxy enable
-/etc/init.d/tg-ws-proxy start
+chmod +x /etc/init.d/tg-ws-proxy-rs
+/etc/init.d/tg-ws-proxy-rs enable
+/etc/init.d/tg-ws-proxy-rs start
 ```
 
 ## Configuration via environment

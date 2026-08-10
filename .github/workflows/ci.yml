@@ -99,16 +99,16 @@ jobs:
 
       - name: Check shell scripts
         run: |
-          shellcheck -s sh install.sh openwrt/luci-app/root/etc/init.d/tg-ws-proxy \
-            openwrt/luci-app/root/etc/uci-defaults/95_luci-tg-ws-proxy
+          shellcheck -s sh install.sh openwrt/luci-app/root/etc/init.d/tg-ws-proxy-rs \
+            openwrt/luci-app/root/etc/uci-defaults/95_luci-tg-ws-proxy-rs
           shellcheck -s bash openwrt/build-luci-package.sh openwrt/tests/*.sh
 
       - name: Check LuCI JavaScript and JSON
         run: |
-          node --check openwrt/luci-app/htdocs/luci-static/resources/view/tg-ws-proxy/settings.js
-          python3 -m json.tool openwrt/luci-app/root/usr/share/luci/menu.d/luci-app-tg-ws-proxy.json >/dev/null
-          python3 -m json.tool openwrt/luci-app/root/usr/share/rpcd/acl.d/luci-app-tg-ws-proxy.json >/dev/null
-          python3 -m json.tool openwrt/luci-app/root/usr/share/ucitrack/luci-app-tg-ws-proxy.json >/dev/null
+          node --check openwrt/luci-app/htdocs/luci-static/resources/view/tg-ws-proxy-rs/settings.js
+          python3 -m json.tool openwrt/luci-app/root/usr/share/luci/menu.d/luci-app-tg-ws-proxy-rs.json >/dev/null
+          python3 -m json.tool openwrt/luci-app/root/usr/share/rpcd/acl.d/luci-app-tg-ws-proxy-rs.json >/dev/null
+          python3 -m json.tool openwrt/luci-app/root/usr/share/ucitrack/luci-app-tg-ws-proxy-rs.json >/dev/null
 
       - name: Run OpenWrt package contracts
         run: openwrt/tests/run.sh
