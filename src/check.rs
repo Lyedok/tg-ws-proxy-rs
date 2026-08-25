@@ -197,7 +197,7 @@ async fn probe_mtproto_proxy(
     // Use DC index 2 (non-media) as a representative test target.
     let (handshake, _enc, _dec) =
         generate_client_handshake(key_bytes, 2, ProtoTag::PaddedIntermediate);
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (mut reader, mut writer) = stream.into_split();
 
     if let Some(hostname) = faketls_hostname {
         // ── FakeTLS path ──────────────────────────────────────────────────

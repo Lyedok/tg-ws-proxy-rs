@@ -33,8 +33,9 @@ use std::time::{Duration, Instant};
 
 use cipher::StreamCipher;
 use futures_util::{SinkExt, StreamExt};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use tungstenite::Message;
@@ -58,8 +59,8 @@ use crate::ws_client::{
     connect_cf_ws_for_dc_with_outbound, connect_ws_for_dc_with_outbound, media_tag,
 };
 
-type TcpReader = ReadHalf<TcpStream>;
-type TcpWriter = WriteHalf<TcpStream>;
+type TcpReader = OwnedReadHalf;
+type TcpWriter = OwnedWriteHalf;
 
 /// Relay buffer size for reads from the *remote* side.
 ///
@@ -401,7 +402,7 @@ pub async fn handle_client_with_runtime(
     let timeouts = Timeouts::from_config(&config);
 
     // Split into independent read / write halves.
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (mut reader, mut writer) = stream.into_split();
 
     // ── Step 1: read the 64-byte MTProto obfuscation init ────────────────
     let inbound_faketls_domain = config.listen_faketls_domain();
@@ -1521,7 +1522,7 @@ async fn connect_mtproto_upstream(
     let _ = stream.set_nodelay(true);
 
     let (handshake, enc, dec) = generate_client_handshake(key_bytes, dc_idx, proto);
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (mut reader, mut writer) = stream.into_split();
 
     let Some(hostname) = faketls_hostname(&secret) else {
         // ── Plain MTProto path ────────────────────────────────────────────
@@ -1763,7 +1764,7 @@ async fn bridge_tcp(
     };
 
     let _ = remote.set_nodelay(true);
-    let (mut rem_reader, mut rem_writer) = tokio::io::split(remote);
+    let (mut rem_reader, mut rem_writer) = remote.into_split();
 
     // Send relay init to the remote Telegram server.
     if let Err(e) = rem_writer.write_all(relay_init).await {

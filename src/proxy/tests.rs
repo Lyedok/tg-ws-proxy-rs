@@ -253,7 +253,7 @@ async fn upstream_frame_sizes(framing: WsFraming, payload: &[u8]) -> Vec<usize> 
     let clients_addr = clients.local_addr().unwrap();
     let mut client = TcpStream::connect(clients_addr).await.unwrap();
     let (server, _) = clients.accept().await.unwrap();
-    let (reader, writer) = tokio::io::split(server);
+    let (reader, writer) = server.into_split();
 
     let relay_init = generate_relay_init(ProtoTag::PaddedIntermediate, 2);
     let ciphers = build_connection_ciphers(&[0u8; 48], &[0u8; 32], &relay_init);
