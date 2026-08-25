@@ -1322,7 +1322,7 @@ impl Route<'_> {
 /// Telegram (WebSocket).
 ///
 /// ```text
-/// client  →  clt_dec  →  plaintext  →  tg_enc  →  split  →  WebSocket frames  →  Telegram
+/// client  →  clt_dec  →  split + tg_enc  →  WebSocket frames  →  Telegram
 /// Telegram  →  WS frame  →  tg_dec  →  plaintext  →  clt_enc  →  client TCP
 /// ```
 struct WsBridgeParams<'a> {
@@ -1354,8 +1354,7 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
         mut tg_enc,
         mut tg_dec,
     } = ciphers;
-    let mut splitter =
-        (framing == WsFraming::Packets).then(|| MsgSplitter::new(&relay_init, proto));
+    let mut splitter = (framing == WsFraming::Packets).then(|| MsgSplitter::new(proto));
 
     // Split the WebSocket stream into sink (send) and source (recv).
     let (mut ws_sink, mut ws_source) = ws.split();
@@ -1385,15 +1384,15 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
                 };
                 let chunk = &mut buf[..n];
 
-                // Decrypt from client, then re-encrypt for Telegram.
+                // Packet framing needs the plaintext header. The splitter
+                // encrypts each consumed slice in stream order afterwards.
                 clt_dec.apply_keystream(chunk);
-                tg_enc.apply_keystream(chunk);
 
                 let sent = match splitter.as_mut() {
                     // Split into MTProto packets and send as separate WS frames.
                     Some(splitter) => {
                         let mut sent = true;
-                        for part in splitter.split(chunk) {
+                        for part in splitter.split_and_encrypt(chunk, &mut tg_enc) {
                             if ws_sink.send(Message::Binary(part)).await.is_err() {
                                 sent = false;
                                 break;
@@ -1405,7 +1404,10 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
                     // bounded by `CLIENT_READ_BUF_SIZE`, far under Cloudflare's
                     // 1 MiB message cap, so it needs no further chunking — and
                     // no intermediate `Vec` of parts either.
-                    None => ws_sink.send(Message::Binary(chunk.to_vec())).await.is_ok(),
+                    None => {
+                        tg_enc.apply_keystream(chunk);
+                        ws_sink.send(Message::Binary(chunk.to_vec())).await.is_ok()
+                    }
                 };
 
                 if !sent {
