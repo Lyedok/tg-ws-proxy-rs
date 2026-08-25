@@ -38,6 +38,7 @@ use tokio_tungstenite::{
 use tracing::{debug, warn};
 use tungstenite::Error as WsError;
 use tungstenite::Message;
+use tungstenite::protocol::WebSocketConfig;
 
 /// A live WebSocket connection to a Telegram DC.
 pub type TgWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -306,10 +307,38 @@ where
             .connect(server_name, tcp)
             .await
             .map_err(WsError::Io)?;
-        client_async_with_config(request, MaybeTlsStream::Rustls(tls_stream), None).await
+        client_async_with_config(
+            request,
+            MaybeTlsStream::Rustls(tls_stream),
+            Some(ws_config()),
+        )
+        .await
     } else {
         let connector = build_tls_connector(skip_tls_verify);
-        client_async_tls_with_config(request, tcp, None, Some(connector)).await
+        client_async_tls_with_config(request, tcp, Some(ws_config()), Some(connector)).await
+    }
+}
+
+/// Ceiling for one incoming WebSocket frame and its reassembled message.
+///
+/// Tungstenite otherwise permits 16 MiB frames and 64 MiB messages, while its
+/// input buffer retains the largest capacity reached by a connection. Telegram
+/// media parts are at most 1 MiB, so 4 MiB leaves protocol headroom without
+/// letting one unusual frame park tens of megabytes for the session lifetime.
+const WS_MAX_FRAME: usize = 4 * 1024 * 1024;
+
+/// Target size of tungstenite's per-connection write buffer.
+///
+/// Every send in the bridge is awaited and flushed before the next message, so
+/// the default 128 KiB batching target only increases the retained footprint.
+const WS_WRITE_BUFFER: usize = 16 * 1024;
+
+fn ws_config() -> WebSocketConfig {
+    WebSocketConfig {
+        write_buffer_size: WS_WRITE_BUFFER,
+        max_frame_size: Some(WS_MAX_FRAME),
+        max_message_size: Some(WS_MAX_FRAME),
+        ..WebSocketConfig::default()
     }
 }
 

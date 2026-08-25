@@ -23,7 +23,9 @@
 
 use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
+use std::future::Future;
 use std::hash::Hash;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -53,7 +55,7 @@ use crate::runtime::Runtime;
 use crate::splitter::MsgSplitter;
 use crate::ws_client::{
     TgWsStream, WsAttempt, connect_cf_worker_ws_for_dc_with_outbound,
-    connect_cf_ws_for_dc_with_outbound, connect_ws_for_dc_with_outbound, media_tag, ws_send,
+    connect_cf_ws_for_dc_with_outbound, connect_ws_for_dc_with_outbound, media_tag,
 };
 
 type TcpReader = ReadHalf<TcpStream>;
@@ -491,71 +493,45 @@ pub async fn handle_client_with_runtime(
     let target_ip = config.dc_target_ip(dc_id).map(str::to_string);
 
     // ── Step 6: bridge whatever we ended up connected to ─────────────────
-    match select_upstream(&route, target_ip).await {
-        Some(Upstream::Ws { ws, framing }) => {
-            bridge_ws(
-                reader,
-                writer,
-                WsBridgeParams {
-                    label: &label,
-                    ws,
-                    framing,
-                    relay_init,
-                    ciphers,
-                    proto,
-                    dc: dc_id,
-                    is_media,
-                },
-            )
-            .await;
-        }
-        Some(Upstream::Mtproto(conn)) => {
-            let ConnectionCiphers {
-                clt_dec, clt_enc, ..
-            } = ciphers;
-
-            bridge_relay(
-                reader,
-                writer,
-                RelayParams {
-                    label: &label,
-                    rem_reader: conn.reader,
-                    rem_writer: conn.writer,
-                    ciphers: ConnectionCiphers {
-                        clt_dec,
-                        clt_enc,
-                        tg_enc: conn.enc,
-                        tg_dec: conn.dec,
-                    },
-                    faketls: conn.faketls,
-                    dc: dc_id,
-                    is_media,
-                },
-            )
-            .await;
-        }
-        Some(Upstream::Tcp(dst)) => {
-            bridge_tcp(
-                reader,
-                writer,
-                TcpBridgeParams {
-                    label: &label,
-                    dst: &dst,
-                    relay_init: &relay_init,
-                    ciphers,
-                    dc: dc_id,
-                    is_media,
-                    connect_timeout: route.timeouts.tcp_fallback,
-                    runtime: Arc::clone(&runtime),
-                },
-            )
-            .await;
-        }
-        None => {}
+    // The routing ladder contains every TLS/WS fallback handshake, while only
+    // one bridge branch survives for the session. Box the short-lived ladder,
+    // then box only the bridge actually selected; otherwise Rust's async state
+    // machine reserves space for their combined widest variants forever.
+    let bridge = Box::pin(select_bridge(
+        &route,
+        target_ip,
+        reader,
+        writer,
+        BridgeDispatch {
+            label: &label,
+            relay_init,
+            ciphers,
+            proto,
+            dc: dc_id,
+            is_media,
+            tcp_connect_timeout: route.timeouts.tcp_fallback,
+            runtime: Arc::clone(&runtime),
+        },
+    ))
+    .await;
+    if let Some(bridge) = bridge {
+        bridge.await;
     }
 }
 
 // ─── Routing ─────────────────────────────────────────────────────────────────
+
+async fn select_bridge<'a>(
+    route: &Route<'_>,
+    target_ip: Option<String>,
+    reader: ClientReader,
+    writer: ClientWriter,
+    params: BridgeDispatch<'a>,
+) -> Option<Pin<Box<dyn Future<Output = ()> + Send + 'a>>> {
+    select_upstream(route, target_ip)
+        .await
+        .map(|upstream| bridge_selected(reader, writer, upstream, params))
+}
 
 /// The upstream a connection was routed to, ready to be bridged.
 // Every other layer (the pool, `WsConnectResult`, the bridges) moves
@@ -571,6 +547,99 @@ enum Upstream {
     Mtproto(UpstreamConnection),
     /// Last resort: a direct TCP connection to this Telegram DC IP.
     Tcp(String),
+}
+
+struct BridgeDispatch<'a> {
+    label: &'a str,
+    relay_init: [u8; 64],
+    ciphers: ConnectionCiphers,
+    proto: ProtoTag,
+    dc: u32,
+    is_media: bool,
+    tcp_connect_timeout: Duration,
+    runtime: Arc<Runtime>,
+}
+
+/// Erase the unselected bridge variants before the session-long await.
+///
+/// Returning one boxed trait object matters here: an `async` `match` reserves
+/// enough state for its widest branch even though a connection uses exactly
+/// one of them. This synchronous dispatch moves only the selected bridge into
+/// its allocation, then drops the `Upstream` enum immediately.
+fn bridge_selected<'a>(
+    reader: ClientReader,
+    writer: ClientWriter,
+    upstream: Upstream,
+    params: BridgeDispatch<'a>,
+) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    let BridgeDispatch {
+        label,
+        relay_init,
+        ciphers,
+        proto,
+        dc,
+        is_media,
+        tcp_connect_timeout,
+        runtime,
+    } = params;
+
+    match upstream {
+        Upstream::Ws { ws, framing } => Box::pin(bridge_ws(
+            reader,
+            writer,
+            WsBridgeParams {
+                label,
+                ws,
+                framing,
+                relay_init,
+                ciphers,
+                proto,
+                dc,
+                is_media,
+            },
+        )),
+        Upstream::Mtproto(conn) => {
+            let ConnectionCiphers {
+                clt_dec, clt_enc, ..
+            } = ciphers;
+
+            Box::pin(bridge_relay(
+                reader,
+                writer,
+                RelayParams {
+                    label,
+                    rem_reader: conn.reader,
+                    rem_writer: conn.writer,
+                    ciphers: ConnectionCiphers {
+                        clt_dec,
+                        clt_enc,
+                        tg_enc: conn.enc,
+                        tg_dec: conn.dec,
+                    },
+                    faketls: conn.faketls,
+                    dc,
+                    is_media,
+                },
+            ))
+        }
+        Upstream::Tcp(dst) => Box::pin(async move {
+            bridge_tcp(
+                reader,
+                writer,
+                TcpBridgeParams {
+                    label,
+                    dst: &dst,
+                    relay_init: &relay_init,
+                    ciphers,
+                    dc,
+                    is_media,
+                    connect_timeout: tcp_connect_timeout,
+                    runtime,
+                },
+            )
+            .await;
+        }),
+    }
 }
 
 /// How the client's byte stream has to be cut into WebSocket messages.
@@ -1270,7 +1339,7 @@ struct WsBridgeParams<'a> {
 async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeParams<'_>) {
     let WsBridgeParams {
         label,
-        mut ws,
+        ws,
         framing,
         relay_init,
         ciphers,
@@ -1278,12 +1347,6 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
         dc,
         is_media,
     } = params;
-
-    // Send the relay init packet to Telegram before bridging.
-    if let Err(e) = ws_send(&mut ws, relay_init.to_vec()).await {
-        warn!("[{}] failed to send relay init: {}", label, e);
-        return;
-    }
 
     let ConnectionCiphers {
         mut clt_dec,
@@ -1301,9 +1364,17 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
     let counters = Arc::new(BridgeCounters::default());
 
     let upload = tokio::spawn({
-        let counters = Arc::clone(&counters);
+        let mut bytes = DirectionCounter::new(Arc::clone(&counters), Direction::Upload);
+        let label = label.to_string();
 
         async move {
+            // Send after splitting so the long-lived parent future never holds
+            // the complete WebSocket/TLS stream across an await point.
+            if let Err(e) = ws_sink.send(Message::Binary(relay_init.to_vec())).await {
+                warn!("[{}] failed to send relay init: {}", label, e);
+                return;
+            }
+
             let mut reader = reader;
             let mut buf = vec![0u8; CLIENT_READ_BUF_SIZE];
 
@@ -1341,7 +1412,7 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
                     return;
                 }
 
-                counters.add_up(n);
+                bytes.add(n);
             }
 
             // Flush any partial last packet.
@@ -1361,7 +1432,7 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
     });
 
     let download = tokio::spawn({
-        let counters = Arc::clone(&counters);
+        let mut bytes = DirectionCounter::new(Arc::clone(&counters), Direction::Download);
 
         async move {
             let mut writer = writer;
@@ -1384,7 +1455,7 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
                     break;
                 }
 
-                counters.add_down(data.len());
+                bytes.add(data.len());
             }
         }
     });
@@ -1560,7 +1631,7 @@ async fn bridge_relay(reader: ClientReader, writer: ClientWriter, params: RelayP
 
     // ── Upload: client → upstream ────────────────────────────────────────
     let upload = tokio::spawn({
-        let counters = Arc::clone(&counters);
+        let mut bytes = DirectionCounter::new(Arc::clone(&counters), Direction::Upload);
 
         async move {
             let mut reader = reader;
@@ -1587,14 +1658,14 @@ async fn bridge_relay(reader: ClientReader, writer: ClientWriter, params: RelayP
                     break;
                 }
 
-                counters.add_up(n);
+                bytes.add(n);
             }
         }
     });
 
     // ── Download: upstream → client ──────────────────────────────────────
     let download = tokio::spawn({
-        let counters = Arc::clone(&counters);
+        let mut bytes = DirectionCounter::new(Arc::clone(&counters), Direction::Download);
 
         async move {
             let mut rem_reader = rem_reader;
@@ -1630,7 +1701,7 @@ async fn bridge_relay(reader: ClientReader, writer: ClientWriter, params: RelayP
                     break;
                 }
 
-                counters.add_down(n);
+                bytes.add(n);
             }
         }
     });
@@ -1709,7 +1780,7 @@ async fn bridge_tcp(
     let counters = Arc::new(BridgeCounters::default());
 
     let upload = tokio::spawn({
-        let counters = Arc::clone(&counters);
+        let mut bytes = DirectionCounter::new(Arc::clone(&counters), Direction::Upload);
 
         async move {
             let mut buf = vec![0u8; CLIENT_READ_BUF_SIZE];
@@ -1728,13 +1799,13 @@ async fn bridge_tcp(
                     break;
                 }
 
-                counters.add_up(n);
+                bytes.add(n);
             }
         }
     });
 
     let download = tokio::spawn({
-        let counters = Arc::clone(&counters);
+        let mut bytes = DirectionCounter::new(Arc::clone(&counters), Direction::Download);
 
         async move {
             let mut buf = vec![0u8; RELAY_BUF_SIZE];
@@ -1753,7 +1824,7 @@ async fn bridge_tcp(
                     break;
                 }
 
-                counters.add_down(n);
+                bytes.add(n);
             }
         }
     });
@@ -1818,38 +1889,57 @@ impl ClosedBy {
     }
 }
 
-/// Byte counters shared with both bridge directions.
+/// Final byte totals published by the two bridge tasks when they stop.
 ///
-/// The directions report as they go rather than returning a total, because
-/// [`join_bridge`] cancels whichever one is still running and a cancelled
-/// task's return value is gone. Accumulating inside the task meant every
-/// session logged exactly one direction as zero — 136 of 137 sessions in one
-/// tester's log — which made the counts useless for diagnosing anything.
-///
-/// Deliberately a `Mutex<u64>` per direction rather than an atomic: 32-bit
-/// MIPS — one of this project's release targets — has no 64-bit atomics at
-/// all, and `AtomicUsize` there would silently wrap a direction at 4 GiB,
-/// which is exactly the "the numbers lie" problem this type exists to fix.
-/// Each counter has a single writer and is read once the session is over, so
-/// the lock is always uncontended: a few tens of nanoseconds per 16 KiB
-/// chunk, against the AES pass over those same bytes.
+/// The hot loop increments a task-local `u64`; [`DirectionCounter::drop`]
+/// publishes it exactly once on normal completion or cancellation. This keeps
+/// accurate partial totals without locking on every 16 KiB relay chunk. A
+/// mutex is still used for portability because 32-bit MIPS has no 64-bit
+/// atomics, but it is touched only while each direction is being torn down.
 #[derive(Default)]
 struct BridgeCounters {
-    up: StdMutex<u64>,
-    down: StdMutex<u64>,
+    totals: StdMutex<[u64; 2]>,
 }
 
 impl BridgeCounters {
-    fn add_up(&self, n: usize) {
-        *self.up.lock().unwrap() += n as u64;
-    }
-
-    fn add_down(&self, n: usize) {
-        *self.down.lock().unwrap() += n as u64;
-    }
-
     fn totals(&self) -> (u64, u64) {
-        (*self.up.lock().unwrap(), *self.down.lock().unwrap())
+        let totals = self.totals.lock().unwrap();
+        (
+            totals[Direction::Upload as usize],
+            totals[Direction::Download as usize],
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Direction {
+    Upload = 0,
+    Download = 1,
+}
+
+struct DirectionCounter {
+    shared: Arc<BridgeCounters>,
+    direction: Direction,
+    bytes: u64,
+}
+
+impl DirectionCounter {
+    fn new(shared: Arc<BridgeCounters>, direction: Direction) -> Self {
+        Self {
+            shared,
+            direction,
+            bytes: 0,
+        }
+    }
+
+    fn add(&mut self, n: usize) {
+        self.bytes += n as u64;
+    }
+}
+
+impl Drop for DirectionCounter {
+    fn drop(&mut self) {
+        self.shared.totals.lock().unwrap()[self.direction as usize] = self.bytes;
     }
 }
 

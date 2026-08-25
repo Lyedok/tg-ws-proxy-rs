@@ -88,6 +88,7 @@ fn ordered_records_put_the_preferred_variant_first() {
 /// certificate verification is skipped for fronted connections, since a real
 /// cert can never match a spoofed SNI).
 #[tokio::test]
+#[allow(clippy::result_large_err)]
 async fn sni_override_presents_fronted_sni_but_keeps_real_host() {
     install_rustls_provider();
 
@@ -218,6 +219,15 @@ fn tls_client_configs_are_built_once_and_shared() {
 
     // The two are genuinely different configs, not one aliased twice.
     assert!(!Arc::ptr_eq(&first, &first_no_verify));
+}
+
+#[test]
+fn websocket_buffers_are_bounded_for_many_connections() {
+    let config = ws_config();
+
+    assert_eq!(config.write_buffer_size, 16 * 1024);
+    assert_eq!(config.max_frame_size, Some(4 * 1024 * 1024));
+    assert_eq!(config.max_message_size, Some(4 * 1024 * 1024));
 }
 
 /// Regression test for TLS session resumption.

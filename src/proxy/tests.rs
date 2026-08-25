@@ -1,6 +1,46 @@
 use super::*;
 
+use clap::Parser;
+
 use crate::crypto::HANDSHAKE_LEN;
+
+#[tokio::test]
+async fn client_handler_future_stays_compact() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (server, peer) = listener.accept().await.unwrap();
+
+    let config = Arc::new(
+        Config::try_parse_from([
+            "tg-ws-proxy",
+            "--secret",
+            "00112233445566778899aabbccddeeff",
+            "--pool-size",
+            "0",
+            "--no-outbound-proxy",
+        ])
+        .unwrap(),
+    );
+    let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
+    let pool = Arc::new(WsPool::with_runtime(
+        0,
+        Duration::from_secs(55),
+        Arc::clone(&runtime),
+    ));
+    let handler = handle_client_with_runtime(server, peer, config, pool, runtime);
+    let future_size = std::mem::size_of_val(&handler);
+    eprintln!("per-client future size: {future_size} bytes");
+
+    assert!(
+        future_size <= 4 * 1024,
+        "the per-client future grew to {future_size} bytes"
+    );
+
+    drop(handler);
+    drop(client);
+}
 
 #[test]
 fn balanced_rotates_the_starting_domain() {
@@ -111,21 +151,22 @@ async fn an_aborted_direction_still_reports_the_bytes_it_moved() {
     let counters = Arc::new(BridgeCounters::default());
 
     let upload = tokio::spawn({
-        let counters = Arc::clone(&counters);
+        let mut bytes = DirectionCounter::new(Arc::clone(&counters), Direction::Upload);
         async move {
-            counters.add_up(4096);
+            bytes.add(4096);
+            tokio::task::yield_now().await;
             // Finishes first, which is what triggers the abort below.
         }
     });
 
     let download = tokio::spawn({
-        let counters = Arc::clone(&counters);
+        let mut bytes = DirectionCounter::new(Arc::clone(&counters), Direction::Download);
         async move {
-            counters.add_down(1024);
+            bytes.add(1024);
             // Still running when the peer finishes, so this task is aborted
             // partway — exactly the case that used to lose the count.
             std::future::pending::<()>().await;
-            counters.add_down(999_999);
+            bytes.add(999_999);
         }
     });
 
@@ -158,13 +199,17 @@ async fn the_side_that_stops_first_is_the_one_reported() {
 
 #[test]
 fn bridge_counters_accumulate_across_many_chunks() {
-    let counters = BridgeCounters::default();
+    let counters = Arc::new(BridgeCounters::default());
+    let mut upload = DirectionCounter::new(Arc::clone(&counters), Direction::Upload);
+    let mut download = DirectionCounter::new(Arc::clone(&counters), Direction::Download);
 
     for _ in 0..10 {
-        counters.add_up(100);
-        counters.add_down(250);
+        upload.add(100);
+        download.add(250);
     }
 
+    drop(upload);
+    drop(download);
     assert_eq!(counters.totals(), (1000, 2500));
 }
 
