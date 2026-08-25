@@ -40,10 +40,10 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use tungstenite::Message;
 
-use crate::config::Config;
+use crate::config::{Config, MtProtoProxy};
 use crate::crypto::{
-    AesCtr256, ConnectionCiphers, ProtoTag, build_connection_ciphers, faketls_hostname,
-    generate_client_handshake, generate_relay_init, parse_handshake, secret_key,
+    AesCtr256, ConnectionCiphers, ProtoTag, build_connection_ciphers, generate_client_handshake,
+    generate_relay_init, parse_handshake,
 };
 use crate::faketls::{
     TLS_MAX_RECORD_PAYLOAD, TLS_RECORD_HANDSHAKE, build_faketls_client_hello,
@@ -398,22 +398,22 @@ pub async fn handle_client_with_runtime(
     let label = peer.to_string();
     let _ = stream.set_nodelay(true);
 
-    let secrets = config.secret_bytes_list();
+    let secrets = config.normalized_secrets();
     let timeouts = Timeouts::from_config(&config);
 
     // Split into independent read / write halves.
     let (mut reader, mut writer) = stream.into_split();
 
     // ── Step 1: read the 64-byte MTProto obfuscation init ────────────────
-    let inbound_faketls_domain = config.listen_faketls_domain();
+    let inbound_faketls_domain = config.normalized_listen_faketls_domain();
     let handshake = tokio::time::timeout(
         timeouts.handshake,
         read_inbound_handshake(
             &label,
             &mut reader,
             &mut writer,
-            &secrets,
-            inbound_faketls_domain.as_deref(),
+            secrets,
+            inbound_faketls_domain,
         ),
     )
     .await;
@@ -1059,9 +1059,7 @@ impl Route<'_> {
             }
 
             let conn = connect_mtproto_upstream(
-                &upstream.host,
-                upstream.port,
-                &upstream.secret,
+                upstream,
                 self.dc_idx,
                 self.proto,
                 self.timeouts.upstream_connect,
@@ -1494,22 +1492,15 @@ struct UpstreamConnection {
 ///   authentication, drains the server's fake handshake, then sends the 64-byte
 ///   MTProto init inside a TLS Application Data record.
 async fn connect_mtproto_upstream(
-    host: &str,
-    port: u16,
-    secret_hex: &str,
+    proxy: &MtProtoProxy,
     dc_idx: i16,
     proto: ProtoTag,
     timeout: Duration,
     outbound: &OutboundConnector,
 ) -> Option<UpstreamConnection> {
-    let secret = match hex::decode(secret_hex) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("[upstream] {}:{} invalid hex secret: {}", host, port, e);
-            return None;
-        }
-    };
-    let key_bytes = secret_key(&secret);
+    let host = &proxy.host;
+    let port = proxy.port;
+    let key_bytes = proxy.secret_key();
 
     // ── TCP connect ───────────────────────────────────────────────────────
     let stream = match outbound.connect(host, port, timeout).await {
@@ -1524,7 +1515,7 @@ async fn connect_mtproto_upstream(
     let (handshake, enc, dec) = generate_client_handshake(key_bytes, dc_idx, proto);
     let (mut reader, mut writer) = stream.into_split();
 
-    let Some(hostname) = faketls_hostname(&secret) else {
+    let Some(hostname) = proxy.faketls_hostname() else {
         // ── Plain MTProto path ────────────────────────────────────────────
         if let Err(e) = writer.write_all(&handshake).await {
             warn!("[upstream] {}:{} send handshake error: {}", host, port, e);
@@ -1541,14 +1532,6 @@ async fn connect_mtproto_upstream(
     };
 
     // ── FakeTLS path ──────────────────────────────────────────────────────
-    let Ok(hostname) = std::str::from_utf8(hostname) else {
-        warn!(
-            "[upstream] {}:{} FakeTLS secret has non-UTF-8 hostname",
-            host, port
-        );
-        return None;
-    };
-
     // Build the ClientHello with HMAC authentication.
     let mut client_hello = build_faketls_client_hello(hostname);
     sign_faketls_client_hello(&mut client_hello, key_bytes);
