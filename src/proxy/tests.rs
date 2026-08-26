@@ -52,16 +52,28 @@ fn balanced_rotates_the_starting_domain() {
     ];
 
     assert_eq!(
-        balanced(&workers, &counter),
-        ["w1", "w2", "w3"].map(|w| format!("{w}.example.workers.dev"))
+        domain_order(&workers, balance_offset(&workers, true, &counter)).collect::<Vec<_>>(),
+        [
+            "w1.example.workers.dev",
+            "w2.example.workers.dev",
+            "w3.example.workers.dev"
+        ]
     );
     assert_eq!(
-        balanced(&workers, &counter),
-        ["w2", "w3", "w1"].map(|w| format!("{w}.example.workers.dev"))
+        domain_order(&workers, balance_offset(&workers, true, &counter)).collect::<Vec<_>>(),
+        [
+            "w2.example.workers.dev",
+            "w3.example.workers.dev",
+            "w1.example.workers.dev"
+        ]
     );
     assert_eq!(
-        balanced(&workers, &counter),
-        ["w3", "w1", "w2"].map(|w| format!("{w}.example.workers.dev"))
+        domain_order(&workers, balance_offset(&workers, true, &counter)).collect::<Vec<_>>(),
+        [
+            "w3.example.workers.dev",
+            "w1.example.workers.dev",
+            "w2.example.workers.dev"
+        ]
     );
 }
 
@@ -70,25 +82,22 @@ fn balanced_leaves_short_lists_untouched() {
     let counter = AtomicUsize::new(0);
     let single = vec!["only.example".to_string()];
 
-    assert_eq!(balanced(&[], &counter), Vec::<String>::new());
-    assert_eq!(balanced(&single, &counter), single);
+    assert_eq!(balance_offset(&[], true, &counter), 0);
+    assert_eq!(balance_offset(&single, true, &counter), 0);
     // A list that cannot be rotated must not consume a counter tick either.
     assert_eq!(counter.load(Ordering::Relaxed), 0);
 }
 
 #[test]
-fn balance_order_borrows_when_balancing_is_disabled() {
+fn domain_order_borrows_without_cloning() {
     let counter = AtomicUsize::new(0);
     let domains = vec!["a.example".to_string(), "b.example".to_string()];
 
-    assert!(matches!(
-        balance_order(&domains, false, &counter),
-        Cow::Borrowed(_)
-    ));
-    assert!(matches!(
-        balance_order(&domains, true, &counter),
-        Cow::Owned(_)
-    ));
+    let ordered =
+        domain_order(&domains, balance_offset(&domains, false, &counter)).collect::<Vec<_>>();
+    assert!(std::ptr::eq(ordered[0], domains[0].as_str()));
+    assert!(std::ptr::eq(ordered[1], domains[1].as_str()));
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
 }
 
 #[test]

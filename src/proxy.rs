@@ -21,7 +21,7 @@
 //! client's own reader/writer halves only ever have to be moved into a single
 //! bridge call.
 
-use std::borrow::{Borrow, Cow};
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::Hash;
@@ -56,7 +56,7 @@ use crate::runtime::Runtime;
 use crate::splitter::MsgSplitter;
 use crate::ws_client::{
     TgWsStream, WsAttempt, connect_cf_worker_ws_for_dc_with_outbound,
-    connect_cf_ws_for_dc_with_outbound, connect_ws_for_dc_with_outbound, media_tag,
+    connect_cf_ws_for_dc_with_outbound_ordered, connect_ws_for_dc_with_outbound, media_tag,
 };
 
 type TcpReader = OwnedReadHalf;
@@ -176,41 +176,17 @@ static CF_BALANCE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// Round-robin counter for CF Worker domain balancing (`--cf-balance`).
 static CF_WORKER_BALANCE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// Return a rotated view of `domains` based on a global round-robin counter.
-///
-/// Each call atomically increments the counter and uses it to determine which
-/// domain should be tried first.  The remaining domains follow in their
-/// original order, wrapping around to the beginning of the slice, so the full
-/// fallback chain is always available.
-///
-/// `Relaxed` ordering is intentional: the counter only drives load
-/// distribution and does not guard access to any other shared state, so no
-/// cross-thread memory synchronisation is required.  Wrapping overflow on
-/// `usize` is harmless — the modulo operation still produces a valid index.
-fn balanced(domains: &[String], counter: &AtomicUsize) -> Vec<String> {
+fn balance_offset(domains: &[String], enabled: bool, counter: &AtomicUsize) -> usize {
     let n = domains.len();
-    if n <= 1 {
-        return domains.to_vec();
+    if !enabled || n <= 1 {
+        return 0;
     }
 
-    // `fetch_add` wraps silently on overflow, keeping the index valid.
-    let idx = counter.fetch_add(1, Ordering::Relaxed) % n;
-
-    (0..n).map(|i| domains[(idx + i) % n].clone()).collect()
+    counter.fetch_add(1, Ordering::Relaxed) % n
 }
 
-/// Apply `--cf-balance` rotation to `domains`, borrowing them unchanged when
-/// balancing is off.
-fn balance_order<'a>(
-    domains: &'a [String],
-    enabled: bool,
-    counter: &AtomicUsize,
-) -> Cow<'a, [String]> {
-    if enabled {
-        Cow::Owned(balanced(domains, counter))
-    } else {
-        Cow::Borrowed(domains)
-    }
+fn domain_order(domains: &[String], first: usize) -> impl Iterator<Item = &str> {
+    (0..domains.len()).map(move |offset| domains[(first + offset) % domains.len()].as_str())
 }
 
 // ─── Client-side framing ─────────────────────────────────────────────────────
@@ -854,10 +830,10 @@ impl Route<'_> {
         counter: &AtomicUsize,
     ) -> CfTarget {
         let domain = if self.config.cf_balance {
-            balanced(rotation, counter)
-                .into_iter()
+            domain_order(rotation, balance_offset(rotation, true, counter))
                 .next()
-                .unwrap_or_else(|| domain.to_string())
+                .unwrap_or(domain)
+                .to_string()
         } else {
             domain.to_string()
         };
@@ -907,14 +883,14 @@ impl Route<'_> {
             return Some(ws);
         }
 
-        let workers = balance_order(
+        let first_worker = balance_offset(
             worker_domains,
             self.config.cf_balance,
             &CF_WORKER_BALANCE_COUNTER,
         );
 
-        for worker_domain in workers.iter() {
-            if CF_WORKER_FAIL.active(worker_domain.as_str()) {
+        for worker_domain in domain_order(worker_domains, first_worker) {
+            if CF_WORKER_FAIL.active(worker_domain) {
                 debug!(
                     "[{}] DC{}{} CF Worker {} in cooldown, skipping",
                     self.label, self.dc, self.media, worker_domain
@@ -940,7 +916,7 @@ impl Route<'_> {
 
             match ws {
                 Some(ws) => {
-                    CF_WORKER_FAIL.clear(worker_domain.as_str());
+                    CF_WORKER_FAIL.clear(worker_domain);
                     info!(
                         "[{}] DC{}{} {} → CF Worker connected ({})",
                         self.label, self.dc, self.media, reason, worker_domain
@@ -961,7 +937,7 @@ impl Route<'_> {
                     return Some(ws);
                 }
                 None => {
-                    CF_WORKER_FAIL.set(worker_domain.clone(), self.timeouts.cf_fail_cooldown);
+                    CF_WORKER_FAIL.set(worker_domain.to_string(), self.timeouts.cf_fail_cooldown);
                     warn!(
                         "[{}] DC{}{} CF Worker {} failed, cooldown {}s",
                         self.label,
@@ -991,7 +967,7 @@ impl Route<'_> {
             return None;
         }
 
-        let cf_domains = balance_order(
+        let first_domain = balance_offset(
             &self.config.cf_domains,
             self.config.cf_balance,
             &CF_BALANCE_COUNTER,
@@ -1012,16 +988,17 @@ impl Route<'_> {
 
         debug!(
             "[{}] DC{}{} {} → trying CF proxy via {:?}",
-            self.label, self.dc, self.media, reason, cf_domains
+            self.label, self.dc, self.media, reason, self.config.cf_domains
         );
 
-        let (ws, domain, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
+        let (ws, domain, _all_redirects) = connect_cf_ws_for_dc_with_outbound_ordered(
             self.dc,
-            &cf_domains,
+            &self.config.cf_domains,
             self.is_media,
             self.config.skip_tls_verify,
             self.timeouts.cf_connect,
             self.runtime.outbound(),
+            first_domain,
         )
         .await;
 
