@@ -4,6 +4,24 @@ use clap::Parser;
 
 use crate::crypto::HANDSHAKE_LEN;
 
+#[test]
+fn faketls_pending_uses_an_offset_and_releases_its_record() {
+    let mut pending = PendingData::from_record(vec![10, 11, 12, 13, 14], 2);
+    let original_ptr = pending.data.as_ptr();
+    let mut first = [0u8; 2];
+
+    assert_eq!(pending.read(&mut first), Some(2));
+    assert_eq!(first, [12, 13]);
+    assert_eq!(pending.data.as_ptr(), original_ptr);
+
+    let mut last = [0u8; 2];
+    assert_eq!(pending.read(&mut last), Some(1));
+    assert_eq!(last[0], 14);
+    assert!(pending.data.is_empty());
+    assert_eq!(pending.data.capacity(), 0);
+    assert_eq!(pending.read(&mut last), None);
+}
+
 #[tokio::test]
 async fn client_handler_future_stays_compact() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -49,7 +49,7 @@ use crate::crypto::{
 use crate::faketls::{
     TLS_MAX_RECORD_PAYLOAD, TLS_RECORD_HANDSHAKE, build_faketls_client_hello,
     build_faketls_server_hello, drain_faketls_server_hello, parse_faketls_client_hello,
-    read_tls_appdata, read_tls_record, sign_faketls_client_hello, write_tls_appdata,
+    read_tls_appdata, read_tls_record_bytes, sign_faketls_client_hello, write_tls_appdata,
 };
 use crate::outbound::OutboundConnector;
 use crate::pool::{CfTarget, CfTier, WsPool};
@@ -194,7 +194,38 @@ fn domain_order(domains: &[String], first: usize) -> impl Iterator<Item = &str> 
 
 enum ClientReader {
     Plain(TcpReader),
-    FakeTls { reader: TcpReader, pending: Vec<u8> },
+    FakeTls {
+        reader: TcpReader,
+        pending: PendingData,
+    },
+}
+
+#[derive(Default)]
+struct PendingData {
+    data: Vec<u8>,
+    offset: usize,
+}
+
+impl PendingData {
+    fn from_record(data: Vec<u8>, offset: usize) -> Self {
+        Self { data, offset }
+    }
+
+    fn read(&mut self, buf: &mut [u8]) -> Option<usize> {
+        let remaining = self.data.get(self.offset..)?;
+        if remaining.is_empty() {
+            return None;
+        }
+
+        let n = std::cmp::min(buf.len(), remaining.len());
+        buf[..n].copy_from_slice(&remaining[..n]);
+        self.offset += n;
+        if self.offset == self.data.len() {
+            self.data = Vec::new();
+            self.offset = 0;
+        }
+        Some(n)
+    }
 }
 
 impl ClientReader {
@@ -202,10 +233,7 @@ impl ClientReader {
         match self {
             Self::Plain(reader) => reader.read(buf).await,
             Self::FakeTls { reader, pending } => {
-                if !pending.is_empty() {
-                    let n = std::cmp::min(buf.len(), pending.len());
-                    buf[..n].copy_from_slice(&pending[..n]);
-                    pending.drain(..n);
+                if let Some(n) = pending.read(buf) {
                     return Ok(n);
                 }
 
@@ -243,21 +271,14 @@ async fn accept_inbound_faketls(
     writer: &mut TcpWriter,
     secrets: &[Vec<u8>],
     expected_domain: &str,
-) -> Option<([u8; 64], Vec<u8>)> {
-    let (record_type, version, payload) =
-        read_tls_record(reader, TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM)
-            .await
-            .ok()??;
-    if record_type != TLS_RECORD_HANDSHAKE || version != [0x03, 0x01] {
+) -> Option<([u8; 64], PendingData)> {
+    let record = read_tls_record_bytes(reader, TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM)
+        .await
+        .ok()??;
+    if record[0] != TLS_RECORD_HANDSHAKE || record[1..3] != [0x03, 0x01] {
         debug!("[{}] bad FakeTLS ClientHello record", label);
         return None;
     }
-
-    let mut record = Vec::with_capacity(5 + payload.len());
-    record.push(record_type);
-    record.extend_from_slice(&version);
-    record.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    record.extend_from_slice(&payload);
 
     let Some((hello, matched_secret)) = secrets.iter().find_map(|secret| {
         parse_faketls_client_hello(&record, secret).map(|hello| (hello, secret))
@@ -282,25 +303,27 @@ async fn accept_inbound_faketls(
 
     let mut handshake_buf = [0u8; 64];
     let mut filled = 0;
-    let mut buf = vec![0u8; TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM];
     while filled < handshake_buf.len() {
-        let n = match read_tls_appdata(reader, &mut buf).await {
-            Ok(0) | Err(_) => return None,
-            Ok(n) => n,
-        };
-        let before = filled;
-        let take = std::cmp::min(n, handshake_buf.len() - filled);
-        handshake_buf[filled..filled + take].copy_from_slice(&buf[..take]);
+        let record = read_tls_record_bytes(reader, TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM)
+            .await
+            .ok()??;
+        let record_type = record[0];
+        let payload_len = record.len() - 5;
+        if record_type == crate::faketls::TLS_RECORD_CHANGE_CIPHER_SPEC {
+            continue;
+        }
+        if record_type != crate::faketls::TLS_RECORD_APPLICATION_DATA || payload_len == 0 {
+            return None;
+        }
+        let take = std::cmp::min(payload_len, handshake_buf.len() - filled);
+        handshake_buf[filled..filled + take].copy_from_slice(&record[5..5 + take]);
         filled += take;
-        if take != n {
-            if before == 0 {
-                return split_mtproto_init_and_pending(&buf[..n]);
-            }
-            return Some((handshake_buf, buf[take..n].to_vec()));
+        if take != payload_len {
+            return Some((handshake_buf, PendingData::from_record(record, 5 + take)));
         }
     }
 
-    Some((handshake_buf, Vec::new()))
+    Some((handshake_buf, PendingData::default()))
 }
 
 // ─── Client handler ──────────────────────────────────────────────────────────
@@ -1887,14 +1910,14 @@ async fn read_inbound_handshake(
     writer: &mut TcpWriter,
     secrets: &[Vec<u8>],
     faketls_domain: Option<&str>,
-) -> Option<([u8; 64], Vec<u8>)> {
+) -> Option<([u8; 64], PendingData)> {
     if let Some(domain) = faketls_domain {
         return accept_inbound_faketls(label, reader, writer, secrets, domain).await;
     }
 
     let mut handshake_buf = [0u8; 64];
     match reader.read_exact(&mut handshake_buf).await {
-        Ok(_) => Some((handshake_buf, Vec::new())),
+        Ok(_) => Some((handshake_buf, PendingData::default())),
         Err(e) => {
             debug!("[{}] read handshake: {}", label, e);
             None
