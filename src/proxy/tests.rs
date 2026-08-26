@@ -145,34 +145,24 @@ fn human_bytes_scales_through_the_units() {
 
 #[tokio::test]
 async fn an_aborted_direction_still_reports_the_bytes_it_moved() {
-    // Regression test: the directions used to return their total, and
-    // `join_bridge` cancels whichever one is still running — so the cancelled
-    // side's count was lost and every session logged one direction as zero.
-    let counters = Arc::new(BridgeCounters::default());
-
+    let bytes_up = Arc::new(StdMutex::new(0));
+    let mut bytes_down = 0;
     let upload = tokio::spawn({
-        let mut bytes = DirectionCounter::new(Arc::clone(&counters), Direction::Upload);
+        let mut bytes = UploadCounter::new(Arc::clone(&bytes_up));
         async move {
             bytes.add(4096);
             tokio::task::yield_now().await;
-            // Finishes first, which is what triggers the abort below.
         }
     });
-
-    let download = tokio::spawn({
-        let mut bytes = DirectionCounter::new(Arc::clone(&counters), Direction::Download);
-        async move {
-            bytes.add(1024);
-            // Still running when the peer finishes, so this task is aborted
-            // partway — exactly the case that used to lose the count.
-            std::future::pending::<()>().await;
-            bytes.add(999_999);
-        }
-    });
+    let download = async {
+        bytes_down += 1024;
+        std::future::pending::<()>().await;
+        bytes_down += 999_999;
+    };
 
     let closed_by = join_bridge(upload, download).await;
 
-    assert_eq!(counters.totals(), (4096, 1024));
+    assert_eq!((*bytes_up.lock().unwrap(), bytes_down), (4096, 1024));
     // The upload direction ran out first, which means the client stopped.
     assert!(matches!(closed_by, ClosedBy::Client));
 }
@@ -183,34 +173,18 @@ async fn the_side_that_stops_first_is_the_one_reported() {
     // up; this is what tells a client-side timeout apart from an upstream
     // that dropped us right after the handshake.
     let upload = tokio::spawn(std::future::pending::<()>());
-    let download = tokio::spawn(async {});
+    let download = async {};
     assert!(matches!(
         join_bridge(upload, download).await,
         ClosedBy::Upstream
     ));
 
     let upload = tokio::spawn(async {});
-    let download = tokio::spawn(std::future::pending::<()>());
+    let download = std::future::pending::<()>();
     assert!(matches!(
         join_bridge(upload, download).await,
         ClosedBy::Client
     ));
-}
-
-#[test]
-fn bridge_counters_accumulate_across_many_chunks() {
-    let counters = Arc::new(BridgeCounters::default());
-    let mut upload = DirectionCounter::new(Arc::clone(&counters), Direction::Upload);
-    let mut download = DirectionCounter::new(Arc::clone(&counters), Direction::Download);
-
-    for _ in 0..10 {
-        upload.add(100);
-        download.add(250);
-    }
-
-    drop(upload);
-    drop(download);
-    assert_eq!(counters.totals(), (1000, 2500));
 }
 
 // ─── WebSocket framing ───────────────────────────────────────────────────────
