@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use futures_util::{FutureExt, StreamExt};
+use futures_util::{FutureExt, StreamExt, stream};
 
 use crate::config::Config;
 use crate::outbound::OutboundConnector;
@@ -44,6 +44,11 @@ use crate::ws_client::{
 /// *next* connection, not a burst.  Upstream settled on the same number for its
 /// Worker pool in v1.9.1.
 const CF_POOL_MAX: usize = 1;
+
+/// Keep startup and refill latency bounded without making a large
+/// `--pool-size` fan out into an equally large TCP/TLS handshake burst.
+const POOL_CONNECT_CONCURRENCY: usize = 2;
+const WARMUP_BUCKET_CONCURRENCY: usize = 2;
 
 /// Which Cloudflare tier a pooled connection belongs to.  Pooled separately
 /// because the two are not interchangeable at the far end: a Worker is a raw
@@ -313,20 +318,29 @@ impl WsPool {
         let skip_tls = config.skip_tls_verify;
         let pool_size = self.pool_size;
 
-        for (dc, ip) in dc_redirects {
-            for is_media in [false, true] {
-                let new_conns = self
+        let jobs = dc_redirects.into_iter().flat_map(|(dc, ip)| {
+            [false, true]
+                .into_iter()
+                .map(move |is_media| (dc, ip.clone(), is_media))
+        });
+        let mut batches = stream::iter(jobs)
+            .map(|(dc, ip, is_media)| async move {
+                let connections = self
                     .connect_batch(&ip, dc, is_media, skip_tls, pool_size)
                     .await;
-                let mut lock = self.idle.lock().await;
-                let bucket = lock.entry((dc, is_media)).or_default();
+                (dc, is_media, connections)
+            })
+            .buffer_unordered(WARMUP_BUCKET_CONCURRENCY);
 
-                for ws in new_conns {
-                    bucket.push(PoolEntry {
-                        ws,
-                        created: Instant::now(),
-                    });
-                }
+        while let Some((dc, is_media, new_conns)) = batches.next().await {
+            let mut lock = self.idle.lock().await;
+            let bucket = lock.entry((dc, is_media)).or_default();
+
+            for ws in new_conns {
+                bucket.push(PoolEntry {
+                    ws,
+                    created: Instant::now(),
+                });
             }
         }
 
@@ -502,19 +516,22 @@ impl WsPool {
             .then(|| self.runtime.fronting_domain())
             .flatten();
 
-        for _ in 0..count {
-            match connect_ws_for_dc_with_outbound(
-                ip,
-                dc,
-                is_media,
-                skip_tls,
-                timeout,
-                self.runtime.outbound(),
-                fronting_domain,
-            )
-            .await
-            .ws
-            {
+        let mut attempts = stream::iter(0..count)
+            .map(|_| {
+                connect_ws_for_dc_with_outbound(
+                    ip,
+                    dc,
+                    is_media,
+                    skip_tls,
+                    timeout,
+                    self.runtime.outbound(),
+                    fronting_domain,
+                )
+            })
+            .buffer_unordered(POOL_CONNECT_CONCURRENCY);
+
+        while let Some(attempt) = attempts.next().await {
+            match attempt.ws {
                 Some(ws) => results.push(ws),
                 None => {
                     warn!(

@@ -55,10 +55,11 @@ async fn pool_refill_dials_through_the_outbound_connector() {
 
 #[tokio::test]
 async fn warmup_gives_up_on_unreachable_dcs_instead_of_hanging() {
-    // `connect_batch` abandons a bucket after its first failure, so a fully
-    // blocked network costs one *attempt* per (DC, media) bucket rather than
-    // `--pool-size` of them. Each attempt still tries both Telegram hostnames,
-    // so one DC costs 2 buckets × 2 records = 4 CONNECTs, not 2 × 4 = 8.
+    // `connect_batch` abandons a bucket after the first completed failure and
+    // cancels the other in-flight work. The bounded parallel fill can start
+    // two attempts per bucket; each tries both Telegram hostnames, so one DC
+    // costs at most 2 buckets × 2 attempts × 2 records = 8 CONNECTs rather
+    // than `--pool-size` unbounded attempts.
     let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
     let config = Config::try_parse_from([
         "tg-ws-proxy",
@@ -78,10 +79,9 @@ async fn warmup_gives_up_on_unreachable_dcs_instead_of_hanging() {
         .expect("warmup should not hang on an unreachable DC");
 
     let requests = await_proxy_requests(proxy_task).await;
-    assert_eq!(
-        requests.len(),
-        4,
-        "warmup should try each bucket once, not --pool-size times: {requests:?}"
+    assert!(
+        (4..=8).contains(&requests.len()),
+        "warmup exceeded the bounded two-attempt budget per bucket: {requests:?}"
     );
     assert!(
         requests
