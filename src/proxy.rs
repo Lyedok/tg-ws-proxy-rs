@@ -25,6 +25,7 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::Hash;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -237,7 +238,7 @@ impl ClientWriter {
 }
 
 async fn accept_inbound_faketls(
-    label: &str,
+    label: SocketAddr,
     reader: &mut TcpReader,
     writer: &mut TcpWriter,
     secrets: &[Vec<u8>],
@@ -348,7 +349,7 @@ impl Timeouts {
 /// accept path.
 pub async fn handle_client(
     stream: TcpStream,
-    peer: std::net::SocketAddr,
+    peer: SocketAddr,
     config: Arc<Config>,
     pool: Arc<WsPool>,
 ) {
@@ -366,12 +367,12 @@ pub async fn handle_client(
 /// outbound routing and DC metadata.
 pub async fn handle_client_with_runtime(
     stream: TcpStream,
-    peer: std::net::SocketAddr,
+    peer: SocketAddr,
     config: Arc<Config>,
     pool: Arc<WsPool>,
     runtime: Arc<Runtime>,
 ) {
-    let label = peer.to_string();
+    let label = peer;
     let _ = stream.set_nodelay(true);
 
     let secrets = config.normalized_secrets();
@@ -385,7 +386,7 @@ pub async fn handle_client_with_runtime(
     let handshake = tokio::time::timeout(
         timeouts.handshake,
         read_inbound_handshake(
-            &label,
+            label,
             &mut reader,
             &mut writer,
             secrets,
@@ -456,7 +457,7 @@ pub async fn handle_client_with_runtime(
 
     // ── Step 5: walk the fallback ladder ─────────────────────────────────
     let route = Route {
-        label: &label,
+        label,
         config: &config,
         runtime: &runtime,
         pool: &pool,
@@ -467,7 +468,7 @@ pub async fn handle_client_with_runtime(
         dc_idx,
         proto,
     };
-    let target_ip = config.dc_target_ip(dc_id).map(str::to_string);
+    let target_ip = config.dc_target_ip(dc_id);
 
     // ── Step 6: bridge whatever we ended up connected to ─────────────────
     // The routing ladder contains every TLS/WS fallback handshake, while only
@@ -480,7 +481,7 @@ pub async fn handle_client_with_runtime(
         reader,
         writer,
         BridgeDispatch {
-            label: &label,
+            label,
             relay_init,
             ciphers,
             proto,
@@ -498,13 +499,13 @@ pub async fn handle_client_with_runtime(
 
 // ─── Routing ─────────────────────────────────────────────────────────────────
 
-async fn select_bridge<'a>(
+async fn select_bridge(
     route: &Route<'_>,
-    target_ip: Option<String>,
+    target_ip: Option<&str>,
     reader: ClientReader,
     writer: ClientWriter,
-    params: BridgeDispatch<'a>,
-) -> Option<Pin<Box<dyn Future<Output = ()> + Send + 'a>>> {
+    params: BridgeDispatch,
+) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
     select_upstream(route, target_ip)
         .await
         .map(|upstream| bridge_selected(reader, writer, upstream, params))
@@ -526,8 +527,8 @@ enum Upstream {
     Tcp(String),
 }
 
-struct BridgeDispatch<'a> {
-    label: &'a str,
+struct BridgeDispatch {
+    label: SocketAddr,
     relay_init: [u8; 64],
     ciphers: ConnectionCiphers,
     proto: ProtoTag,
@@ -543,12 +544,12 @@ struct BridgeDispatch<'a> {
 /// enough state for its widest branch even though a connection uses exactly
 /// one of them. This synchronous dispatch moves only the selected bridge into
 /// its allocation, then drops the `Upstream` enum immediately.
-fn bridge_selected<'a>(
+fn bridge_selected(
     reader: ClientReader,
     writer: ClientWriter,
     upstream: Upstream,
-    params: BridgeDispatch<'a>,
-) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    params: BridgeDispatch,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     let BridgeDispatch {
         label,
         relay_init,
@@ -643,7 +644,7 @@ enum WsFraming {
 
 /// Everything the fallback ladder needs to route one client connection.
 struct Route<'a> {
-    label: &'a str,
+    label: SocketAddr,
     config: &'a Config,
     runtime: &'a Runtime,
     pool: &'a Arc<WsPool>,
@@ -662,12 +663,12 @@ struct Route<'a> {
 /// `target_ip` is the DC's `--dc-ip` override, if the user configured one.
 /// Without it the direct WebSocket path is skipped entirely and the Python
 /// reference's order is used (Worker, CF proxy, upstream proxies, then TCP).
-async fn select_upstream(route: &Route<'_>, target_ip: Option<String>) -> Option<Upstream> {
+async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<Upstream> {
     let Some(target_ip) = target_ip else {
         // Every log line already carries the DC, so the reason only has to say
         // what is missing.
         let reason = "not in --dc-ip config";
-        let Some(fallback) = route.runtime.fallback_ip(route.dc).map(str::to_string) else {
+        let Some(fallback) = route.runtime.fallback_ip(route.dc) else {
             warn!(
                 "[{}] DC{}{} {} — no fallback IP available",
                 route.label, route.dc, route.media, reason
@@ -677,7 +678,7 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<String>) -> Option
 
         return Some(
             route
-                .fallback_chain(&fallback, reason, false)
+                .fallback_chain(fallback, reason, false)
                 .await
                 .unwrap_or_else(|| route.tcp_fallback(fallback, reason)),
         );
@@ -685,7 +686,7 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<String>) -> Option
 
     // ── CF priority — try both CF tiers before direct WS if enabled ──────
     if route.config.cf_priority
-        && let Some(upstream) = route.cf_tiers(&target_ip, "cf-priority").await
+        && let Some(upstream) = route.cf_tiers(target_ip, "cf-priority").await
     {
         return Some(upstream);
     }
@@ -697,7 +698,7 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<String>) -> Option
     // "Connecting..." forever.  Only worth skipping when there is somewhere
     // else to go; without a fallback the doomed attempt is still the only
     // path we have.
-    let ip_cooling = IP_FAIL.active(target_ip.as_str()) && route.has_fallback();
+    let ip_cooling = IP_FAIL.active(target_ip) && route.has_fallback();
     if ip_cooling {
         let reason = "IP in cooldown";
         info!(
@@ -711,7 +712,7 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<String>) -> Option
         // cooldown self-healing — a direct connect is the only thing that
         // clears it, so something has to keep asking.
         if let Some(upstream) = route
-            .fallback_chain(&target_ip, reason, route.config.cf_priority)
+            .fallback_chain(target_ip, reason, route.config.cf_priority)
             .await
         {
             return Some(upstream);
@@ -729,9 +730,9 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<String>) -> Option
         .get(
             route.dc,
             route.is_media,
-            target_ip.clone(),
+            target_ip,
             route.config.skip_tls_verify,
-            !IP_FAIL.active(target_ip.as_str()),
+            !IP_FAIL.active(target_ip),
         )
         .await;
     if let Some(ws) = pooled {
@@ -745,7 +746,7 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<String>) -> Option
         });
     }
 
-    if let Some(ws) = route.direct_ws(&target_ip).await {
+    if let Some(ws) = route.direct_ws(target_ip).await {
         return Some(Upstream::Ws {
             ws,
             framing: WsFraming::Packets,
@@ -764,7 +765,7 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<String>) -> Option
 
     Some(
         route
-            .fallback_chain(&target_ip, reason, route.config.cf_priority)
+            .fallback_chain(target_ip, reason, route.config.cf_priority)
             .await
             .unwrap_or_else(|| route.tcp_last_resort(target_ip, reason)),
     )
@@ -1273,22 +1274,19 @@ impl Route<'_> {
     /// only reached after that override failed, and on the paths that get here
     /// it failed by timing out — the one signal that says the address itself
     /// is unreachable.
-    fn tcp_last_resort(&self, target_ip: String, reason: &str) -> Upstream {
-        let dst = self
-            .runtime
-            .fallback_ip(self.dc)
-            .map_or(target_ip, str::to_string);
+    fn tcp_last_resort(&self, target_ip: &str, reason: &str) -> Upstream {
+        let dst = self.runtime.fallback_ip(self.dc).unwrap_or(target_ip);
 
         self.tcp_fallback(dst, reason)
     }
 
-    fn tcp_fallback(&self, dst: String, reason: &str) -> Upstream {
+    fn tcp_fallback(&self, dst: &str, reason: &str) -> Upstream {
         info!(
             "[{}] DC{}{} {} → TCP fallback {}:443",
             self.label, self.dc, self.media, reason, dst
         );
 
-        Upstream::Tcp(dst)
+        Upstream::Tcp(dst.to_string())
     }
 }
 
@@ -1301,8 +1299,8 @@ impl Route<'_> {
 /// client  →  clt_dec  →  split + tg_enc  →  WebSocket frames  →  Telegram
 /// Telegram  →  WS frame  →  tg_dec  →  plaintext  →  clt_enc  →  client TCP
 /// ```
-struct WsBridgeParams<'a> {
-    label: &'a str,
+struct WsBridgeParams {
+    label: SocketAddr,
     ws: TgWsStream,
     framing: WsFraming,
     relay_init: [u8; 64],
@@ -1312,7 +1310,7 @@ struct WsBridgeParams<'a> {
     is_media: bool,
 }
 
-async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeParams<'_>) {
+async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeParams) {
     let WsBridgeParams {
         label,
         ws,
@@ -1341,8 +1339,6 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
 
     let upload = tokio::spawn({
         let mut bytes = UploadCounter::new(Arc::clone(&bytes_up));
-        let label = label.to_string();
-
         async move {
             // Keep every sink operation in this direction so upload and download
             // can be polled independently by `join_bridge`.
@@ -1557,8 +1553,8 @@ async fn connect_mtproto_upstream(
 /// `ciphers.tg_enc` / `ciphers.tg_dec` must already be set to the upstream
 /// session ciphers returned by [`connect_mtproto_upstream`].  No relay init is
 /// sent here — the client handshake was the only setup packet.
-struct RelayParams<'a> {
-    label: &'a str,
+struct RelayParams {
+    label: SocketAddr,
     rem_reader: TcpReader,
     rem_writer: TcpWriter,
     ciphers: ConnectionCiphers,
@@ -1567,7 +1563,7 @@ struct RelayParams<'a> {
     is_media: bool,
 }
 
-async fn bridge_relay(reader: ClientReader, writer: ClientWriter, params: RelayParams<'_>) {
+async fn bridge_relay(reader: ClientReader, writer: ClientWriter, params: RelayParams) {
     let RelayParams {
         label,
         rem_reader,
@@ -1681,7 +1677,7 @@ async fn bridge_relay(reader: ClientReader, writer: ClientWriter, params: RelayP
 ///
 /// Logs a session-close line on return (matching the `bridge_ws` format).
 struct TcpBridgeParams<'a> {
-    label: &'a str,
+    label: SocketAddr,
     dst: &'a str,
     relay_init: &'a [u8; 64],
     ciphers: ConnectionCiphers,
@@ -1863,7 +1859,7 @@ impl Drop for UploadCounter {
 
 #[allow(clippy::too_many_arguments)]
 fn log_session_closed(
-    label: &str,
+    label: SocketAddr,
     dc: u32,
     is_media: bool,
     kind: &str,
@@ -1886,7 +1882,7 @@ fn log_session_closed(
 }
 
 async fn read_inbound_handshake(
-    label: &str,
+    label: SocketAddr,
     reader: &mut TcpReader,
     writer: &mut TcpWriter,
     secrets: &[Vec<u8>],

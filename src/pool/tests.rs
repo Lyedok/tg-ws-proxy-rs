@@ -29,7 +29,7 @@ async fn a_direct_miss_burst_spawns_one_refill_task() {
     let pool = Arc::new(WsPool::new(4, Duration::from_secs(60)));
 
     for _ in 0..1_000 {
-        pool.schedule_refill(2, true, "203.0.113.10".to_string(), false);
+        pool.schedule_refill(2, true, "203.0.113.10", false);
     }
 
     assert_eq!(pool.refill_task_spawns.load(Ordering::Relaxed), 1);

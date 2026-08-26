@@ -185,7 +185,7 @@ impl WsPool {
         self: &Arc<Self>,
         dc: u32,
         is_media: bool,
-        target_ip: String,
+        target_ip: &str,
         skip_tls_verify: bool,
         allow_refill: bool,
     ) -> Option<TgWsStream> {
@@ -349,18 +349,13 @@ impl WsPool {
 
     // ── Internal ─────────────────────────────────────────────────────────
 
-    fn schedule_refill(
-        self: &Arc<Self>,
-        dc: u32,
-        is_media: bool,
-        target_ip: String,
-        skip_tls: bool,
-    ) {
+    fn schedule_refill(self: &Arc<Self>, dc: u32, is_media: bool, target_ip: &str, skip_tls: bool) {
         if self.pool_size == 0 || !self.reserve_refill((dc, is_media)) {
             return;
         }
 
         let pool = Arc::clone(self);
+        let target_ip = target_ip.to_string();
         #[cfg(test)]
         self.refill_task_spawns.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {

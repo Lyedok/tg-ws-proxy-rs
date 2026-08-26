@@ -246,7 +246,7 @@ async fn upstream_frame_sizes(framing: WsFraming, payload: &[u8]) -> Vec<usize> 
             ClientReader::Plain(reader),
             ClientWriter::Plain(writer),
             WsBridgeParams {
-                label: "test",
+                label: "127.0.0.1:1".parse().unwrap(),
                 ws,
                 framing,
                 relay_init,

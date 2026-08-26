@@ -24,9 +24,7 @@ fn pool_with_outbound(pool_size: usize, outbound: OutboundConnector) -> Arc<WsPo
 async fn an_empty_pool_misses_and_lets_the_caller_connect_directly() {
     let pool = pool_with_outbound(0, OutboundConnector::direct());
 
-    let hit = pool
-        .get(2, false, "203.0.113.10".to_string(), false, true)
-        .await;
+    let hit = pool.get(2, false, "203.0.113.10", false, true).await;
 
     assert!(hit.is_none());
 }
@@ -41,7 +39,7 @@ async fn pool_refill_dials_through_the_outbound_connector() {
     let pool = pool_with_outbound(1, outbound);
 
     assert!(
-        pool.get(2, false, "203.0.113.10".to_string(), false, true)
+        pool.get(2, false, "203.0.113.10", false, true)
             .await
             .is_none()
     );
@@ -92,7 +90,7 @@ async fn warmup_gives_up_on_unreachable_dcs_instead_of_hanging() {
 
     // Nothing was pooled, so a subsequent get still misses.
     assert!(
-        pool.get(2, false, "203.0.113.10".to_string(), false, true)
+        pool.get(2, false, "203.0.113.10", false, true)
             .await
             .is_none()
     );
